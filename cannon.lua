@@ -34,10 +34,15 @@ local DEFAULTS = {
   -- Subtracted from the world-space yaw so 0 matches the cannon's rest
   -- orientation. The original script's "facing south" cannon used 90.
   yawOffset = 0,
-  -- Flip these if an axis spins away from the target instead of toward it
-  -- (depends on your gearing).
-  invertYaw = false,
-  invertPitch = false,
+  -- Added to the computed pitch, in degrees: -1 aims 1 degree below the
+  -- target, +1 above. Plain aim bias -- not a sign fix.
+  pitchOffset = 0,
+  -- Drive sign per axis. "auto" calibrates on next boot: the axis is
+  -- nudged ~2 degrees while the block reader watches which way the angle
+  -- actually moves, and the measured true/false is written back here.
+  -- Set back to "auto" whenever you re-gear the build.
+  invertYaw = "auto",
+  invertPitch = "auto",
   tolerance = 1,    -- degrees of acceptable aim error per axis
   speedGain = 5,    -- RPM per degree of error
   maxSpeed = 60,    -- RPM cap for the speed controllers
@@ -144,7 +149,7 @@ end
 local function anglesFor(tx, ty, tz)
   local dx, dy, dz = tx - cfg.cannon.x, ty - cfg.cannon.y, tz - cfg.cannon.z
   local distance = math.sqrt(dx ^ 2 + dy ^ 2 + dz ^ 2)
-  local relPitch = math.deg(math.asin(dy / distance))
+  local relPitch = math.deg(math.asin(dy / distance)) + cfg.pitchOffset
   local relYaw = angleDiff(math.deg(math.atan(dz, dx)) - cfg.yawOffset, 0)
   return relYaw, relPitch
 end
@@ -153,6 +158,53 @@ local function stopAll()
   yaw.setTargetSpeed(0)
   pitch.setTargetSpeed(0)
   relay.setOutput(cfg.fireSide, false)
+end
+
+-- Empirically determine the drive sign for one axis: nudge the controller
+-- and watch which way the mount's angle moves. Tries both directions so it
+-- still works when the axis starts resting against a clamp (pitch limits).
+local function calibrateAxis(label, controller, nbtKey, wraps)
+  for _, rpm in ipairs({ 8, -8 }) do
+    local data = blockReader.getBlockData()
+    local before = data and data[nbtKey]
+    if not before then
+      error(("calibration failed: block reader has no %s -- is it against the cannon mount?")
+        :format(nbtKey), 0)
+    end
+    controller.setTargetSpeed(rpm)
+    sleep(0.6)
+    controller.setTargetSpeed(0)
+    sleep(0.2) -- let the angle settle before re-reading
+    local after = blockReader.getBlockData()[nbtKey]
+    local delta = wraps and angleDiff(after, before) or (after - before)
+    if math.abs(delta) >= 0.5 then
+      local invert = (delta > 0) ~= (rpm > 0)
+      print(("calibrated %s: %+d RPM moved %+.1f deg -> invert%s = %s")
+        :format(label, rpm, delta, label:gsub("^%l", string.upper), tostring(invert)))
+      return invert
+    end
+  end
+  error(("calibration failed: %s axis did not move in either direction -- check gearing")
+    :format(label), 0)
+end
+
+-- Run once per axis while its invert flag is "auto", then persist the
+-- measured sign so later boots skip the wiggle.
+local function calibrate()
+  local changed = false
+  if cfg.invertYaw == "auto" then
+    cfg.invertYaw = calibrateAxis("yaw", yaw, "CannonYaw", true)
+    changed = true
+  end
+  if cfg.invertPitch == "auto" then
+    cfg.invertPitch = calibrateAxis("pitch", pitch, "CannonPitch", false)
+    changed = true
+  end
+  if changed then
+    writeFile(CONFIG, Cfg.jsonPretty(cfg) .. "\n")
+    print("Calibration saved to " .. CONFIG)
+    sleep(1)
+  end
 end
 
 local function fire()
@@ -213,6 +265,7 @@ local function inputLoop()
 end
 
 stopAll()
+calibrate()
 local ok, err = pcall(parallel.waitForAny, trackLoop, inputLoop)
 stopAll()
 term.setCursorPos(1, select(2, term.getSize()))
