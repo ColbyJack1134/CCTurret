@@ -15,12 +15,15 @@ local Cfg = dofile("cfgutil.lua")
 local CONFIG = "cannon.cfg"
 
 local DEFAULTS = {
+  -- "auto" finds the single attached peripheral of that type (errors if
+  -- there are zero or several). The two speed controllers share a type,
+  -- so yaw and pitch must always be named explicitly.
   peripherals = {
     yaw = "Create_RotationSpeedController_0",
     pitch = "Create_RotationSpeedController_1",
-    blockReader = "blockReader_0",
-    playerDetector = "playerDetector_0",
-    relay = "redstone_relay_0",
+    blockReader = "auto",
+    playerDetector = "auto",
+    relay = "auto",
   },
   -- Which side of the redstone relay the fire line is wired to.
   -- Relays only accept relative names: top/bottom/front/back/left/right.
@@ -30,11 +33,11 @@ local DEFAULTS = {
   cannon = { x = 0.5, y = 64.5, z = 0.5 },
   -- Subtracted from the world-space yaw so 0 matches the cannon's rest
   -- orientation. The original script's "facing south" cannon used 90.
-  yawOffset = 90,
+  yawOffset = 0,
   -- Flip these if an axis spins away from the target instead of toward it
-  -- (depends on your gearing). true matches the original script's wiring.
-  invertYaw = true,
-  invertPitch = true,
+  -- (depends on your gearing).
+  invertYaw = false,
+  invertPitch = false,
   tolerance = 1,    -- degrees of acceptable aim error per axis
   speedGain = 5,    -- RPM per degree of error
   maxSpeed = 60,    -- RPM cap for the speed controllers
@@ -82,11 +85,32 @@ local function need(name, what)
   return p
 end
 
+-- Resolve a config entry to a peripheral: an explicit name wraps directly;
+-- "auto" finds the one attached peripheral of `ptype` and errors if the
+-- count is anything but exactly one.
+local function resolve(name, ptype, what)
+  if name ~= "auto" then return need(name, what) end
+  local matches = { peripheral.find(ptype) }
+  if #matches == 0 then
+    error(("no %s (type %q) attached -- connect one or set an explicit name in %s")
+      :format(what, ptype, CONFIG), 0)
+  end
+  if #matches > 1 then
+    local names = {}
+    for i, p in ipairs(matches) do names[i] = peripheral.getName(p) end
+    error(("found %d of %s (%s) -- set an explicit name in %s")
+      :format(#matches, what, table.concat(names, ", "), CONFIG), 0)
+  end
+  return matches[1]
+end
+
 local yaw = need(cfg.peripherals.yaw, "yaw speed controller")
 local pitch = need(cfg.peripherals.pitch, "pitch speed controller")
-local blockReader = need(cfg.peripherals.blockReader, "block reader on cannon mount")
-local entDet = need(cfg.peripherals.playerDetector, "player detector")
-local relay = need(cfg.peripherals.relay, "redstone relay")
+local blockReader = resolve(cfg.peripherals.blockReader, "blockReader",
+  "block reader on cannon mount")
+local entDet = resolve(cfg.peripherals.playerDetector, "playerDetector",
+  "player detector")
+local relay = resolve(cfg.peripherals.relay, "redstone_relay", "redstone relay")
 
 -- Shared state between the tracking loop and the input loop.
 local running = true
