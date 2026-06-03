@@ -106,9 +106,9 @@ end
 
 local yaw = need(cfg.peripherals.yaw, "yaw speed controller")
 local pitch = need(cfg.peripherals.pitch, "pitch speed controller")
-local blockReader = resolve(cfg.peripherals.blockReader, "blockReader",
+local blockReader = resolve(cfg.peripherals.blockReader, "block_reader",
   "block reader on cannon mount")
-local entDet = resolve(cfg.peripherals.playerDetector, "playerDetector",
+local entDet = resolve(cfg.peripherals.playerDetector, "player_detector",
   "player detector")
 local relay = resolve(cfg.peripherals.relay, "redstone_relay", "redstone relay")
 
