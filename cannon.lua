@@ -324,7 +324,8 @@ local function refreshRoster()
   local roster = {}
   for _, name in ipairs(entDet.getOnlinePlayers() or {}) do
     local item = { name = name }
-    local pos = entDet.getPlayerPos(name)
+    -- Second arg = decimal places (AP floors to whole blocks by default).
+    local pos = entDet.getPlayerPos(name, 2)
     if pos and pos.x then
       item.x, item.y, item.z = pos.x, pos.y, pos.z
       if c then
@@ -563,13 +564,15 @@ end
 local function trackLoop()
   local tick = 0
   while running do
-    -- Ship fix every 0.5s (gps.locate is a rednet round-trip; 0.1s would
-    -- spam the channel), roster every 1s, aim every 0.1s.
-    if cfg.ship.enabled and tick % 5 == 0 then updateShip() end
+    -- Ship fix every tick while tracking (a climbing ship stair-steps the
+    -- aim on anything slower), every 0.5s when idle; roster every 1s.
+    if cfg.ship.enabled and (state.targetName or tick % 5 == 0) then
+      updateShip()
+    end
     if tick % 10 == 0 then refreshRoster() end
     tick = tick + 1
     if state.targetName then
-      local pos = entDet.getPlayerPos(state.targetName)
+      local pos = entDet.getPlayerPos(state.targetName, 2)
       if pos and pos.x then
         state.lost = false
         local relYaw, relPitch = anglesFor(pos.x, pos.y, pos.z)
