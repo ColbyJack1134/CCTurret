@@ -51,6 +51,12 @@ local DEFAULTS = {
     offset = { forward = 0, up = 0, right = 0 },
     headingOffset = 0,   -- nav-table needle correction, same as CCMinimap
     navTable = "auto",
+    -- Aeronautics gimbal sensor (type "gimbal_sensor", getAngles() ->
+    -- {xAngleDeg, zAngleDeg} -- see CCMissile). Raw values surface on the
+    -- DEBUG tab to work out the pitch/roll axis mapping before any aim
+    -- compensation uses them. "auto" finds one, a name wraps it, "none"
+    -- disables.
+    gimbal = "auto",
   },
   -- Subtracted from the world-space yaw so 0 matches the cannon's rest
   -- orientation. The original script's "facing south" cannon used 90.
@@ -142,6 +148,7 @@ local relay = resolve(cfg.peripherals.relay, "redstone_relay", "redstone relay")
 -- Airship mode prerequisites: a wireless modem for gps.locate and a
 -- navigation table for heading. Checked loudly at boot, not at first use.
 local navSource = nil
+local gimbal = nil
 if cfg.ship.enabled then
   if not peripheral.find("modem", function(_, m) return m.isWireless() end) then
     error("ship.enabled but no wireless modem attached (needed for gps.locate)", 0)
@@ -152,14 +159,32 @@ if cfg.ship.enabled then
     error("ship.enabled but no navigation table found -- set ship.navTable in "
       .. CONFIG, 0)
   end
+  if cfg.ship.gimbal ~= "none" then
+    if cfg.ship.gimbal ~= "auto" then
+      gimbal = need(cfg.ship.gimbal, "gimbal sensor")
+    else
+      gimbal = peripheral.find("gimbal_sensor")
+      -- nil is tolerated in auto mode (not aim-critical yet); the DEBUG
+      -- tab shows NOT FOUND in red rather than failing the boot.
+    end
+  end
 end
 
 -- Live ship fix: computer world position, heading, and the derived cannon
 -- position. freshUntil guards against aiming on stale data when GPS or the
 -- nav table stop answering.
-local ship = { pos = nil, heading = nil, cannon = nil, rel = nil, freshUntil = 0 }
+local ship = {
+  pos = nil, heading = nil, cannon = nil, rel = nil,
+  gimbal = nil, -- { x, z } raw gimbal-sensor degrees, debug-only for now
+  freshUntil = 0,
+}
 
 local function updateShip()
+  if gimbal then
+    local ok, angles = pcall(gimbal.getAngles)
+    ship.gimbal = (ok and type(angles) == "table")
+      and { x = angles[1], z = angles[2] } or nil
+  end
   local x, y, z = gps.locate(0.5)
   local rel = Heading.relativeAngle(navSource)
   if not (x and rel) then return end
@@ -498,6 +523,15 @@ local function drawDebugScreen(w, h)
     line("offset f/u/r", ("%g / %g / %g"):format(cfg.ship.offset.forward,
       cfg.ship.offset.up, cfg.ship.offset.right))
     line("headingOffset", cfg.ship.headingOffset)
+    if cfg.ship.gimbal ~= "none" then
+      if not gimbal then
+        line("gimbal", "NOT FOUND", colors.red)
+      else
+        local g = ship.gimbal
+        line("gimbal X", g and ("%+.2f"):format(g.x) or "?", colors.orange)
+        line("gimbal Z", g and ("%+.2f"):format(g.z) or "?", colors.orange)
+      end
+    end
   else
     line("mode", "static (land)")
     line("cannon xyz", fmtPos(cfg.cannon), colors.yellow)
