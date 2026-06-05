@@ -1,10 +1,15 @@
--- cannon.lua: CCBigCannon v1 -- closed-loop turret control for Create Big Cannons.
+-- cannon.lua: CCBigCannon v2 -- closed-loop turret control for Create Big Cannons.
 --
 -- Reads the cannon mount's CannonYaw/CannonPitch NBT through a Block Reader,
--- drives two modem-attached Rotational Speed Controllers to aim at the
--- nearest non-whitelisted player, and fires via a Redstone Relay pulse.
+-- drives two modem-attached Rotational Speed Controllers, and fires via a
+-- Redstone Relay pulse.
 --
--- Keys: F = fire, Q = quit.
+-- Targeting is click-to-lock, CCMinimap-style: a TARGETS tab lists every
+-- online player (getOnlinePlayers/getPlayerPos are position-independent, so
+-- this works from an airship where range scans see nobody); click a row to
+-- track that player, click again or [ STOP ] to release.
+--
+-- Keys: F = fire, Q = quit. Mouse/touch for everything else.
 --
 -- Config lives in cannon.cfg (JSON). Missing keys are filled from DEFAULTS
 -- on first boot and written back, CCMinimap-style. Edit the peripheral names
@@ -46,8 +51,9 @@ local DEFAULTS = {
   tolerance = 1,    -- degrees of acceptable aim error per axis
   speedGain = 5,    -- RPM per degree of error
   maxSpeed = 60,    -- RPM cap for the speed controllers
-  detectionRange = 30,
-  whitelist = {},   -- player names the turret must never target
+  -- Names listed here are dimmed in the target list as a "friendly"
+  -- reminder; they can still be clicked deliberately.
+  whitelist = {},
 }
 
 local function readFile(p)
@@ -117,19 +123,29 @@ local entDet = resolve(cfg.peripherals.playerDetector, "player_detector",
   "player detector")
 local relay = resolve(cfg.peripherals.relay, "redstone_relay", "redstone relay")
 
--- Shared state between the tracking loop and the input loop.
-local running = true
-local status = { target = nil, locked = false, yawErr = 0, pitchErr = 0 }
-
 local whitelisted = {}
 for _, name in ipairs(cfg.whitelist) do whitelisted[name] = true end
 
-local function findTarget()
-  for _, name in ipairs(entDet.getPlayersInRange(cfg.detectionRange)) do
-    if not whitelisted[name] then return name end
-  end
-  return nil
-end
+-- Shared state between the tracking loop and the input loop.
+local running = true
+local state = {
+  targetName = nil,  -- player we're locked onto, or nil
+  lost = false,      -- target set but offline / other dimension
+  locked = false,    -- both axes within tolerance
+  yawErr = 0,
+  pitchErr = 0,
+  roster = {},       -- { {name, x, y, z, dist?}, ... } sorted by distance
+  flash = nil,       -- transient status message (e.g. "FIRED")
+}
+
+local ui = {
+  tabs = { { id = "targets", label = " TARGETS " } },
+  activeTab = "targets",
+  cells = {},  -- clickable regions: {col1, col2, row, cmd, name?}
+  scroll = 0,
+}
+
+-- ---------------------------------------------------------------- aiming --
 
 -- Smallest signed angle from `current` to `target`, in [-180, 180].
 local function angleDiff(target, current)
@@ -154,11 +170,24 @@ local function anglesFor(tx, ty, tz)
   return relYaw, relPitch
 end
 
-local function stopAll()
+local function stopMotors()
   yaw.setTargetSpeed(0)
   pitch.setTargetSpeed(0)
+end
+
+local function stopAll()
+  stopMotors()
   relay.setOutput(cfg.fireSide, false)
 end
+
+local function fire()
+  relay.setOutput(cfg.fireSide, true)
+  sleep(cfg.firePulseSeconds)
+  relay.setOutput(cfg.fireSide, false)
+  state.flash = "FIRED"
+end
+
+-- ----------------------------------------------------------- calibration --
 
 -- Empirically determine the drive sign for one axis: nudge the controller
 -- and watch which way the mount's angle moves. Tries both directions so it
@@ -207,67 +236,241 @@ local function calibrate()
   end
 end
 
-local function fire()
-  relay.setOutput(cfg.fireSide, true)
-  sleep(cfg.firePulseSeconds)
-  relay.setOutput(cfg.fireSide, false)
+-- -------------------------------------------------------------- targeting --
+
+-- Refresh the online-player roster. getPlayerPos is position-independent
+-- (any distance, same dimension) so this works from an assembled airship;
+-- players in another dimension get no coords and show as untargetable.
+local function refreshRoster()
+  local roster = {}
+  for _, name in ipairs(entDet.getOnlinePlayers() or {}) do
+    local item = { name = name }
+    local pos = entDet.getPlayerPos(name)
+    if pos and pos.x then
+      item.x, item.y, item.z = pos.x, pos.y, pos.z
+      local dx = pos.x - cfg.cannon.x
+      local dy = pos.y - cfg.cannon.y
+      local dz = pos.z - cfg.cannon.z
+      item.dist = math.floor(math.sqrt(dx * dx + dy * dy + dz * dz))
+    end
+    roster[#roster + 1] = item
+  end
+  table.sort(roster, function(a, b)
+    local da, db = a.dist or math.huge, b.dist or math.huge
+    if da ~= db then return da < db end
+    return a.name < b.name
+  end)
+  state.roster = roster
 end
 
-local function draw()
-  term.clear()
+local function setTarget(name)
+  if state.targetName == name then name = nil end -- click again to release
+  state.targetName = name
+  state.lost = false
+  state.locked = false
+  if not name then stopMotors() end
+end
+
+-- ---------------------------------------------------------------- drawing --
+
+local function drawTabBar(w)
   term.setCursorPos(1, 1)
-  print("CCBigCannon v1   [F] fire  [Q] quit")
-  print(("Target: %s"):format(status.target or "none"))
-  if status.target then
-    print(("Yaw err: %6.1f  Pitch err: %6.1f"):format(status.yawErr, status.pitchErr))
-    print(status.locked and "LOCKED ON" or "tracking...")
+  term.setBackgroundColor(colors.gray)
+  term.write(string.rep(" ", w))
+  local col = 1
+  for _, tab in ipairs(ui.tabs) do
+    local active = ui.activeTab == tab.id
+    term.setCursorPos(col, 1)
+    term.setTextColor(colors.black)
+    term.setBackgroundColor(active and colors.white or colors.lightGray)
+    term.write(tab.label)
+    ui.cells[#ui.cells + 1] =
+      { col1 = col, col2 = col + #tab.label - 1, row = 1, cmd = "tab_" .. tab.id }
+    col = col + #tab.label + 1
   end
 end
 
--- Continuous control loop: re-reads the mount and the target every tick so
--- the turret tracks moving players instead of aiming at a stale position.
+local function drawStatus()
+  term.setCursorPos(1, 2)
+  term.setBackgroundColor(colors.black)
+  term.clearLine()
+  if state.targetName then
+    term.setTextColor(colors.lightGray)
+    term.write("Target ")
+    term.setTextColor(colors.cyan)
+    term.write(state.targetName .. " ")
+    if state.lost then
+      term.setTextColor(colors.red)
+      term.write("LOST")
+    elseif state.locked then
+      term.setTextColor(colors.lime)
+      term.write("LOCKED")
+    else
+      term.setTextColor(colors.yellow)
+      term.write(("y%+.0f p%+.0f"):format(state.yawErr, state.pitchErr))
+    end
+  else
+    term.setTextColor(colors.lightGray)
+    term.write("No target -- click a player")
+  end
+  if state.flash then
+    term.setTextColor(colors.orange)
+    term.write("  " .. state.flash)
+  end
+end
+
+local function drawTargetsList(w, h)
+  local listTop, listBot = 3, h - 1
+  local visRows = listBot - listTop + 1
+  local maxScroll = math.max(0, #state.roster - visRows)
+  if ui.scroll > maxScroll then ui.scroll = maxScroll end
+  for i = 1, visRows do
+    local row = listTop + i - 1
+    local item = state.roster[i + ui.scroll]
+    term.setCursorPos(1, row)
+    term.setBackgroundColor(colors.black)
+    term.clearLine()
+    if item then
+      local selected = item.name == state.targetName
+      local friendly = whitelisted[item.name]
+      term.setBackgroundColor(selected and colors.gray or colors.black)
+      term.setTextColor(selected and colors.white or colors.lightGray)
+      term.write(selected and ">" or " ")
+      term.setTextColor(friendly and colors.gray or colors.cyan)
+      term.write(("@%-16s"):format(item.name:sub(1, 16)))
+      if item.dist then
+        term.setTextColor(colors.white)
+        term.write((" %dm"):format(item.dist))
+      else
+        term.setTextColor(colors.gray)
+        term.write(" other dim")
+      end
+      ui.cells[#ui.cells + 1] =
+        { col1 = 1, col2 = w, row = row, cmd = "select", name = item.name }
+    end
+  end
+end
+
+local function drawButtonBar(w, h)
+  term.setCursorPos(1, h)
+  term.setBackgroundColor(colors.black)
+  term.clearLine()
+  local col = 1
+  local function button(label, cmd, fg, enabled)
+    term.setCursorPos(col, h)
+    term.setBackgroundColor(enabled and colors.gray or colors.black)
+    term.setTextColor(enabled and fg or colors.gray)
+    term.write(label)
+    if enabled then
+      ui.cells[#ui.cells + 1] =
+        { col1 = col, col2 = col + #label - 1, row = h, cmd = cmd }
+    end
+    col = col + #label + 1
+  end
+  button(" FIRE ", "fire", state.locked and colors.lime or colors.red, true)
+  button(" STOP ", "stop", colors.white, state.targetName ~= nil)
+  term.setCursorPos(w - 12, h)
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.gray)
+  term.write("F=fire Q=quit")
+end
+
+local function draw()
+  local w, h = term.getSize()
+  ui.cells = {}
+  drawTabBar(w)
+  drawStatus()
+  drawTargetsList(w, h)
+  drawButtonBar(w, h)
+end
+
+-- ------------------------------------------------------------------ loops --
+
+-- Continuous control loop: re-reads the target and the mount every tick so
+-- the turret tracks moving players; refreshes the full roster about once
+-- a second (one getPlayerPos call per online player).
 local function trackLoop()
+  local tick = 0
   while running do
-    status.target = findTarget()
-    if status.target then
-      local pos = entDet.getPlayerPos(status.target)
-      local data = pos and blockReader.getBlockData()
-      if pos and data and data.CannonYaw and data.CannonPitch then
-        local relYaw, relPitch = anglesFor(pos.x, pos.y, pos.z)
-        status.yawErr = angleDiff(relYaw, data.CannonYaw)
-        status.pitchErr = relPitch - data.CannonPitch
-        status.locked = math.abs(status.yawErr) < cfg.tolerance
-          and math.abs(status.pitchErr) < cfg.tolerance
-        yaw.setTargetSpeed(speedFor(status.yawErr, cfg.invertYaw))
-        pitch.setTargetSpeed(speedFor(status.pitchErr, cfg.invertPitch))
+    if tick % 10 == 0 then refreshRoster() end
+    tick = tick + 1
+    if state.targetName then
+      local pos = entDet.getPlayerPos(state.targetName)
+      if pos and pos.x then
+        state.lost = false
+        local data = blockReader.getBlockData()
+        if data and data.CannonYaw and data.CannonPitch then
+          local relYaw, relPitch = anglesFor(pos.x, pos.y, pos.z)
+          state.yawErr = angleDiff(relYaw, data.CannonYaw)
+          state.pitchErr = relPitch - data.CannonPitch
+          state.locked = math.abs(state.yawErr) < cfg.tolerance
+            and math.abs(state.pitchErr) < cfg.tolerance
+          yaw.setTargetSpeed(speedFor(state.yawErr, cfg.invertYaw))
+          pitch.setTargetSpeed(speedFor(state.pitchErr, cfg.invertPitch))
+        end
+      else
+        state.lost = true
+        state.locked = false
+        stopMotors()
       end
       draw()
       sleep(0.1)
     else
-      status.locked = false
-      yaw.setTargetSpeed(0)
-      pitch.setTargetSpeed(0)
+      stopMotors()
       draw()
-      sleep(1)
+      sleep(0.5)
     end
+    state.flash = nil
+  end
+end
+
+local function handleCommand(cell)
+  if cell.cmd == "select" then
+    setTarget(cell.name)
+  elseif cell.cmd == "fire" then
+    fire()
+  elseif cell.cmd == "stop" then
+    setTarget(state.targetName) -- toggle off
+  elseif cell.cmd:sub(1, 4) == "tab_" then
+    ui.activeTab = cell.cmd:sub(5)
   end
 end
 
 local function inputLoop()
   while running do
-    local _, key = os.pullEvent("key")
-    if key == keys.f then
-      fire()
-    elseif key == keys.q then
-      running = false
+    local event = { os.pullEvent() }
+    if event[1] == "key" then
+      if event[2] == keys.f then
+        fire()
+      elseif event[2] == keys.q then
+        running = false
+      end
+    elseif event[1] == "mouse_click" or event[1] == "monitor_touch" then
+      local x, y = event[3], event[4]
+      for _, cell in ipairs(ui.cells) do
+        if y == cell.row and x >= cell.col1 and x <= cell.col2 then
+          handleCommand(cell)
+          break
+        end
+      end
+    elseif event[1] == "mouse_scroll" then
+      ui.scroll = math.max(0, ui.scroll + event[2])
     end
+    draw()
   end
 end
 
 stopAll()
 calibrate()
+term.setBackgroundColor(colors.black)
+term.clear()
+refreshRoster()
+draw()
 local ok, err = pcall(parallel.waitForAny, trackLoop, inputLoop)
 stopAll()
-term.setCursorPos(1, select(2, term.getSize()))
+term.setBackgroundColor(colors.black)
+term.setTextColor(colors.white)
+term.clear()
+term.setCursorPos(1, 1)
 if not ok then error(err, 0) end
 print("CCBigCannon stopped.")
