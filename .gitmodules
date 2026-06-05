@@ -1,0 +1,3 @@
+[submodule "vendor/CCMinimap"]
+	path = vendor/CCMinimap
+	url = https://github.com/ColbyJack1134/CCMinimap.git

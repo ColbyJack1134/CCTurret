@@ -17,9 +17,29 @@ on CC:Tweaked, based on [pastebin tb4aiueb](https://pastebin.com/tb4aiueb)
 
 ## Usage
 
-Copy `cannon.lua` and `cfgutil.lua` to the computer and run `cannon.lua`.
-First boot writes `cannon.cfg` with defaults — edit the peripheral names,
-cannon position, and `yawOffset` to match your build, then rerun.
+Shared libraries come from the CCMinimap submodule (`git submodule update
+--init`) so there is exactly one tracked copy of each. Copy to the computer,
+flat:
+
+- `cannon.lua`
+- `vendor/CCMinimap/computercraft/cfgutil.lua` → `cfgutil.lua`
+- `vendor/CCMinimap/computercraft/heading.lua` → `heading.lua`
+
+Run `cannon.lua`. First boot writes `cannon.cfg` with defaults — edit the
+peripheral names, cannon position, and `yawOffset` to match your build,
+then rerun.
+
+## Airship mode
+
+Set `ship.enabled = true` in `cannon.cfg`. Requires a wireless modem
+(GPS) and a navigation table (heading, CCMinimap needle math with
+`ship.headingOffset` correction). The cannon's world position is derived
+each half-second from the computer's GPS fix plus `ship.offset` — the
+ship-local computer→cannon-mount vector in blocks (`forward`/`up`/`right`,
+left = negative right) — rotated by the live heading. `yawOffset` then
+means "cannon rest direction relative to ship-forward". Ship pitch/roll
+are assumed level for now. If GPS or the nav table stop answering, the
+turret holds and shows NO FIX rather than aiming on stale data.
 
 Keys: `F` fire, `Q` quit. The turret continuously tracks the nearest
 non-whitelisted player; `LOCKED ON` means both axes are within `tolerance`.

@@ -16,6 +16,7 @@
 -- there to match your network (e.g. yaw = "Create_RotationSpeedController_0").
 
 local Cfg = dofile("cfgutil.lua")
+local Heading = dofile("heading.lua")
 
 local CONFIG = "cannon.cfg"
 
@@ -35,7 +36,22 @@ local DEFAULTS = {
   fireSide = "top",
   firePulseSeconds = 0.4,
   -- Center of the cannon mount (use the mount block's coords + 0.5).
+  -- Only used while ship.enabled = false; aboard a ship the position is
+  -- derived live from GPS + ship.offset instead.
   cannon = { x = 0.5, y = 64.5, z = 0.5 },
+  -- Airship mode: locate the COMPUTER via GPS (wireless modem required),
+  -- read ship yaw from the navigation table (CCMinimap-style needle math),
+  -- and derive the cannon's world position by rotating `offset` -- the
+  -- ship-local vector from the computer to the cannon mount, in blocks
+  -- (left = negative right, down = negative up) -- by the live heading.
+  -- While enabled, yawOffset means "cannon rest direction relative to
+  -- ship-forward", so it stays correct at any heading.
+  ship = {
+    enabled = false,
+    offset = { forward = 0, up = 0, right = 0 },
+    headingOffset = 0,   -- nav-table needle correction, same as CCMinimap
+    navTable = "auto",
+  },
   -- Subtracted from the world-space yaw so 0 matches the cannon's rest
   -- orientation. The original script's "facing south" cannon used 90.
   yawOffset = 0,
@@ -123,6 +139,56 @@ local entDet = resolve(cfg.peripherals.playerDetector, "player_detector",
   "player detector")
 local relay = resolve(cfg.peripherals.relay, "redstone_relay", "redstone relay")
 
+-- Airship mode prerequisites: a wireless modem for gps.locate and a
+-- navigation table for heading. Checked loudly at boot, not at first use.
+local navSource = nil
+if cfg.ship.enabled then
+  if not peripheral.find("modem", function(_, m) return m.isWireless() end) then
+    error("ship.enabled but no wireless modem attached (needed for gps.locate)", 0)
+  end
+  navSource = Heading.discover(
+    cfg.ship.navTable ~= "auto" and cfg.ship.navTable or nil)
+  if not navSource then
+    error("ship.enabled but no navigation table found -- set ship.navTable in "
+      .. CONFIG, 0)
+  end
+end
+
+-- Live ship fix: computer world position, heading, and the derived cannon
+-- position. freshUntil guards against aiming on stale data when GPS or the
+-- nav table stop answering.
+local ship = { pos = nil, heading = nil, cannon = nil, freshUntil = 0 }
+
+local function updateShip()
+  local x, y, z = gps.locate(0.5)
+  local rel = Heading.relativeAngle(navSource)
+  if not (x and rel) then return end
+  local heading = Heading.fromPositionAndRelative(
+    { x = x, z = z }, rel, cfg.ship.headingOffset)
+  if not heading then return end
+  -- Ship-forward and ship-right unit vectors in world XZ for this heading
+  -- (compass convention: 0 = north/-Z, 90 = east/+X, clockwise).
+  local h, off = math.rad(heading), cfg.ship.offset
+  local fx, fz = math.sin(h), -math.cos(h)
+  local rx, rz = math.cos(h), math.sin(h)
+  ship.pos = { x = x, y = y, z = z }
+  ship.heading = heading
+  ship.cannon = {
+    x = x + fx * off.forward + rx * off.right,
+    y = y + off.up,
+    z = z + fz * off.forward + rz * off.right,
+  }
+  ship.freshUntil = os.clock() + 3
+end
+
+-- Where the cannon is right now (world frame), or nil when the ship fix
+-- has gone stale. Static mode just returns the configured position.
+local function cannonPos()
+  if not cfg.ship.enabled then return cfg.cannon end
+  if os.clock() > ship.freshUntil then return nil end
+  return ship.cannon
+end
+
 local whitelisted = {}
 for _, name in ipairs(cfg.whitelist) do whitelisted[name] = true end
 
@@ -131,6 +197,7 @@ local running = true
 local state = {
   targetName = nil,  -- player we're locked onto, or nil
   lost = false,      -- target set but offline / other dimension
+  noFix = false,     -- ship mode and GPS/nav stopped answering
   locked = false,    -- both axes within tolerance
   yawErr = 0,
   pitchErr = 0,
@@ -162,12 +229,18 @@ local function speedFor(diff, invert)
 end
 
 -- World-space target position -> desired mount yaw/pitch in degrees.
+-- Returns nil when the cannon position is unknown (stale ship fix).
 local function anglesFor(tx, ty, tz)
-  local dx, dy, dz = tx - cfg.cannon.x, ty - cfg.cannon.y, tz - cfg.cannon.z
+  local c = cannonPos()
+  if not c then return nil end
+  local dx, dy, dz = tx - c.x, ty - c.y, tz - c.z
   local distance = math.sqrt(dx ^ 2 + dy ^ 2 + dz ^ 2)
   local relPitch = math.deg(math.asin(dy / distance)) + cfg.pitchOffset
-  local relYaw = angleDiff(math.deg(math.atan(dz, dx)) - cfg.yawOffset, 0)
-  return relYaw, relPitch
+  local worldYaw = math.deg(math.atan(dz, dx))
+  -- Aboard a ship the mount angle is ship-relative, so the live heading
+  -- comes off the world-frame bearing before yawOffset.
+  if cfg.ship.enabled then worldYaw = worldYaw - ship.heading end
+  return angleDiff(worldYaw - cfg.yawOffset, 0), relPitch
 end
 
 local function stopMotors()
@@ -242,16 +315,17 @@ end
 -- (any distance, same dimension) so this works from an assembled airship;
 -- players in another dimension get no coords and show as untargetable.
 local function refreshRoster()
+  local c = cannonPos() -- may be nil on a stale ship fix: rows lose distances
   local roster = {}
   for _, name in ipairs(entDet.getOnlinePlayers() or {}) do
     local item = { name = name }
     local pos = entDet.getPlayerPos(name)
     if pos and pos.x then
       item.x, item.y, item.z = pos.x, pos.y, pos.z
-      local dx = pos.x - cfg.cannon.x
-      local dy = pos.y - cfg.cannon.y
-      local dz = pos.z - cfg.cannon.z
-      item.dist = math.floor(math.sqrt(dx * dx + dy * dy + dz * dz))
+      if c then
+        local dx, dy, dz = pos.x - c.x, pos.y - c.y, pos.z - c.z
+        item.dist = math.floor(math.sqrt(dx * dx + dy * dy + dz * dz))
+      end
     end
     roster[#roster + 1] = item
   end
@@ -302,12 +376,26 @@ local function drawStatus()
     if state.lost then
       term.setTextColor(colors.red)
       term.write("LOST")
+    elseif state.noFix then
+      term.setTextColor(colors.red)
+      term.write("NO FIX")
     elseif state.locked then
       term.setTextColor(colors.lime)
       term.write("LOCKED")
     else
       term.setTextColor(colors.yellow)
       term.write(("y%+.0f p%+.0f"):format(state.yawErr, state.pitchErr))
+    end
+  elseif cfg.ship.enabled then
+    local c = cannonPos()
+    if c then
+      term.setTextColor(colors.lightGray)
+      term.write(("Ship H%03d  cannon %d,%d,%d"):format(
+        math.floor(ship.heading + 0.5) % 360,
+        math.floor(c.x), math.floor(c.y), math.floor(c.z)))
+    else
+      term.setTextColor(colors.red)
+      term.write("NO GPS/NAV FIX")
     end
   else
     term.setTextColor(colors.lightGray)
@@ -341,10 +429,10 @@ local function drawTargetsList(w, h)
       if item.dist then
         term.setTextColor(colors.white)
         term.write((" %dm"):format(item.dist))
-      else
+      elseif not item.x then
         term.setTextColor(colors.gray)
         term.write(" other dim")
-      end
+      end -- has coords but no cannon fix: distance unknown, leave blank
       ui.cells[#ui.cells + 1] =
         { col1 = 1, col2 = w, row = row, cmd = "select", name = item.name }
     end
@@ -392,21 +480,32 @@ end
 local function trackLoop()
   local tick = 0
   while running do
+    -- Ship fix every 0.5s (gps.locate is a rednet round-trip; 0.1s would
+    -- spam the channel), roster every 1s, aim every 0.1s.
+    if cfg.ship.enabled and tick % 5 == 0 then updateShip() end
     if tick % 10 == 0 then refreshRoster() end
     tick = tick + 1
     if state.targetName then
       local pos = entDet.getPlayerPos(state.targetName)
       if pos and pos.x then
         state.lost = false
-        local data = blockReader.getBlockData()
-        if data and data.CannonYaw and data.CannonPitch then
-          local relYaw, relPitch = anglesFor(pos.x, pos.y, pos.z)
-          state.yawErr = angleDiff(relYaw, data.CannonYaw)
-          state.pitchErr = relPitch - data.CannonPitch
-          state.locked = math.abs(state.yawErr) < cfg.tolerance
-            and math.abs(state.pitchErr) < cfg.tolerance
-          yaw.setTargetSpeed(speedFor(state.yawErr, cfg.invertYaw))
-          pitch.setTargetSpeed(speedFor(state.pitchErr, cfg.invertPitch))
+        local relYaw, relPitch = anglesFor(pos.x, pos.y, pos.z)
+        if not relYaw then
+          -- Stale ship fix: hold rather than aim with old coords/heading.
+          state.noFix = true
+          state.locked = false
+          stopMotors()
+        else
+          state.noFix = false
+          local data = blockReader.getBlockData()
+          if data and data.CannonYaw and data.CannonPitch then
+            state.yawErr = angleDiff(relYaw, data.CannonYaw)
+            state.pitchErr = relPitch - data.CannonPitch
+            state.locked = math.abs(state.yawErr) < cfg.tolerance
+              and math.abs(state.pitchErr) < cfg.tolerance
+            yaw.setTargetSpeed(speedFor(state.yawErr, cfg.invertYaw))
+            pitch.setTargetSpeed(speedFor(state.pitchErr, cfg.invertPitch))
+          end
         end
       else
         state.lost = true
@@ -464,6 +563,7 @@ stopAll()
 calibrate()
 term.setBackgroundColor(colors.black)
 term.clear()
+if cfg.ship.enabled then updateShip() end
 refreshRoster()
 draw()
 local ok, err = pcall(parallel.waitForAny, trackLoop, inputLoop)
