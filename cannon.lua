@@ -444,6 +444,20 @@ local function drawTargetsList(w, h)
   end
 end
 
+-- Convert our compass heading (0 = north/-Z, 90 = east/+X, clockwise --
+-- CCMinimap convention) to the F3 debug screen's "Facing" line: MC yaw is
+-- 0 = south/+Z, 90 = west/-X, range (-180, 180], i.e. ours shifted 180.
+-- Verified against minecraft.wiki/w/Rotation.
+local function f3Facing(heading)
+  local mcYaw = heading - 180
+  if mcYaw <= -180 then mcYaw = mcYaw + 360 end
+  local names = {
+    { "north", "-Z" }, { "east", "+X" }, { "south", "+Z" }, { "west", "-X" },
+  }
+  local n = names[math.floor(((heading + 45) % 360) / 90) + 1]
+  return mcYaw, n[1], n[2]
+end
+
 -- Live numbers for dialing in ship.offset / headingOffset / yawOffset:
 -- everything the aim math sees, raw and derived.
 local function drawDebugScreen(w, h)
@@ -472,6 +486,13 @@ local function drawDebugScreen(w, h)
     line("gps (computer)", fmtPos(ship.pos))
     line("needle rel", fmtDeg(ship.rel))
     line("ship heading", fmtDeg(ship.heading), colors.yellow)
+    if ship.heading then
+      -- Same direction in F3's language: stand facing ship-forward and
+      -- this should match your "Facing" line exactly.
+      local mcYaw, name, axis = f3Facing(ship.heading)
+      line("  as F3", ("%s (%s)  %+.1f"):format(name, axis, mcYaw),
+        colors.yellow)
+    end
     line("cannon xyz", fmtPos(ship.cannon), colors.yellow)
     line("offset f/u/r", ("%g / %g / %g"):format(cfg.ship.offset.forward,
       cfg.ship.offset.up, cfg.ship.offset.right))
