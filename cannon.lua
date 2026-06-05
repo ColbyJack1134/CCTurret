@@ -157,12 +157,13 @@ end
 -- Live ship fix: computer world position, heading, and the derived cannon
 -- position. freshUntil guards against aiming on stale data when GPS or the
 -- nav table stop answering.
-local ship = { pos = nil, heading = nil, cannon = nil, freshUntil = 0 }
+local ship = { pos = nil, heading = nil, cannon = nil, rel = nil, freshUntil = 0 }
 
 local function updateShip()
   local x, y, z = gps.locate(0.5)
   local rel = Heading.relativeAngle(navSource)
   if not (x and rel) then return end
+  ship.rel = rel
   local heading = Heading.fromPositionAndRelative(
     { x = x, z = z }, rel, cfg.ship.headingOffset)
   if not heading then return end
@@ -202,11 +203,15 @@ local state = {
   yawErr = 0,
   pitchErr = 0,
   roster = {},       -- { {name, x, y, z, dist?}, ... } sorted by distance
+  mount = nil,       -- last block-reader NBT, for the debug tab
   flash = nil,       -- transient status message (e.g. "FIRED")
 }
 
 local ui = {
-  tabs = { { id = "targets", label = " TARGETS " } },
+  tabs = {
+    { id = "targets", label = " TARGETS " },
+    { id = "debug", label = " DEBUG " },
+  },
   activeTab = "targets",
   cells = {},  -- clickable regions: {col1, col2, row, cmd, name?}
   scroll = 0,
@@ -439,6 +444,59 @@ local function drawTargetsList(w, h)
   end
 end
 
+-- Live numbers for dialing in ship.offset / headingOffset / yawOffset:
+-- everything the aim math sees, raw and derived.
+local function drawDebugScreen(w, h)
+  local row = 3
+  local function line(label, value, fg)
+    if row > h - 1 then return end
+    term.setCursorPos(1, row)
+    term.setBackgroundColor(colors.black)
+    term.clearLine()
+    term.setTextColor(colors.lightGray)
+    term.write(("%-14s"):format(label))
+    term.setTextColor(fg or colors.white)
+    term.write(tostring(value):sub(1, w - 14))
+    row = row + 1
+  end
+  local function fmtPos(p)
+    return p and ("%.1f  %.1f  %.1f"):format(p.x, p.y, p.z) or "?"
+  end
+  local function fmtDeg(v)
+    return v and ("%.1f"):format(v) or "?"
+  end
+  if cfg.ship.enabled then
+    local fresh = os.clock() <= ship.freshUntil
+    line("ship fix", fresh and "OK" or "STALE",
+      fresh and colors.lime or colors.red)
+    line("gps (computer)", fmtPos(ship.pos))
+    line("needle rel", fmtDeg(ship.rel))
+    line("ship heading", fmtDeg(ship.heading), colors.yellow)
+    line("cannon xyz", fmtPos(ship.cannon), colors.yellow)
+    line("offset f/u/r", ("%g / %g / %g"):format(cfg.ship.offset.forward,
+      cfg.ship.offset.up, cfg.ship.offset.right))
+    line("headingOffset", cfg.ship.headingOffset)
+  else
+    line("mode", "static (land)")
+    line("cannon xyz", fmtPos(cfg.cannon), colors.yellow)
+  end
+  line("yawOffset", cfg.yawOffset)
+  local m = state.mount
+  line("CannonYaw", fmtDeg(m and m.CannonYaw))
+  line("CannonPitch", fmtDeg(m and m.CannonPitch))
+  if state.targetName then
+    line("target", state.targetName, colors.cyan)
+    line("yaw/pitch err",
+      ("%+.1f / %+.1f"):format(state.yawErr, state.pitchErr))
+  end
+  while row <= h - 1 do -- clear leftovers from the targets list
+    term.setCursorPos(1, row)
+    term.setBackgroundColor(colors.black)
+    term.clearLine()
+    row = row + 1
+  end
+end
+
 local function drawButtonBar(w, h)
   term.setCursorPos(1, h)
   term.setBackgroundColor(colors.black)
@@ -468,7 +526,11 @@ local function draw()
   ui.cells = {}
   drawTabBar(w)
   drawStatus()
-  drawTargetsList(w, h)
+  if ui.activeTab == "debug" then
+    drawDebugScreen(w, h)
+  else
+    drawTargetsList(w, h)
+  end
   drawButtonBar(w, h)
 end
 
@@ -498,6 +560,7 @@ local function trackLoop()
         else
           state.noFix = false
           local data = blockReader.getBlockData()
+          state.mount = data
           if data and data.CannonYaw and data.CannonPitch then
             state.yawErr = angleDiff(relYaw, data.CannonYaw)
             state.pitchErr = relPitch - data.CannonPitch
@@ -516,6 +579,10 @@ local function trackLoop()
       sleep(0.1)
     else
       stopMotors()
+      -- Idle aim loop doesn't touch the mount; keep the debug tab live.
+      if ui.activeTab == "debug" then
+        state.mount = blockReader.getBlockData()
+      end
       draw()
       sleep(0.5)
     end
