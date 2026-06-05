@@ -52,11 +52,20 @@ local DEFAULTS = {
     headingOffset = 0,   -- nav-table needle correction, same as CCMinimap
     navTable = "auto",
     -- Aeronautics gimbal sensor (type "gimbal_sensor", getAngles() ->
-    -- {xAngleDeg, zAngleDeg} -- see CCMissile). Raw values surface on the
-    -- DEBUG tab to work out the pitch/roll axis mapping before any aim
-    -- compensation uses them. "auto" finds one, a name wraps it, "none"
-    -- disables.
+    -- {xAngleDeg, zAngleDeg} -- see CCMissile). "auto" finds one, a name
+    -- wraps it, "none" disables (ship assumed level).
     gimbal = "auto",
+    -- Raw gimbal angles -> ship attitude. Conventions the aim math needs:
+    -- ship pitch is +nose-up, ship roll is +right-side-down (looking
+    -- forward). Verify on the DEBUG tab ("ship pitch"/"ship roll" lines)
+    -- and flip the invert flags if a tilt reads with the wrong sign.
+    -- *Rest values are what the sensor reads when the ship is perfectly
+    -- level; they get subtracted.
+    gimbalMap = {
+      pitch = "x", roll = "z",
+      invertPitch = false, invertRoll = false,
+      pitchRest = 0, rollRest = 0,
+    },
   },
   -- Subtracted from the world-space yaw so 0 matches the cannon's rest
   -- orientation. The original script's "facing south" cannon used 90.
@@ -175,15 +184,39 @@ end
 -- nav table stop answering.
 local ship = {
   pos = nil, heading = nil, cannon = nil, rel = nil,
-  gimbal = nil, -- { x, z } raw gimbal-sensor degrees, debug-only for now
+  gimbal = nil,           -- { x, z } raw gimbal-sensor degrees
+  pitch = 0, roll = 0,    -- mapped attitude: +nose-up / +right-side-down
+  basis = nil,            -- ship-frame unit vectors {f, u, r} in world coords
   freshUntil = 0,
 }
+
+-- Raw gimbal angles -> (pitch, roll) degrees per cfg.ship.gimbalMap.
+local function shipAttitude()
+  local g = ship.gimbal
+  if not g then return 0, 0 end
+  local m = cfg.ship.gimbalMap
+  local p = (g[m.pitch] - m.pitchRest) * (m.invertPitch and -1 or 1)
+  local r = (g[m.roll] - m.rollRest) * (m.invertRoll and -1 or 1)
+  return p, r
+end
+
+-- a*ca + b*cb, componentwise: rotate one basis vector toward another.
+local function mix(a, b, ca, cb)
+  return {
+    x = a.x * ca + b.x * cb,
+    y = a.y * ca + b.y * cb,
+    z = a.z * ca + b.z * cb,
+  }
+end
 
 local function updateShip()
   if gimbal then
     local ok, angles = pcall(gimbal.getAngles)
     ship.gimbal = (ok and type(angles) == "table")
       and { x = angles[1], z = angles[2] } or nil
+    -- A present-but-unreadable gimbal must not silently mean "level":
+    -- skip the update so the fix goes stale and the turret holds.
+    if not ship.gimbal then return end
   end
   local x, y, z = gps.locate(0.5)
   local rel = Heading.relativeAngle(navSource)
@@ -192,17 +225,29 @@ local function updateShip()
   local heading = Heading.fromPositionAndRelative(
     { x = x, z = z }, rel, cfg.ship.headingOffset)
   if not heading then return end
-  -- Ship-forward and ship-right unit vectors in world XZ for this heading
-  -- (compass convention: 0 = north/-Z, 90 = east/+X, clockwise).
-  local h, off = math.rad(heading), cfg.ship.offset
-  local fx, fz = math.sin(h), -math.cos(h)
-  local rx, rz = math.cos(h), math.sin(h)
+  -- Ship basis in world coords: start level at this heading (compass
+  -- convention: 0 = north/-Z, 90 = east/+X, clockwise), pitch about
+  -- ship-right (+nose-up), then roll about ship-forward (+right-down).
+  -- Euler-order error is negligible at hover-attitude angles.
+  local pitchDeg, rollDeg = shipAttitude()
+  local h = math.rad(heading)
+  local th, ph = math.rad(pitchDeg), math.rad(rollDeg)
+  local f = { x = math.sin(h), y = 0, z = -math.cos(h) }
+  local r = { x = math.cos(h), y = 0, z = math.sin(h) }
+  local u = { x = 0, y = 1, z = 0 }
+  local f2 = mix(f, u, math.cos(th), math.sin(th))
+  local u2 = mix(u, f, math.cos(th), -math.sin(th))
+  local r2 = mix(r, u2, math.cos(ph), -math.sin(ph))
+  local u3 = mix(u2, r, math.cos(ph), math.sin(ph))
+  local off = cfg.ship.offset
   ship.pos = { x = x, y = y, z = z }
   ship.heading = heading
+  ship.pitch, ship.roll = pitchDeg, rollDeg
+  ship.basis = { f = f2, u = u3, r = r2 }
   ship.cannon = {
-    x = x + fx * off.forward + rx * off.right,
-    y = y + off.up,
-    z = z + fz * off.forward + rz * off.right,
+    x = x + f2.x * off.forward + u3.x * off.up + r2.x * off.right,
+    y = y + f2.y * off.forward + u3.y * off.up + r2.y * off.right,
+    z = z + f2.z * off.forward + u3.z * off.up + r2.z * off.right,
   }
   ship.freshUntil = os.clock() + 3
 end
@@ -265,11 +310,23 @@ local function anglesFor(tx, ty, tz)
   if not c then return nil end
   local dx, dy, dz = tx - c.x, ty - c.y, tz - c.z
   local distance = math.sqrt(dx ^ 2 + dy ^ 2 + dz ^ 2)
+  if cfg.ship.enabled then
+    -- Project the target direction onto the ship frame: the mount's
+    -- yaw/pitch are deck-relative, and a rolled deck couples roll into
+    -- BOTH axes -- a constant heading subtraction can't express that.
+    local b = ship.basis
+    local df = (dx * b.f.x + dy * b.f.y + dz * b.f.z) / distance
+    local du = (dx * b.u.x + dy * b.u.y + dz * b.u.z) / distance
+    local dr = (dx * b.r.x + dy * b.r.y + dz * b.r.z) / distance
+    local relPitch = math.deg(math.asin(du)) + cfg.pitchOffset
+    -- -90: deck yaw is measured from ship-forward here, while the old
+    -- yaw-only formula measured from ship-right; keeps the tuned
+    -- yawOffset meaning what it always meant.
+    local relYaw = angleDiff(math.deg(math.atan(dr, df)) - 90 - cfg.yawOffset, 0)
+    return relYaw, relPitch
+  end
   local relPitch = math.deg(math.asin(dy / distance)) + cfg.pitchOffset
   local worldYaw = math.deg(math.atan(dz, dx))
-  -- Aboard a ship the mount angle is ship-relative, so the live heading
-  -- comes off the world-frame bearing before yawOffset.
-  if cfg.ship.enabled then worldYaw = worldYaw - ship.heading end
   return angleDiff(worldYaw - cfg.yawOffset, 0), relPitch
 end
 
@@ -525,11 +582,17 @@ local function drawDebugScreen(w, h)
     line("headingOffset", cfg.ship.headingOffset)
     if cfg.ship.gimbal ~= "none" then
       if not gimbal then
-        line("gimbal", "NOT FOUND", colors.red)
+        line("gimbal", "NOT FOUND (assuming level)", colors.red)
       else
         local g = ship.gimbal
-        line("gimbal X", g and ("%+.2f"):format(g.x) or "?", colors.orange)
-        line("gimbal Z", g and ("%+.2f"):format(g.z) or "?", colors.orange)
+        line("gimbal X/Z", g and ("%+.2f / %+.2f"):format(g.x, g.z) or "?",
+          colors.orange)
+        -- Mapped attitude: must read +up when the nose is up and +right
+        -- when the right side is down, else flip gimbalMap inverts.
+        line("ship pitch", ("%+.2f (+ = nose up)"):format(ship.pitch),
+          colors.yellow)
+        line("ship roll", ("%+.2f (+ = right down)"):format(ship.roll),
+          colors.yellow)
       end
     end
   else
