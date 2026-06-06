@@ -9,7 +9,9 @@
 -- this works from an airship where range scans see nobody); click a row to
 -- track that player, click again or [ STOP ] to release.
 --
--- Keys: F = fire, Q = quit. Mouse/touch for everything else.
+-- Keys: F = fire, A = arm/disarm, Q = quit. Mouse/touch for everything else.
+-- While armed, the fire line is held high whenever both axes are locked on
+-- (autocannon assumption) and dropped the moment lock is lost.
 --
 -- Config lives in cannon.cfg (JSON). Missing keys are filled from DEFAULTS
 -- on first boot and written back, CCMinimap-style. Edit the peripheral names
@@ -270,6 +272,8 @@ local state = {
   lost = false,      -- target set but offline / other dimension
   noFix = false,     -- ship mode and GPS/nav stopped answering
   locked = false,    -- both axes within tolerance
+  armed = false,     -- auto-fire master switch (ARM button / A key)
+  firing = false,    -- fire line currently held high by auto-fire
   yawErr = 0,
   pitchErr = 0,
   roster = {},       -- { {name, x, y, z, dist?}, ... } sorted by distance
@@ -340,11 +344,27 @@ local function stopAll()
   relay.setOutput(cfg.fireSide, false)
 end
 
+-- Manual single pulse (F key / FIRE button).
 local function fire()
+  if state.firing then return end -- auto-fire already holds the line high
   relay.setOutput(cfg.fireSide, true)
   sleep(cfg.firePulseSeconds)
   relay.setOutput(cfg.fireSide, false)
   state.flash = "FIRED"
+end
+
+-- Auto-fire (autocannon): hold the fire line high while armed and locked,
+-- drop it the moment lock is lost. A regular (single-shot) big cannon will
+-- need a pulse + reload-delay mode here once cannon type is configurable.
+local function setFiring(on)
+  if state.firing == on then return end
+  state.firing = on
+  relay.setOutput(cfg.fireSide, on)
+end
+
+local function toggleArm()
+  state.armed = not state.armed
+  if not state.armed then setFiring(false) end
 end
 
 -- ----------------------------------------------------------- calibration --
@@ -430,6 +450,7 @@ local function setTarget(name)
   state.targetName = name
   state.lost = false
   state.locked = false
+  setFiring(false) -- never carry a held fire line across a target change
   if not name then stopMotors() end
 end
 
@@ -470,9 +491,15 @@ local function drawStatus()
     elseif state.locked then
       term.setTextColor(colors.lime)
       term.write("LOCKED")
+      if state.firing then
+        term.setTextColor(colors.orange)
+        term.write(" FIRING")
+      end
     else
       term.setTextColor(colors.yellow)
-      term.write(("y%+.0f p%+.0f"):format(state.yawErr, state.pitchErr))
+      -- One decimal: whole-degree rounding hid "0.3 deg off, not locked"
+      -- as a confusing "y+0 p+0".
+      term.write(("y%+.1f p%+.1f"):format(state.yawErr, state.pitchErr))
     end
   elseif cfg.ship.enabled then
     local c = cannonPos()
@@ -488,6 +515,10 @@ local function drawStatus()
   else
     term.setTextColor(colors.lightGray)
     term.write("No target -- click a player")
+  end
+  if state.armed and not state.firing then
+    term.setTextColor(colors.red)
+    term.write("  ARMED")
   end
   if state.flash then
     term.setTextColor(colors.orange)
@@ -633,11 +664,13 @@ local function drawButtonBar(w, h)
     col = col + #label + 1
   end
   button(" FIRE ", "fire", state.locked and colors.lime or colors.red, true)
+  button(state.armed and " DISARM " or " ARM ", "arm",
+    state.armed and colors.red or colors.lime, true)
   button(" STOP ", "stop", colors.white, state.targetName ~= nil)
-  term.setCursorPos(w - 12, h)
+  term.setCursorPos(w - 18, h)
   term.setBackgroundColor(colors.black)
   term.setTextColor(colors.gray)
-  term.write("F=fire Q=quit")
+  term.write("F=fire A=arm Q=quit")
 end
 
 local function draw()
@@ -689,6 +722,10 @@ local function trackLoop()
               and math.abs(state.pitchErr) < cfg.tolerance
             yaw.setTargetSpeed(speedFor(state.yawErr, cfg.invertYaw))
             pitch.setTargetSpeed(speedFor(state.pitchErr, cfg.invertPitch))
+          else
+            -- No mount reading: don't keep reporting (or firing on) a lock
+            -- computed from stale angles.
+            state.locked = false
           end
         end
       else
@@ -696,10 +733,12 @@ local function trackLoop()
         state.locked = false
         stopMotors()
       end
+      setFiring(state.armed and state.locked)
       draw()
       sleep(0.1)
     else
       stopMotors()
+      setFiring(false)
       -- Idle aim loop doesn't touch the mount; keep the debug tab live.
       if ui.activeTab == "debug" then
         state.mount = blockReader.getBlockData()
@@ -716,6 +755,8 @@ local function handleCommand(cell)
     setTarget(cell.name)
   elseif cell.cmd == "fire" then
     fire()
+  elseif cell.cmd == "arm" then
+    toggleArm()
   elseif cell.cmd == "stop" then
     setTarget(state.targetName) -- toggle off
   elseif cell.cmd:sub(1, 4) == "tab_" then
@@ -729,6 +770,8 @@ local function inputLoop()
     if event[1] == "key" then
       if event[2] == keys.f then
         fire()
+      elseif event[2] == keys.a then
+        toggleArm()
       elseif event[2] == keys.q then
         running = false
       end

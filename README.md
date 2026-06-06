@@ -41,8 +41,12 @@ means "cannon rest direction relative to ship-forward". Ship pitch/roll
 are assumed level for now. If GPS or the nav table stop answering, the
 turret holds and shows NO FIX rather than aiming on stale data.
 
-Keys: `F` fire, `Q` quit. The turret continuously tracks the nearest
-non-whitelisted player; `LOCKED ON` means both axes are within `tolerance`.
+Keys: `F` fire (manual pulse), `A` arm/disarm, `Q` quit. The turret
+continuously tracks the selected player; `LOCKED` means both axes are
+within `tolerance`. While **armed** (ARM button or `A`; disarmed by
+default) the fire line is held high whenever the turret is locked on and
+dropped the moment lock is lost — autocannon behavior; a pulse/reload
+mode for regular cannons is planned.
 
 If an axis spins away from the target, flip `invertYaw` / `invertPitch`
 in the config instead of regearing.
