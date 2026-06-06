@@ -48,6 +48,17 @@ default) the fire line is held high whenever the turret is locked on and
 dropped the moment lock is lost — autocannon behavior; a pulse/reload
 mode for regular cannons is planned.
 
+## Transponder targets
+
+With any wireless modem attached, the TARGETS tab also lists every ship
+broadcasting CCMinimap's transponder (`airship-state` rednet protocol,
+0.5 s cadence) — `#callsign` rows in orange next to `@player` rows in
+cyan. The aim point is the peer ship's computer GPS fix (full 3D).
+Ships that go quiet for 5 s drop from the roster; a tracked ship that
+goes quiet shows `LOST` and the turret holds. **Note:** if the cannon's
+own ship runs CCMinimap, its own callsign appears in the roster — add it
+to `whitelist` so it renders dimmed.
+
 If an axis spins away from the target, flip `invertYaw` / `invertPitch`
 in the config instead of regearing.
 

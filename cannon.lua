@@ -6,8 +6,9 @@
 --
 -- Targeting is click-to-lock, CCMinimap-style: a TARGETS tab lists every
 -- online player (getOnlinePlayers/getPlayerPos are position-independent, so
--- this works from an airship where range scans see nobody); click a row to
--- track that player, click again or [ STOP ] to release.
+-- this works from an airship where range scans see nobody) plus every ship
+-- heard on the CCMinimap transponder (rednet "airship-state" broadcasts);
+-- click a row to track it, click again or [ STOP ] to release.
 --
 -- Keys: F = fire, A = arm/disarm, Q = quit. Mouse/touch for everything else.
 -- While armed, the fire line is held high whenever both axes are locked on
@@ -85,7 +86,9 @@ local DEFAULTS = {
   speedGain = 5,    -- RPM per degree of error
   maxSpeed = 60,    -- RPM cap for the speed controllers
   -- Names listed here are dimmed in the target list as a "friendly"
-  -- reminder; they can still be clicked deliberately.
+  -- reminder; they can still be clicked deliberately. Works for player
+  -- names AND ship callsigns -- when the cannon's own ship runs CCMinimap,
+  -- its transponder shows up in the roster too, so list its callsign here.
   whitelist = {},
 }
 
@@ -181,6 +184,20 @@ if cfg.ship.enabled then
   end
 end
 
+-- Transponder targets: CCMinimap ships broadcast a state snapshot on rednet
+-- protocol "airship-state" every 0.5s (airshipName + lastPos GPS fix +
+-- heading -- see CCMinimap minimap-ui.lua stateSnapshot). Any wireless modem
+-- doubles as the receiver; without one the roster just lists no ships
+-- (ship.enabled already requires a wireless modem anyway).
+local STATE_PROTOCOL = "airship-state"
+local PEER_TTL = 5  -- seconds without a broadcast before a ship is dropped
+local transponderModem = peripheral.find("modem",
+  function(_, m) return m.isWireless() end)
+if transponderModem then
+  local modemName = peripheral.getName(transponderModem)
+  if not rednet.isOpen(modemName) then rednet.open(modemName) end
+end
+
 -- Live ship fix: computer world position, heading, and the derived cannon
 -- position. freshUntil guards against aiming on stale data when GPS or the
 -- nav table stop answering.
@@ -268,15 +285,17 @@ for _, name in ipairs(cfg.whitelist) do whitelisted[name] = true end
 -- Shared state between the tracking loop and the input loop.
 local running = true
 local state = {
-  targetName = nil,  -- player we're locked onto, or nil
-  lost = false,      -- target set but offline / other dimension
+  targetKind = nil,  -- "player" | "ship", or nil
+  targetName = nil,  -- player name / ship callsign we're locked onto
+  lost = false,      -- target set but offline / other dim / transponder quiet
   noFix = false,     -- ship mode and GPS/nav stopped answering
   locked = false,    -- both axes within tolerance
   armed = false,     -- auto-fire master switch (ARM button / A key)
   firing = false,    -- fire line currently held high by auto-fire
   yawErr = 0,
   pitchErr = 0,
-  roster = {},       -- { {name, x, y, z, dist?}, ... } sorted by distance
+  roster = {},       -- { {kind, name, x, y, z, dist?}, ... } sorted by distance
+  peerShips = {},    -- transponder ships by callsign: {x,y,z,heading,seenAt}
   mount = nil,       -- last block-reader NBT, for the debug tab
   flash = nil,       -- transient status message (e.g. "FIRED")
 }
@@ -418,35 +437,82 @@ end
 
 -- -------------------------------------------------------------- targeting --
 
--- Refresh the online-player roster. getPlayerPos is position-independent
--- (any distance, same dimension) so this works from an assembled airship;
--- players in another dimension get no coords and show as untargetable.
+-- Ingest one transponder broadcast (CCMinimap handlePeerState pattern).
+-- lastPos is the peer computer's GPS fix -- full 3D, exactly what the aim
+-- math needs. Broadcasts without a numeric y are useless here and dropped.
+local function handlePeerState(msg)
+  if type(msg) ~= "table" then return end
+  local name = msg.airshipName
+  if type(name) ~= "string" or name == "" then return end
+  local pos = msg.lastPos
+  if type(pos) ~= "table" or type(pos.x) ~= "number"
+    or type(pos.y) ~= "number" or type(pos.z) ~= "number" then return end
+  state.peerShips[name] = {
+    x = pos.x, y = pos.y, z = pos.z,
+    heading = msg.shipHeading,
+    seenAt = os.clock(),
+  }
+end
+
+local function peerFresh(peer)
+  return peer ~= nil and (os.clock() - peer.seenAt) <= PEER_TTL
+end
+
+-- Current world position of the tracked target, or nil when it's lost
+-- (player offline/other dim, ship transponder gone quiet).
+local function targetPos()
+  if state.targetKind == "ship" then
+    local peer = state.peerShips[state.targetName]
+    return peerFresh(peer) and peer or nil
+  end
+  -- Second arg = decimal places (AP floors to whole blocks by default).
+  local pos = entDet.getPlayerPos(state.targetName, 2)
+  return (pos and pos.x) and pos or nil
+end
+
+-- Refresh the target roster: online players plus fresh transponder ships.
+-- getPlayerPos is position-independent (any distance, same dimension) so
+-- this works from an assembled airship; players in another dimension get
+-- no coords and show as untargetable. Stale ships are evicted here.
 local function refreshRoster()
   local c = cannonPos() -- may be nil on a stale ship fix: rows lose distances
   local roster = {}
+  local function add(item)
+    if item.x and c then
+      local dx, dy, dz = item.x - c.x, item.y - c.y, item.z - c.z
+      item.dist = math.floor(math.sqrt(dx * dx + dy * dy + dz * dz))
+    end
+    roster[#roster + 1] = item
+  end
   for _, name in ipairs(entDet.getOnlinePlayers() or {}) do
-    local item = { name = name }
-    -- Second arg = decimal places (AP floors to whole blocks by default).
+    local item = { kind = "player", name = name }
     local pos = entDet.getPlayerPos(name, 2)
     if pos and pos.x then
       item.x, item.y, item.z = pos.x, pos.y, pos.z
-      if c then
-        local dx, dy, dz = pos.x - c.x, pos.y - c.y, pos.z - c.z
-        item.dist = math.floor(math.sqrt(dx * dx + dy * dy + dz * dz))
-      end
     end
-    roster[#roster + 1] = item
+    add(item)
+  end
+  for name, peer in pairs(state.peerShips) do
+    if peerFresh(peer) then
+      add({ kind = "ship", name = name, x = peer.x, y = peer.y, z = peer.z })
+    else
+      state.peerShips[name] = nil
+    end
   end
   table.sort(roster, function(a, b)
     local da, db = a.dist or math.huge, b.dist or math.huge
     if da ~= db then return da < db end
+    if a.kind ~= b.kind then return a.kind < b.kind end -- players first
     return a.name < b.name
   end)
   state.roster = roster
 end
 
-local function setTarget(name)
-  if state.targetName == name then name = nil end -- click again to release
+local function setTarget(kind, name)
+  if state.targetKind == kind and state.targetName == name then
+    kind, name = nil, nil -- click again to release
+  end
+  state.targetKind = kind
   state.targetName = name
   state.lost = false
   state.locked = false
@@ -478,10 +544,11 @@ local function drawStatus()
   term.setBackgroundColor(colors.black)
   term.clearLine()
   if state.targetName then
+    local isShip = state.targetKind == "ship"
     term.setTextColor(colors.lightGray)
     term.write("Target ")
-    term.setTextColor(colors.cyan)
-    term.write(state.targetName .. " ")
+    term.setTextColor(isShip and colors.orange or colors.cyan)
+    term.write((isShip and "#" or "@") .. state.targetName .. " ")
     if state.lost then
       term.setTextColor(colors.red)
       term.write("LOST")
@@ -514,7 +581,7 @@ local function drawStatus()
     end
   else
     term.setTextColor(colors.lightGray)
-    term.write("No target -- click a player")
+    term.write("No target -- click a player or ship")
   end
   if state.armed and not state.firing then
     term.setTextColor(colors.red)
@@ -538,13 +605,16 @@ local function drawTargetsList(w, h)
     term.setBackgroundColor(colors.black)
     term.clearLine()
     if item then
+      local isShip = item.kind == "ship"
       local selected = item.name == state.targetName
+        and item.kind == state.targetKind
       local friendly = whitelisted[item.name]
       term.setBackgroundColor(selected and colors.gray or colors.black)
       term.setTextColor(selected and colors.white or colors.lightGray)
       term.write(selected and ">" or " ")
-      term.setTextColor(friendly and colors.gray or colors.cyan)
-      term.write(("@%-16s"):format(item.name:sub(1, 16)))
+      term.setTextColor(friendly and colors.gray
+        or (isShip and colors.orange or colors.cyan))
+      term.write(((isShip and "#" or "@") .. "%-16s"):format(item.name:sub(1, 16)))
       if item.dist then
         term.setTextColor(colors.white)
         term.write((" %dm"):format(item.dist))
@@ -552,8 +622,8 @@ local function drawTargetsList(w, h)
         term.setTextColor(colors.gray)
         term.write(" other dim")
       end -- has coords but no cannon fix: distance unknown, leave blank
-      ui.cells[#ui.cells + 1] =
-        { col1 = 1, col2 = w, row = row, cmd = "select", name = item.name }
+      ui.cells[#ui.cells + 1] = { col1 = 1, col2 = w, row = row,
+        cmd = "select", kind = item.kind, name = item.name }
     end
   end
 end
@@ -634,6 +704,13 @@ local function drawDebugScreen(w, h)
   local m = state.mount
   line("CannonYaw", fmtDeg(m and m.CannonYaw))
   line("CannonPitch", fmtDeg(m and m.CannonPitch))
+  if transponderModem then
+    local nShips = 0
+    for _ in pairs(state.peerShips) do nShips = nShips + 1 end
+    line("transponders", nShips)
+  else
+    line("transponders", "NO WIRELESS MODEM", colors.red)
+  end
   if state.targetName then
     line("target", state.targetName, colors.cyan)
     line("yaw/pitch err",
@@ -702,8 +779,8 @@ local function trackLoop()
     if tick % 10 == 0 then refreshRoster() end
     tick = tick + 1
     if state.targetName then
-      local pos = entDet.getPlayerPos(state.targetName, 2)
-      if pos and pos.x then
+      local pos = targetPos()
+      if pos then
         state.lost = false
         local relYaw, relPitch = anglesFor(pos.x, pos.y, pos.z)
         if not relYaw then
@@ -752,15 +829,29 @@ end
 
 local function handleCommand(cell)
   if cell.cmd == "select" then
-    setTarget(cell.name)
+    setTarget(cell.kind, cell.name)
   elseif cell.cmd == "fire" then
     fire()
   elseif cell.cmd == "arm" then
     toggleArm()
   elseif cell.cmd == "stop" then
-    setTarget(state.targetName) -- toggle off
+    setTarget(state.targetKind, state.targetName) -- toggle off
   elseif cell.cmd:sub(1, 4) == "tab_" then
     ui.activeTab = cell.cmd:sub(5)
+  end
+end
+
+-- Transponder listener: park on the rednet protocol and ingest peer ship
+-- broadcasts as they arrive. Eviction happens in refreshRoster (1s cadence)
+-- and per-tick freshness in targetPos, so this loop only ever adds.
+local function rednetLoop()
+  if not transponderModem then
+    while running do sleep(1) end
+    return
+  end
+  while running do
+    local _, msg = rednet.receive(STATE_PROTOCOL, 1.0)
+    if msg then handlePeerState(msg) end
   end
 end
 
@@ -797,7 +888,7 @@ term.clear()
 if cfg.ship.enabled then updateShip() end
 refreshRoster()
 draw()
-local ok, err = pcall(parallel.waitForAny, trackLoop, inputLoop)
+local ok, err = pcall(parallel.waitForAny, trackLoop, inputLoop, rednetLoop)
 stopAll()
 term.setBackgroundColor(colors.black)
 term.setTextColor(colors.white)
