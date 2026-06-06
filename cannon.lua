@@ -127,6 +127,18 @@ local DEFAULTS = {
     -- Per-callsign overrides, e.g. { CBJK = { areaRadius = 12 } }.
     perShip = {},
   },
+  -- Hard travel limits per axis, in mount-frame degrees (the block
+  -- reader's CannonYaw/CannonPitch convention: 0 = the rest orientation,
+  -- which yawOffset places relative to the ship). A target outside the
+  -- arc clamps to the nearest edge: the barrel parks at the limit ready
+  -- for re-entry, the status shows OUT OF ARC, and the fire gate only
+  -- opens if shots from inside the arc would still hit. Drive errors are
+  -- computed unwrapped, so the barrel never slews through the forbidden
+  -- zone behind the arc (i.e. through your own ship).
+  limits = {
+    yaw = { min = -90, max = 90 },
+    pitch = { min = -30, max = 60 },
+  },
   -- Drive tuning per axis: RPM = error degrees * speedGain, capped at
   -- maxSpeed. The axes have different gearing/inertia, so they tune
   -- separately -- if one oscillates around the target while the other
@@ -337,6 +349,7 @@ local state = {
   targetName = nil,  -- player name / ship callsign we're locked onto
   lost = false,      -- target set but offline / other dim / transponder quiet
   noFix = false,     -- ship mode and GPS/nav stopped answering
+  outOfArc = false,  -- aim solution clamped to a travel limit
   locked = false,    -- both axes within tolerance
   armed = false,     -- auto-fire master switch (ARM button / A key)
   firing = false,    -- fire line currently held high by auto-fire
@@ -653,6 +666,7 @@ local function setTarget(kind, name)
   state.targetName = name
   state.lost = false
   state.locked = false
+  state.outOfArc = false
   state.miss, state.missH, state.missV = nil, nil, nil
   state.lead = nil
   resetLead()
@@ -702,6 +716,9 @@ local function drawStatus()
         term.setTextColor(colors.orange)
         term.write(" FIRING")
       end
+    elseif state.outOfArc then
+      term.setTextColor(colors.orange)
+      term.write("OUT OF ARC")
     else
       term.setTextColor(colors.yellow)
       -- One decimal: whole-degree rounding hid "0.3 deg off, not locked"
@@ -860,6 +877,8 @@ local function drawDebugScreen(w, h)
     line("target", state.targetName, colors.cyan)
     line("yaw/pitch err",
       ("%+.1f / %+.1f"):format(state.yawErr, state.pitchErr))
+    line("arc", state.outOfArc and "OUT (parked at limit)" or "in",
+      state.outOfArc and colors.orange or colors.lime)
     if state.targetKind == "ship" then
       local area, avoid = shipArea(state.targetName)
       line("hull miss", state.miss
@@ -980,8 +999,21 @@ local function trackLoop()
           local data = blockReader.getBlockData()
           state.mount = data
           if data and data.CannonYaw and data.CannonPitch then
-            state.yawErr = angleDiff(relYaw, data.CannonYaw)
-            state.pitchErr = relPitch - data.CannonPitch
+            -- Travel limits: drive toward the solution clamped into the
+            -- arc (parks at the edge while the target is outside, ready
+            -- for re-entry). Errors are plain unwrapped differences, NOT
+            -- shortest-path: with the forbidden zone behind the arc, the
+            -- short way through it is exactly the slew that must never
+            -- happen.
+            local lim = cfg.limits
+            local cy = angleDiff(data.CannonYaw, 0)
+            local aimYaw = math.max(lim.yaw.min,
+              math.min(relYaw, lim.yaw.max))
+            local aimPitch = math.max(lim.pitch.min,
+              math.min(relPitch, lim.pitch.max))
+            state.outOfArc = aimYaw ~= relYaw or aimPitch ~= relPitch
+            state.yawErr = aimYaw - cy
+            state.pitchErr = aimPitch - data.CannonPitch
             if area then
               -- Hull gate replaces the per-axis tolerance lock: fire as
               -- soon as the shot would land on the hull ring, while the
@@ -991,15 +1023,21 @@ local function trackLoop()
               -- Hitbox gate: fire while the shot would pass through the
               -- body box hanging below the reported head Y, OR once both
               -- axes settle inside tolerance (long range, where the box
-              -- subtends less than the deadband). missV is measured from
-              -- the AIM point, so shift by aimOffset back to the head.
+              -- subtends less than the deadband). Gate errors are vs the
+              -- TRUE aim solution, not the clamped one -- parked at an
+              -- arc edge, fire only if shots from there would still hit;
+              -- the tolerance lock is meaningless at a clamped setpoint.
+              -- missV is measured from the AIM point, so shift by
+              -- aimOffset back to the head.
               local hb = cfg.playerHitbox
-              state.missH, state.missV = missComponents(state.yawErr,
-                state.pitchErr, data.CannonPitch, dist)
+              state.missH, state.missV = missComponents(
+                angleDiff(relYaw, data.CannonYaw),
+                relPitch - data.CannonPitch, data.CannonPitch, dist)
               local vHead = state.missV + hb.aimOffset
               state.locked = (math.abs(state.missH) <= hb.width / 2
                   and vHead <= hb.up and vHead >= -hb.down)
-                or (math.abs(state.yawErr) < cfg.tolerance
+                or (not state.outOfArc
+                  and math.abs(state.yawErr) < cfg.tolerance
                   and math.abs(state.pitchErr) < cfg.tolerance)
             end
             yaw.setTargetSpeed(speedFor(state.yawErr, cfg.invertYaw,

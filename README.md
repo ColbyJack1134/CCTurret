@@ -97,6 +97,19 @@ that ring fire immediately while the barrel keeps converging on the
 center; the transponder block itself is never fired on. The status
 line shows the live miss distance while closing in.
 
+## Travel limits
+
+`limits.yaw` (default −90..+90) and `limits.pitch` (default −30..+60)
+bound the mount in rest-relative degrees (0 = the barrel's rest
+orientation, wherever `yawOffset` points it — e.g. off the ship's
+starboard side). A target outside the arc shows `OUT OF ARC`: the
+barrel parks at the nearest limit, ready for re-entry, and fire only
+opens if shots from inside the arc would still hit. Slews never route
+through the zone behind the arc (no shortest-path wrap), so the barrel
+can't sweep across your own ship. For a free-standing 360° cannon set
+yaw to −180..180 (note: it will then unwind the long way around rather
+than crossing the ±180 seam).
+
 If an axis spins away from the target, flip `invertYaw` / `invertPitch`
 in the config instead of regearing.
 
