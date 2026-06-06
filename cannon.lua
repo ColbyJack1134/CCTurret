@@ -110,8 +110,12 @@ local DEFAULTS = {
     -- Per-callsign overrides, e.g. { CBJK = { areaRadius = 12 } }.
     perShip = {},
   },
-  speedGain = 5,    -- RPM per degree of error
-  maxSpeed = 60,    -- RPM cap for the speed controllers
+  -- Drive tuning per axis: RPM = error degrees * speedGain, capped at
+  -- maxSpeed. The axes have different gearing/inertia, so they tune
+  -- separately -- if one oscillates around the target while the other
+  -- is clean, lower the oscillating axis's speedGain.
+  yawDrive = { speedGain = 3, maxSpeed = 100 },
+  pitchDrive = { speedGain = 6, maxSpeed = 120 },
   -- Names listed here are dimmed in the target list as a "friendly"
   -- reminder; they can still be clicked deliberately. Works for player
   -- names AND ship callsigns -- when the cannon's own ship runs CCMinimap,
@@ -347,10 +351,10 @@ local function angleDiff(target, current)
   return ((target - current + 180) % 360) - 180
 end
 
--- Proportional controller: RPM scales with error, capped at maxSpeed.
-local function speedFor(diff, invert)
+-- Proportional controller: RPM scales with error, capped per axis.
+local function speedFor(diff, invert, drive)
   if math.abs(diff) < cfg.tolerance then return 0 end
-  local speed = math.min(math.abs(diff) * cfg.speedGain, cfg.maxSpeed)
+  local speed = math.min(math.abs(diff) * drive.speedGain, drive.maxSpeed)
   local sign = diff > 0 and 1 or -1
   if invert then sign = -sign end
   return speed * sign
@@ -911,8 +915,10 @@ local function trackLoop()
                 or (math.abs(state.yawErr) < cfg.tolerance
                   and math.abs(state.pitchErr) < cfg.tolerance)
             end
-            yaw.setTargetSpeed(speedFor(state.yawErr, cfg.invertYaw))
-            pitch.setTargetSpeed(speedFor(state.pitchErr, cfg.invertPitch))
+            yaw.setTargetSpeed(speedFor(state.yawErr, cfg.invertYaw,
+              cfg.yawDrive))
+            pitch.setTargetSpeed(speedFor(state.pitchErr, cfg.invertPitch,
+              cfg.pitchDrive))
           else
             -- No mount reading: don't keep reporting (or firing on) a lock
             -- computed from stale angles.
