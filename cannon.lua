@@ -398,16 +398,23 @@ end
 -- deadband; the FF term keeps the barrel moving WITH a moving aim point
 -- so the error stays inside the deadband instead of regrowing each tick.
 local function speedFor(diff, invert, drive, ffRate)
+  local ff = 0
+  local degPerSec = drive.degPerSecPerRpm
+  if ffRate and type(degPerSec) == "number" and degPerSec > 0 then
+    ff = ffRate / degPerSec
+  end
+  -- The deadband only exists so a PARKED barrel doesn't hunt. While the
+  -- setpoint is moving (ff active) the P term must stay live inside it,
+  -- or the barrel -- always entering the deadband from behind on a
+  -- mover -- settles at its trailing edge and every shot lands a touch
+  -- behind: an offset relative to the setpoint itself, which no
+  -- latencySeconds value can compensate.
   local rpm = 0
-  if math.abs(diff) >= cfg.tolerance then
+  if math.abs(diff) >= cfg.tolerance or math.abs(ff) > 0.5 then
     rpm = math.min(math.abs(diff) * drive.speedGain, drive.maxSpeed)
     if diff < 0 then rpm = -rpm end
   end
-  local degPerSec = drive.degPerSecPerRpm
-  if ffRate and type(degPerSec) == "number" and degPerSec > 0 then
-    rpm = rpm + ffRate / degPerSec
-  end
-  rpm = math.max(-drive.maxSpeed, math.min(rpm, drive.maxSpeed))
+  rpm = math.max(-drive.maxSpeed, math.min(rpm + ff, drive.maxSpeed))
   if invert then rpm = -rpm end
   return rpm
 end
