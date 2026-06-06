@@ -114,8 +114,8 @@ local DEFAULTS = {
   -- maxSpeed. The axes have different gearing/inertia, so they tune
   -- separately -- if one oscillates around the target while the other
   -- is clean, lower the oscillating axis's speedGain.
-  yawDrive = { speedGain = 3, maxSpeed = 100 },
-  pitchDrive = { speedGain = 6, maxSpeed = 120 },
+  yawDrive = { speedGain = 6, maxSpeed = 120 },
+  pitchDrive = { speedGain = 3, maxSpeed = 100 },
   -- Names listed here are dimmed in the target list as a "friendly"
   -- reminder; they can still be clicked deliberately. Works for player
   -- names AND ship callsigns -- when the cannon's own ship runs CCMinimap,
