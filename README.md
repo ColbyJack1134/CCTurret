@@ -48,6 +48,18 @@ default) the fire line is held high whenever the turret is locked on and
 dropped the moment lock is lost — autocannon behavior; a pulse/reload
 mode for regular cannons is planned.
 
+Player targets are aimed with **predictive lead** (`lead` in the
+config): target velocity is estimated from successive positions
+(EMA-smoothed over `smoothingSeconds`) and the turret aims where the
+target will be after the shell's flight time —
+`distance / muzzleVelocity` plus `latencySeconds` of fixed lag. The
+fire gate follows the predicted box, so shells are gated on where the
+target *will* be, not where it was. Calibrate `muzzleVelocity` against
+a strafing target: shots trailing behind = value too low, leading in
+front = too high. `enabled = false` reverts to aiming at the live
+position. The DEBUG tab shows the live lead distance, target speed,
+and lead time.
+
 Player targets lock onto the head (`getPlayerPos` reports ~head level;
 `playerHitbox.aimOffset` shifts the setpoint if shots ride high or
 low). Fire opens early: as soon as the shot would pass through the

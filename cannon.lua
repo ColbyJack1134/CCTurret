@@ -93,6 +93,21 @@ local DEFAULTS = {
   -- where the box subtends less than the deadband). Pad the numbers if
   -- the gate feels too strict.
   playerHitbox = { width = 0.6, up = 0.2, down = 1.8, aimOffset = 0 },
+  -- Predictive lead for player targets: aim where the target WILL be
+  -- when the shell arrives -- pos + velocity * (flight time + latency).
+  -- muzzleVelocity is the shell speed in blocks/second; calibrate it by
+  -- firing at a moving target and tightening until hits land centered
+  -- (too low = shots trail behind the target, too high = they lead in
+  -- front). latencySeconds covers detector staleness + redstone + loop
+  -- lag on top of flight time. smoothingSeconds is the velocity
+  -- estimator's EMA time constant: lower follows jukes faster but
+  -- jitters more, higher is steadier but slower to notice turns.
+  lead = {
+    enabled = true,
+    muzzleVelocity = 80,
+    latencySeconds = 0.15,
+    smoothingSeconds = 0.3,
+  },
   -- Tracking loop period in seconds while a target is set. CC timers
   -- quantize to 0.05 (one game tick): 0.05 doubles the aim update rate
   -- for twice the peripheral traffic; the roster (1s) and idle ship fix
@@ -328,6 +343,7 @@ local state = {
   miss = nil,        -- ship target: radial miss distance in blocks
   missH = nil,       -- player target: signed horizontal / vertical miss
   missV = nil,       --   in blocks (drives the hitbox fire gate)
+  lead = nil,        -- player lead debug: { speed, blocks, tof }
   roster = {},       -- { {kind, name, x, y, z, dist?}, ... } sorted by distance
   peerShips = {},    -- transponder ships by callsign: {x,y,z,heading,seenAt}
   mount = nil,       -- last block-reader NBT, for the debug tab
@@ -408,6 +424,58 @@ end
 local function missDistance(yawErr, pitchErr, mountPitch, dist)
   local h, v = missComponents(yawErr, pitchErr, mountPitch, dist)
   return math.sqrt(h * h + v * v)
+end
+
+-- ------------------------------------------------------------- prediction --
+
+-- Target velocity estimate: EMA-smoothed finite differences over the
+-- tracked target's position samples. One shared track -- it resets on
+-- every target change.
+local track = { x = nil, y = nil, z = nil, t = nil, vx = 0, vy = 0, vz = 0 }
+
+local function resetLead()
+  track.t = nil
+  track.vx, track.vy, track.vz = 0, 0, 0
+end
+
+local function updateLead(pos)
+  local t = os.clock()
+  if track.t then
+    local dt = t - track.t
+    if dt > 1 then
+      -- Sample gap (target was LOST a while): old velocity is fiction.
+      track.vx, track.vy, track.vz = 0, 0, 0
+    elseif dt > 0 then
+      local a = dt / (cfg.lead.smoothingSeconds + dt)
+      track.vx = track.vx + a * ((pos.x - track.x) / dt - track.vx)
+      track.vy = track.vy + a * ((pos.y - track.y) / dt - track.vy)
+      track.vz = track.vz + a * ((pos.z - track.z) / dt - track.vz)
+    end
+  end
+  track.x, track.y, track.z, track.t = pos.x, pos.y, pos.z, t
+end
+
+-- Intercept point: where the target will be after the shell's flight time
+-- (plus fixed latency), with one refinement pass so the flight time is
+-- measured to the predicted point, not the current one. Returns the aim
+-- position and the lead time used.
+local function leadPoint(pos)
+  local c = cannonPos()
+  local v0 = cfg.lead.muzzleVelocity
+  if not c or v0 <= 0 then return pos, 0 end
+  local function leadTime(p)
+    local dx, dy, dz = p.x - c.x, p.y - c.y, p.z - c.z
+    return math.sqrt(dx * dx + dy * dy + dz * dz) / v0
+      + cfg.lead.latencySeconds
+  end
+  local t1 = leadTime(pos)
+  local t2 = leadTime({ x = pos.x + track.vx * t1, y = pos.y + track.vy * t1,
+    z = pos.z + track.vz * t1 })
+  return {
+    x = pos.x + track.vx * t2,
+    y = pos.y + track.vy * t2,
+    z = pos.z + track.vz * t2,
+  }, t2
 end
 
 -- Ship-target fire gate: would the shot land within `area` blocks of the
@@ -584,6 +652,8 @@ local function setTarget(kind, name)
   state.lost = false
   state.locked = false
   state.miss, state.missH, state.missV = nil, nil, nil
+  state.lead = nil
+  resetLead()
   setFiring(false) -- never carry a held fire line across a target change
   if not name then stopMotors() end
 end
@@ -799,6 +869,12 @@ local function drawDebugScreen(w, h)
         and ("%+.2f / %+.2f (box %g +%g/-%g)"):format(
           state.missH, state.missV, hb.width, hb.up, hb.down)
         or "?", state.locked and colors.lime or colors.yellow)
+      if cfg.lead.enabled then
+        line("lead", state.lead
+          and ("%.1fm @ %.1fm/s (t %.2fs)"):format(
+            state.lead.blocks, state.lead.speed, state.lead.tof)
+          or "?", colors.orange)
+      end
     end
   end
   while row <= h - 1 do -- clear leftovers from the targets list
@@ -873,16 +949,25 @@ local function trackLoop()
         state.lost = false
         -- Ship targets: aim below the transponder, never at it (the
         -- broadcast position is the block keeping the target on the air).
-        -- Players: lock the reported (head-level) Y plus aimOffset.
+        -- Players: lock the reported (head-level) Y plus aimOffset, led
+        -- to the intercept point when prediction is on.
         local area, avoid
-        local aimY
+        local ax, ay, az = pos.x, pos.y, pos.z
         if state.targetKind == "ship" then
           area, avoid = shipArea(state.targetName)
-          aimY = pos.y - avoid * 1.5
+          ay = ay - avoid * 1.5
         else
-          aimY = pos.y + cfg.playerHitbox.aimOffset
+          if cfg.lead.enabled then
+            updateLead(pos)
+            local p, tof = leadPoint(pos)
+            local speed = math.sqrt(track.vx * track.vx
+              + track.vy * track.vy + track.vz * track.vz)
+            state.lead = { speed = speed, blocks = speed * tof, tof = tof }
+            ax, ay, az = p.x, p.y, p.z
+          end
+          ay = ay + cfg.playerHitbox.aimOffset
         end
-        local relYaw, relPitch, dist = anglesFor(pos.x, aimY, pos.z)
+        local relYaw, relPitch, dist = anglesFor(ax, ay, az)
         if not relYaw then
           -- Stale ship fix: hold rather than aim with old coords/heading.
           state.noFix = true
