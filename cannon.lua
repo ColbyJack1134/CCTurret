@@ -1005,13 +1005,20 @@ local function trackLoop()
             -- shortest-path: with the forbidden zone behind the arc, the
             -- short way through it is exactly the slew that must never
             -- happen.
+            -- Yaw angles are re-centered on the ARC's midpoint before
+            -- clamping (not on 0): with an off-center arc like 0..180, a
+            -- target just past the max edge would otherwise normalize to
+            -- ~-180 and clamp to the WRONG edge, swinging the barrel all
+            -- the way across the arc.
             local lim = cfg.limits
-            local cy = angleDiff(data.CannonYaw, 0)
+            local yawMid = (lim.yaw.min + lim.yaw.max) / 2
+            local cy = yawMid + angleDiff(data.CannonYaw, yawMid)
+            local tgtYaw = yawMid + angleDiff(relYaw, yawMid)
             local aimYaw = math.max(lim.yaw.min,
-              math.min(relYaw, lim.yaw.max))
+              math.min(tgtYaw, lim.yaw.max))
             local aimPitch = math.max(lim.pitch.min,
               math.min(relPitch, lim.pitch.max))
-            state.outOfArc = aimYaw ~= relYaw or aimPitch ~= relPitch
+            state.outOfArc = aimYaw ~= tgtYaw or aimPitch ~= relPitch
             state.yawErr = aimYaw - cy
             state.pitchErr = aimPitch - data.CannonPitch
             if area then
