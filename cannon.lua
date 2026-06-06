@@ -83,6 +83,12 @@ local DEFAULTS = {
   invertYaw = "auto",
   invertPitch = "auto",
   tolerance = 1,    -- degrees of acceptable aim error per axis
+  -- Player targets: open fire as soon as the shot would land within this
+  -- many blocks of the player, even before both axes settle inside
+  -- `tolerance` -- the turret keeps converging on the exact aim while
+  -- already shooting. (At long range the tolerance lock alone applies:
+  -- this radius can subtend less than the motor deadband.)
+  playerFireRadius = 2,
   -- Ship (transponder) targets: the broadcast position IS the peer's
   -- computer, and destroying it loses the target's coords. So the turret
   -- aims 1.5*avoidRadius BELOW the transponder (into the hull), and the
@@ -306,8 +312,8 @@ local state = {
   firing = false,    -- fire line currently held high by auto-fire
   yawErr = 0,
   pitchErr = 0,
-  miss = nil,        -- ship target: barrel line's miss distance from the
-                     -- transponder in blocks (drives the hull fire gate)
+  miss = nil,        -- barrel line's miss distance from the target in
+                     -- blocks (drives the hull / near-miss fire gates)
   roster = {},       -- { {kind, name, x, y, z, dist?}, ... } sorted by distance
   peerShips = {},    -- transponder ships by callsign: {x,y,z,heading,seenAt}
   mount = nil,       -- last block-reader NBT, for the debug tab
@@ -375,19 +381,23 @@ local function shipArea(name)
     o.avoidRadius or cfg.shipTargets.avoidRadius
 end
 
--- Ship-target fire gate: would a shot along the barrel's CURRENT direction
--- land within `area` blocks of the transponder, but no closer than `avoid`?
--- Returns gate, missBlocks. Perpendicular miss distance of the barrel line
--- from the transponder is dist * sin(angular error); the yaw component
--- shrinks by cos(pitch) on the way to a true angular distance.
+-- Perpendicular miss distance in blocks of the barrel's CURRENT line from a
+-- point `dist` blocks away, given the angular errors toward it: dist *
+-- sin(angular error), with the yaw component shrunk by cos(pitch) on the
+-- way to a true angular distance.
+local function missDistance(yawErr, pitchErr, mountPitch, dist)
+  local ey = yawErr * math.cos(math.rad(mountPitch))
+  local ang = math.min(math.sqrt(ey * ey + pitchErr * pitchErr), 90)
+  return dist * math.sin(math.rad(ang))
+end
+
+-- Ship-target fire gate: would the shot land within `area` blocks of the
+-- transponder, but no closer than `avoid`? Returns gate, missBlocks.
 local function hullGate(center, mount, area, avoid)
   local relYaw, relPitch, dist = anglesFor(center.x, center.y, center.z)
   if not relYaw then return false, nil end
-  local ey = angleDiff(relYaw, mount.CannonYaw)
-    * math.cos(math.rad(mount.CannonPitch))
-  local ep = relPitch - mount.CannonPitch
-  local ang = math.min(math.sqrt(ey * ey + ep * ep), 90)
-  local miss = dist * math.sin(math.rad(ang))
+  local miss = missDistance(angleDiff(relYaw, mount.CannonYaw),
+    relPitch - mount.CannonPitch, mount.CannonPitch, dist)
   return miss <= area and miss >= avoid, miss
 end
 
@@ -606,7 +616,7 @@ local function drawStatus()
       -- One decimal: whole-degree rounding hid "0.3 deg off, not locked"
       -- as a confusing "y+0 p+0".
       term.write(("y%+.1f p%+.1f"):format(state.yawErr, state.pitchErr))
-      if state.targetKind == "ship" and state.miss then
+      if state.miss then
         term.write((" miss %.0fm"):format(state.miss))
       end
     end
@@ -762,6 +772,10 @@ local function drawDebugScreen(w, h)
       line("hull miss", state.miss
         and ("%.1f (fire %g..%g)"):format(state.miss, avoid, area) or "?",
         state.locked and colors.lime or colors.yellow)
+    else
+      line("aim miss", state.miss
+        and ("%.1f (fire <=%g)"):format(state.miss, cfg.playerFireRadius)
+        or "?", state.locked and colors.lime or colors.yellow)
     end
   end
   while row <= h - 1 do -- clear leftovers from the targets list
@@ -838,7 +852,7 @@ local function trackLoop()
           area, avoid = shipArea(state.targetName)
           aimY = pos.y - avoid * 1.5
         end
-        local relYaw, relPitch = anglesFor(pos.x, aimY, pos.z)
+        local relYaw, relPitch, dist = anglesFor(pos.x, aimY, pos.z)
         if not relYaw then
           -- Stale ship fix: hold rather than aim with old coords/heading.
           state.noFix = true
@@ -857,8 +871,14 @@ local function trackLoop()
               -- motors keep converging on the below-transponder aim point.
               state.locked, state.miss = hullGate(pos, data, area, avoid)
             else
-              state.locked = math.abs(state.yawErr) < cfg.tolerance
-                and math.abs(state.pitchErr) < cfg.tolerance
+              -- Tolerance lock OR near-miss gate: open fire once the shot
+              -- would land within playerFireRadius while still converging
+              -- on the exact aim.
+              state.miss = missDistance(state.yawErr, state.pitchErr,
+                data.CannonPitch, dist)
+              state.locked = state.miss <= cfg.playerFireRadius
+                or (math.abs(state.yawErr) < cfg.tolerance
+                  and math.abs(state.pitchErr) < cfg.tolerance)
             end
             yaw.setTargetSpeed(speedFor(state.yawErr, cfg.invertYaw))
             pitch.setTargetSpeed(speedFor(state.pitchErr, cfg.invertPitch))

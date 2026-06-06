@@ -48,6 +48,11 @@ default) the fire line is held high whenever the turret is locked on and
 dropped the moment lock is lost — autocannon behavior; a pulse/reload
 mode for regular cannons is planned.
 
+Player targets also open fire early: as soon as the shot would land
+within `playerFireRadius` blocks (default 2) of the player, the line
+goes high while the turret keeps converging on the exact aim. The
+status line shows the live miss distance until lock.
+
 ## Transponder targets
 
 With any wireless modem attached, the TARGETS tab also lists every ship
