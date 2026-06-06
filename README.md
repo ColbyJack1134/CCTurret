@@ -54,11 +54,18 @@ config): target velocity is estimated from successive positions
 target will be after the shell's flight time —
 `distance / muzzleVelocity` plus `latencySeconds` of fixed lag. The
 fire gate follows the predicted box, so shells are gated on where the
-target *will* be, not where it was. Calibrate `muzzleVelocity` against
-a strafing target: shots trailing behind = value too low, leading in
-front = too high. `enabled = false` reverts to aiming at the live
-position. The DEBUG tab shows the live lead distance, target speed,
-and lead time.
+target *will* be, not where it was. `enabled = false` reverts to
+aiming at the live position. The DEBUG tab shows the live lead
+distance, target speed, and lead time.
+
+`muzzleVelocity` is in blocks/second. CBC autocannon muzzle speed is
+set by the cannon, not the round:
+`20 × (baseSpeed + perBarrel × min(barrels, cap))` blocks/sec —
+cast iron `20×(5 + 2×b≤2)`, bronze `20×(3 + 1.5×b≤3)`, steel
+`20×(3 + 1.5×b≤4)`; a full-length steel or cast-iron gun is 180.
+Fine-tune on a strafing target: shots trailing behind = value too
+high, leading in front = too low. Mind `projectileLifetime`: cast iron
+rounds despawn after ~99 blocks, bronze ~187, steel ~540.
 
 Player targets lock onto the head (`getPlayerPos` reports ~head level;
 `playerHitbox.aimOffset` shifts the setpoint if shots ride high or

@@ -95,16 +95,18 @@ local DEFAULTS = {
   playerHitbox = { width = 0.6, up = 0.2, down = 1.8, aimOffset = 0 },
   -- Predictive lead for player targets: aim where the target WILL be
   -- when the shell arrives -- pos + velocity * (flight time + latency).
-  -- muzzleVelocity is the shell speed in blocks/second; calibrate it by
-  -- firing at a moving target and tightening until hits land centered
-  -- (too low = shots trail behind the target, too high = they lead in
-  -- front). latencySeconds covers detector staleness + redstone + loop
+  -- muzzleVelocity is the shell speed in BLOCKS/SECOND. CBC autocannons:
+  -- 20 * (baseSpeed + perBarrel * min(barrels, cap)) -- cast iron
+  -- 20*(5+2b<=2), bronze 20*(3+1.5b<=3), steel 20*(3+1.5b<=4); e.g.
+  -- full-length steel = 180. Fine-tune on a moving target: shots
+  -- trailing behind = value too high, leading in front = too low.
+  -- latencySeconds covers detector staleness + redstone + loop
   -- lag on top of flight time. smoothingSeconds is the velocity
   -- estimator's EMA time constant: lower follows jukes faster but
   -- jitters more, higher is steadier but slower to notice turns.
   lead = {
     enabled = true,
-    muzzleVelocity = 80,
+    muzzleVelocity = 180,
     latencySeconds = 0.15,
     smoothingSeconds = 0.3,
   },
