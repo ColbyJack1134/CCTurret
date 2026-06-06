@@ -880,7 +880,14 @@ end
 -- everything the aim math sees, raw and derived.
 local function drawDebugScreen(w, h)
   local row = 3
+  local skip = ui.scroll -- mouse wheel hides the first N lines
+  local total = 0        -- lines requested this draw, to clamp the scroll
   local function line(label, value, fg)
+    total = total + 1
+    if skip > 0 then
+      skip = skip - 1
+      return
+    end
     if row > h - 1 then return end
     term.setCursorPos(1, row)
     term.setBackgroundColor(colors.black)
@@ -978,6 +985,9 @@ local function drawDebugScreen(w, h)
     term.clearLine()
     row = row + 1
   end
+  -- Clamp for the next draw so the view can't scroll past the last line.
+  local maxScroll = math.max(0, total - (h - 3))
+  if ui.scroll > maxScroll then ui.scroll = maxScroll end
 end
 
 local function drawButtonBar(w, h)
@@ -1165,6 +1175,7 @@ local function handleCommand(cell)
     setTarget(state.targetKind, state.targetName) -- toggle off
   elseif cell.cmd:sub(1, 4) == "tab_" then
     ui.activeTab = cell.cmd:sub(5)
+    ui.scroll = 0 -- the tabs share the scroll offset; start each at the top
   end
 end
 
