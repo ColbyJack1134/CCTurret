@@ -83,15 +83,16 @@ local DEFAULTS = {
   invertYaw = "auto",
   invertPitch = "auto",
   tolerance = 1,    -- degrees of acceptable aim error per axis
-  -- Player targets: a player hitbox is 0.6 wide x 1.8 tall. getPlayerPos
-  -- returns roughly HEAD level (observed in-game; docs suggest feet), so
-  -- aimOffset is added to the reported Y to reach center mass -- tweak it
-  -- if shots ride high or low. Fire opens while the shot would pass
-  -- within width/2 horizontally and height/2 vertically of the aim
-  -- point -- even before both axes settle inside `tolerance` (which
-  -- still locks on its own at long range, where the box subtends less
-  -- than the deadband). Pad the numbers if the gate feels too strict.
-  playerHitbox = { width = 0.6, height = 1.8, aimOffset = -0.9 },
+  -- Player targets. getPlayerPos returns roughly HEAD level (observed
+  -- in-game; docs suggest feet). The turret locks onto the reported Y
+  -- plus aimOffset (0 = the head); the fire gate is a box anchored to
+  -- the reported Y covering the body below it: fire opens while the
+  -- shot would pass within width/2 horizontally and between `up` above
+  -- and `down` below the reported Y -- even before both axes settle
+  -- inside `tolerance` (which still locks on its own at long range,
+  -- where the box subtends less than the deadband). Pad the numbers if
+  -- the gate feels too strict.
+  playerHitbox = { width = 0.6, up = 0.2, down = 1.8, aimOffset = 0 },
   -- Tracking loop period in seconds while a target is set. CC timers
   -- quantize to 0.05 (one game tick): 0.05 doubles the aim update rate
   -- for twice the peripheral traffic; the roster (1s) and idle ship fix
@@ -791,8 +792,8 @@ local function drawDebugScreen(w, h)
     else
       local hb = cfg.playerHitbox
       line("aim miss h/v", state.missH
-        and ("%+.2f / %+.2f (box %gx%g)"):format(
-          state.missH, state.missV, hb.width, hb.height)
+        and ("%+.2f / %+.2f (box %g +%g/-%g)"):format(
+          state.missH, state.missV, hb.width, hb.up, hb.down)
         or "?", state.locked and colors.lime or colors.yellow)
     end
   end
@@ -868,7 +869,7 @@ local function trackLoop()
         state.lost = false
         -- Ship targets: aim below the transponder, never at it (the
         -- broadcast position is the block keeping the target on the air).
-        -- Players: getPlayerPos reads ~head level; offset to center mass.
+        -- Players: lock the reported (head-level) Y plus aimOffset.
         local area, avoid
         local aimY
         if state.targetKind == "ship" then
@@ -896,15 +897,17 @@ local function trackLoop()
               -- motors keep converging on the below-transponder aim point.
               state.locked, state.miss = hullGate(pos, data, area, avoid)
             else
-              -- Hitbox gate: fire while the shot would pass through a
-              -- player-sized box around the center-mass aim point, OR
-              -- once both axes settle inside tolerance (long range,
-              -- where the box subtends less than the deadband).
+              -- Hitbox gate: fire while the shot would pass through the
+              -- body box hanging below the reported head Y, OR once both
+              -- axes settle inside tolerance (long range, where the box
+              -- subtends less than the deadband). missV is measured from
+              -- the AIM point, so shift by aimOffset back to the head.
               local hb = cfg.playerHitbox
               state.missH, state.missV = missComponents(state.yawErr,
                 state.pitchErr, data.CannonPitch, dist)
+              local vHead = state.missV + hb.aimOffset
               state.locked = (math.abs(state.missH) <= hb.width / 2
-                  and math.abs(state.missV) <= hb.height / 2)
+                  and vHead <= hb.up and vHead >= -hb.down)
                 or (math.abs(state.yawErr) < cfg.tolerance
                   and math.abs(state.pitchErr) < cfg.tolerance)
             end
