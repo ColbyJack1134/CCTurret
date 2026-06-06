@@ -48,10 +48,14 @@ default) the fire line is held high whenever the turret is locked on and
 dropped the moment lock is lost — autocannon behavior; a pulse/reload
 mode for regular cannons is planned.
 
-Player targets also open fire early: as soon as the shot would land
-within `playerFireRadius` blocks (default 2) of the player, the line
-goes high while the turret keeps converging on the exact aim. The
-status line shows the live miss distance until lock.
+Player targets aim at center mass (`getPlayerPos` returns the feet) and
+open fire early: as soon as the shot would pass through a player-sized
+box around the aim point (`playerHitbox`, default 0.6 × 1.8 — pad it if
+too strict at your ranges), the line goes high while the turret keeps
+converging on the exact aim. The status line shows the live horizontal
+/ vertical miss until lock. `trackSeconds` (default 0.1, minimum 0.05 —
+one game tick) sets the tracking loop period if you want faster aim
+updates for more peripheral traffic.
 
 ## Transponder targets
 

@@ -83,12 +83,19 @@ local DEFAULTS = {
   invertYaw = "auto",
   invertPitch = "auto",
   tolerance = 1,    -- degrees of acceptable aim error per axis
-  -- Player targets: open fire as soon as the shot would land within this
-  -- many blocks of the player, even before both axes settle inside
-  -- `tolerance` -- the turret keeps converging on the exact aim while
-  -- already shooting. (At long range the tolerance lock alone applies:
-  -- this radius can subtend less than the motor deadband.)
-  playerFireRadius = 2,
+  -- Player targets: a player hitbox is 0.6 wide x 1.8 tall and
+  -- getPlayerPos returns the FEET, so the turret aims at center mass
+  -- (feet + height/2) and opens fire while the shot would pass within
+  -- width/2 horizontally and height/2 vertically of that point -- even
+  -- before both axes settle inside `tolerance` (which still locks on its
+  -- own at long range, where the box subtends less than the deadband).
+  -- Pad the numbers if the gate feels too strict at your ranges.
+  playerHitbox = { width = 0.6, height = 1.8 },
+  -- Tracking loop period in seconds while a target is set. CC timers
+  -- quantize to 0.05 (one game tick): 0.05 doubles the aim update rate
+  -- for twice the peripheral traffic; the roster (1s) and idle ship fix
+  -- (0.5s) cadences stay the same regardless.
+  trackSeconds = 0.1,
   -- Ship (transponder) targets: the broadcast position IS the peer's
   -- computer, and destroying it loses the target's coords. So the turret
   -- aims 1.5*avoidRadius BELOW the transponder (into the hull), and the
@@ -312,8 +319,9 @@ local state = {
   firing = false,    -- fire line currently held high by auto-fire
   yawErr = 0,
   pitchErr = 0,
-  miss = nil,        -- barrel line's miss distance from the target in
-                     -- blocks (drives the hull / near-miss fire gates)
+  miss = nil,        -- ship target: radial miss distance in blocks
+  missH = nil,       -- player target: signed horizontal / vertical miss
+  missV = nil,       --   in blocks (drives the hitbox fire gate)
   roster = {},       -- { {kind, name, x, y, z, dist?}, ... } sorted by distance
   peerShips = {},    -- transponder ships by callsign: {x,y,z,heading,seenAt}
   mount = nil,       -- last block-reader NBT, for the debug tab
@@ -381,14 +389,19 @@ local function shipArea(name)
     o.avoidRadius or cfg.shipTargets.avoidRadius
 end
 
--- Perpendicular miss distance in blocks of the barrel's CURRENT line from a
--- point `dist` blocks away, given the angular errors toward it: dist *
--- sin(angular error), with the yaw component shrunk by cos(pitch) on the
--- way to a true angular distance.
+-- Where a shot along the barrel's CURRENT line would pass relative to a
+-- point `dist` blocks away, as signed horizontal/vertical offsets in
+-- blocks (positive = the shot passes on the +yaw side / above). Gates use
+-- the magnitudes; the signs make readouts say which way it's missing.
+local function missComponents(yawErr, pitchErr, mountPitch, dist)
+  return -dist * math.sin(math.rad(yawErr)) * math.cos(math.rad(mountPitch)),
+    -dist * math.sin(math.rad(pitchErr))
+end
+
+-- Radial miss distance in blocks (ship targets gate on a sphere).
 local function missDistance(yawErr, pitchErr, mountPitch, dist)
-  local ey = yawErr * math.cos(math.rad(mountPitch))
-  local ang = math.min(math.sqrt(ey * ey + pitchErr * pitchErr), 90)
-  return dist * math.sin(math.rad(ang))
+  local h, v = missComponents(yawErr, pitchErr, mountPitch, dist)
+  return math.sqrt(h * h + v * v)
 end
 
 -- Ship-target fire gate: would the shot land within `area` blocks of the
@@ -564,7 +577,7 @@ local function setTarget(kind, name)
   state.targetName = name
   state.lost = false
   state.locked = false
-  state.miss = nil
+  state.miss, state.missH, state.missV = nil, nil, nil
   setFiring(false) -- never carry a held fire line across a target change
   if not name then stopMotors() end
 end
@@ -616,8 +629,10 @@ local function drawStatus()
       -- One decimal: whole-degree rounding hid "0.3 deg off, not locked"
       -- as a confusing "y+0 p+0".
       term.write(("y%+.1f p%+.1f"):format(state.yawErr, state.pitchErr))
-      if state.miss then
+      if state.targetKind == "ship" and state.miss then
         term.write((" miss %.0fm"):format(state.miss))
+      elseif state.missH then
+        term.write((" h%+.1f v%+.1f"):format(state.missH, state.missV))
       end
     end
   elseif cfg.ship.enabled then
@@ -773,8 +788,10 @@ local function drawDebugScreen(w, h)
         and ("%.1f (fire %g..%g)"):format(state.miss, avoid, area) or "?",
         state.locked and colors.lime or colors.yellow)
     else
-      line("aim miss", state.miss
-        and ("%.1f (fire <=%g)"):format(state.miss, cfg.playerFireRadius)
+      local hb = cfg.playerHitbox
+      line("aim miss h/v", state.missH
+        and ("%+.2f / %+.2f (box %gx%g)"):format(
+          state.missH, state.missV, hb.width, hb.height)
         or "?", state.locked and colors.lime or colors.yellow)
     end
   end
@@ -832,13 +849,17 @@ end
 -- a second (one getPlayerPos call per online player).
 local function trackLoop()
   local tick = 0
+  -- Roster (~1s) and idle ship fix (~0.5s) cadences in loop ticks, so they
+  -- hold steady as cfg.trackSeconds changes the tracking rate.
+  local rosterTicks = math.max(1, math.floor(1 / cfg.trackSeconds + 0.5))
+  local shipIdleTicks = math.max(1, math.floor(0.5 / cfg.trackSeconds + 0.5))
   while running do
     -- Ship fix every tick while tracking (a climbing ship stair-steps the
     -- aim on anything slower), every 0.5s when idle; roster every 1s.
-    if cfg.ship.enabled and (state.targetName or tick % 5 == 0) then
+    if cfg.ship.enabled and (state.targetName or tick % shipIdleTicks == 0) then
       updateShip()
     end
-    if tick % 10 == 0 then refreshRoster() end
+    if tick % rosterTicks == 0 then refreshRoster() end
     tick = tick + 1
     if state.targetName then
       local pos = targetPos()
@@ -846,11 +867,14 @@ local function trackLoop()
         state.lost = false
         -- Ship targets: aim below the transponder, never at it (the
         -- broadcast position is the block keeping the target on the air).
+        -- Players: getPlayerPos returns the feet; aim at center mass.
         local area, avoid
-        local aimY = pos.y
+        local aimY
         if state.targetKind == "ship" then
           area, avoid = shipArea(state.targetName)
           aimY = pos.y - avoid * 1.5
+        else
+          aimY = pos.y + cfg.playerHitbox.height / 2
         end
         local relYaw, relPitch, dist = anglesFor(pos.x, aimY, pos.z)
         if not relYaw then
@@ -871,12 +895,15 @@ local function trackLoop()
               -- motors keep converging on the below-transponder aim point.
               state.locked, state.miss = hullGate(pos, data, area, avoid)
             else
-              -- Tolerance lock OR near-miss gate: open fire once the shot
-              -- would land within playerFireRadius while still converging
-              -- on the exact aim.
-              state.miss = missDistance(state.yawErr, state.pitchErr,
-                data.CannonPitch, dist)
-              state.locked = state.miss <= cfg.playerFireRadius
+              -- Hitbox gate: fire while the shot would pass through a
+              -- player-sized box around the center-mass aim point, OR
+              -- once both axes settle inside tolerance (long range,
+              -- where the box subtends less than the deadband).
+              local hb = cfg.playerHitbox
+              state.missH, state.missV = missComponents(state.yawErr,
+                state.pitchErr, data.CannonPitch, dist)
+              state.locked = (math.abs(state.missH) <= hb.width / 2
+                  and math.abs(state.missV) <= hb.height / 2)
                 or (math.abs(state.yawErr) < cfg.tolerance
                   and math.abs(state.pitchErr) < cfg.tolerance)
             end
@@ -895,7 +922,7 @@ local function trackLoop()
       end
       setFiring(state.armed and state.locked)
       draw()
-      sleep(0.1)
+      sleep(cfg.trackSeconds)
     else
       stopMotors()
       setFiring(false)
