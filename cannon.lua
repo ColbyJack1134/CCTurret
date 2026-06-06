@@ -83,6 +83,18 @@ local DEFAULTS = {
   invertYaw = "auto",
   invertPitch = "auto",
   tolerance = 1,    -- degrees of acceptable aim error per axis
+  -- Ship (transponder) targets: the broadcast position IS the peer's
+  -- computer, and destroying it loses the target's coords. So the turret
+  -- aims 1.5*avoidRadius BELOW the transponder (into the hull), and the
+  -- fire gate opens whenever the shot would land within areaRadius of the
+  -- transponder but no closer than avoidRadius: hull hits anywhere in
+  -- that ring count, the transponder block itself is never fired on.
+  shipTargets = {
+    areaRadius = 8,   -- default hull "size" in blocks around the transponder
+    avoidRadius = 2,  -- protected bubble around the transponder
+    -- Per-callsign overrides, e.g. { CBJK = { areaRadius = 12 } }.
+    perShip = {},
+  },
   speedGain = 5,    -- RPM per degree of error
   maxSpeed = 60,    -- RPM cap for the speed controllers
   -- Names listed here are dimmed in the target list as a "friendly"
@@ -294,6 +306,8 @@ local state = {
   firing = false,    -- fire line currently held high by auto-fire
   yawErr = 0,
   pitchErr = 0,
+  miss = nil,        -- ship target: barrel line's miss distance from the
+                     -- transponder in blocks (drives the hull fire gate)
   roster = {},       -- { {kind, name, x, y, z, dist?}, ... } sorted by distance
   peerShips = {},    -- transponder ships by callsign: {x,y,z,heading,seenAt}
   mount = nil,       -- last block-reader NBT, for the debug tab
@@ -326,8 +340,9 @@ local function speedFor(diff, invert)
   return speed * sign
 end
 
--- World-space target position -> desired mount yaw/pitch in degrees.
--- Returns nil when the cannon position is unknown (stale ship fix).
+-- World-space target position -> desired mount yaw/pitch in degrees, plus
+-- the distance in blocks. Returns nil when the cannon position is unknown
+-- (stale ship fix).
 local function anglesFor(tx, ty, tz)
   local c = cannonPos()
   if not c then return nil end
@@ -346,11 +361,34 @@ local function anglesFor(tx, ty, tz)
     -- yaw-only formula measured from ship-right; keeps the tuned
     -- yawOffset meaning what it always meant.
     local relYaw = angleDiff(math.deg(math.atan(dr, df)) - 90 - cfg.yawOffset, 0)
-    return relYaw, relPitch
+    return relYaw, relPitch, distance
   end
   local relPitch = math.deg(math.asin(dy / distance)) + cfg.pitchOffset
   local worldYaw = math.deg(math.atan(dz, dx))
-  return angleDiff(worldYaw - cfg.yawOffset, 0), relPitch
+  return angleDiff(worldYaw - cfg.yawOffset, 0), relPitch, distance
+end
+
+-- areaRadius/avoidRadius for a ship target, per-callsign override first.
+local function shipArea(name)
+  local o = cfg.shipTargets.perShip[name] or {}
+  return o.areaRadius or cfg.shipTargets.areaRadius,
+    o.avoidRadius or cfg.shipTargets.avoidRadius
+end
+
+-- Ship-target fire gate: would a shot along the barrel's CURRENT direction
+-- land within `area` blocks of the transponder, but no closer than `avoid`?
+-- Returns gate, missBlocks. Perpendicular miss distance of the barrel line
+-- from the transponder is dist * sin(angular error); the yaw component
+-- shrinks by cos(pitch) on the way to a true angular distance.
+local function hullGate(center, mount, area, avoid)
+  local relYaw, relPitch, dist = anglesFor(center.x, center.y, center.z)
+  if not relYaw then return false, nil end
+  local ey = angleDiff(relYaw, mount.CannonYaw)
+    * math.cos(math.rad(mount.CannonPitch))
+  local ep = relPitch - mount.CannonPitch
+  local ang = math.min(math.sqrt(ey * ey + ep * ep), 90)
+  local miss = dist * math.sin(math.rad(ang))
+  return miss <= area and miss >= avoid, miss
 end
 
 local function stopMotors()
@@ -516,6 +554,7 @@ local function setTarget(kind, name)
   state.targetName = name
   state.lost = false
   state.locked = false
+  state.miss = nil
   setFiring(false) -- never carry a held fire line across a target change
   if not name then stopMotors() end
 end
@@ -567,6 +606,9 @@ local function drawStatus()
       -- One decimal: whole-degree rounding hid "0.3 deg off, not locked"
       -- as a confusing "y+0 p+0".
       term.write(("y%+.1f p%+.1f"):format(state.yawErr, state.pitchErr))
+      if state.targetKind == "ship" and state.miss then
+        term.write((" miss %.0fm"):format(state.miss))
+      end
     end
   elseif cfg.ship.enabled then
     local c = cannonPos()
@@ -715,6 +757,12 @@ local function drawDebugScreen(w, h)
     line("target", state.targetName, colors.cyan)
     line("yaw/pitch err",
       ("%+.1f / %+.1f"):format(state.yawErr, state.pitchErr))
+    if state.targetKind == "ship" then
+      local area, avoid = shipArea(state.targetName)
+      line("hull miss", state.miss
+        and ("%.1f (fire %g..%g)"):format(state.miss, avoid, area) or "?",
+        state.locked and colors.lime or colors.yellow)
+    end
   end
   while row <= h - 1 do -- clear leftovers from the targets list
     term.setCursorPos(1, row)
@@ -782,7 +830,15 @@ local function trackLoop()
       local pos = targetPos()
       if pos then
         state.lost = false
-        local relYaw, relPitch = anglesFor(pos.x, pos.y, pos.z)
+        -- Ship targets: aim below the transponder, never at it (the
+        -- broadcast position is the block keeping the target on the air).
+        local area, avoid
+        local aimY = pos.y
+        if state.targetKind == "ship" then
+          area, avoid = shipArea(state.targetName)
+          aimY = pos.y - avoid * 1.5
+        end
+        local relYaw, relPitch = anglesFor(pos.x, aimY, pos.z)
         if not relYaw then
           -- Stale ship fix: hold rather than aim with old coords/heading.
           state.noFix = true
@@ -795,8 +851,15 @@ local function trackLoop()
           if data and data.CannonYaw and data.CannonPitch then
             state.yawErr = angleDiff(relYaw, data.CannonYaw)
             state.pitchErr = relPitch - data.CannonPitch
-            state.locked = math.abs(state.yawErr) < cfg.tolerance
-              and math.abs(state.pitchErr) < cfg.tolerance
+            if area then
+              -- Hull gate replaces the per-axis tolerance lock: fire as
+              -- soon as the shot would land on the hull ring, while the
+              -- motors keep converging on the below-transponder aim point.
+              state.locked, state.miss = hullGate(pos, data, area, avoid)
+            else
+              state.locked = math.abs(state.yawErr) < cfg.tolerance
+                and math.abs(state.pitchErr) < cfg.tolerance
+            end
             yaw.setTargetSpeed(speedFor(state.yawErr, cfg.invertYaw))
             pitch.setTargetSpeed(speedFor(state.pitchErr, cfg.invertPitch))
           else

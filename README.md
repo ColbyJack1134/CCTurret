@@ -53,11 +53,20 @@ mode for regular cannons is planned.
 With any wireless modem attached, the TARGETS tab also lists every ship
 broadcasting CCMinimap's transponder (`airship-state` rednet protocol,
 0.5 s cadence) — `#callsign` rows in orange next to `@player` rows in
-cyan. The aim point is the peer ship's computer GPS fix (full 3D).
-Ships that go quiet for 5 s drop from the roster; a tracked ship that
-goes quiet shows `LOST` and the turret holds. **Note:** if the cannon's
-own ship runs CCMinimap, its own callsign appears in the roster — add it
-to `whitelist` so it renders dimmed.
+cyan. Ships that go quiet for 5 s drop from the roster; a tracked ship
+that goes quiet shows `LOST` and the turret holds. **Note:** if the
+cannon's own ship runs CCMinimap, its own callsign appears in the
+roster — add it to `whitelist` so it renders dimmed.
+
+The broadcast position is the peer's *computer* — destroying it loses
+the target's coords. So ship targets use an area instead of a point
+(`shipTargets` in the config, per-callsign overrides under `perShip`):
+the turret aims `1.5 * avoidRadius` below the transponder, and the fire
+gate opens whenever the shot would land within `areaRadius` of the
+transponder but no closer than `avoidRadius`. Hull hits anywhere in
+that ring fire immediately while the barrel keeps converging on the
+center; the transponder block itself is never fired on. The status
+line shows the live miss distance while closing in.
 
 If an axis spins away from the target, flip `invertYaw` / `invertPitch`
 in the config instead of regearing.
