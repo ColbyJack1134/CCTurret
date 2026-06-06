@@ -49,9 +49,10 @@ dropped the moment lock is lost — autocannon behavior; a pulse/reload
 mode for regular cannons is planned.
 
 Player targets are aimed with **predictive lead** (`lead` in the
-config): target velocity is estimated from successive positions
-(EMA-smoothed over `smoothingSeconds`) and the turret aims where the
-target will be after the shell's flight time —
+config): target velocity is measured across a short position history
+(`windowSeconds`, newest-minus-oldest — adjacent-tick differences are
+detector-jitter noise) and the turret aims where the target will be
+after the shell's flight time —
 `distance / muzzleVelocity` plus `latencySeconds` of fixed lag. The
 fire gate follows the predicted box, so shells are gated on where the
 target *will* be, not where it was. `enabled = false` reverts to
@@ -109,6 +110,16 @@ through the zone behind the arc (no shortest-path wrap), so the barrel
 can't sweep across your own ship. For a free-standing 360° cannon set
 yaw to −180..180 (note: it will then unwind the long way around rather
 than crossing the ±180 seam).
+
+The drive adds **velocity feedforward** on top of the proportional
+term: the boot calibration wiggle measures each axis's slew rate
+(`degPerSecPerRpm`, ~0.75 for a direct-drive mount), and the
+controller feeds the aim point's own angular rate straight into the
+RPM command. Without it, a pure-P loop trails any crossing target by
+`speed / (rate × gain)` blocks at every distance — enough to keep the
+fire gate closed against anything faster than a walk. Set
+`degPerSecPerRpm` (or an invert flag) back to `"auto"` after
+re-gearing to re-measure.
 
 If an axis spins away from the target, flip `invertYaw` / `invertPitch`
 in the config instead of regearing.

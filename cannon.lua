@@ -77,9 +77,10 @@ local DEFAULTS = {
   -- target, +1 above. Plain aim bias -- not a sign fix.
   pitchOffset = 0,
   -- Drive sign per axis. "auto" calibrates on next boot: the axis is
-  -- nudged ~2 degrees while the block reader watches which way the angle
-  -- actually moves, and the measured true/false is written back here.
-  -- Set back to "auto" whenever you re-gear the build.
+  -- nudged a few degrees while the block reader watches which way (and
+  -- how fast) the angle actually moves; the sign lands here and the
+  -- slew rate in yawDrive/pitchDrive.degPerSecPerRpm. Set back to
+  -- "auto" whenever you re-gear the build.
   invertYaw = "auto",
   invertPitch = "auto",
   tolerance = 1,    -- degrees of acceptable aim error per axis
@@ -101,14 +102,16 @@ local DEFAULTS = {
   -- full-length steel = 180. Fine-tune on a moving target: shots
   -- trailing behind = value too high, leading in front = too low.
   -- latencySeconds covers detector staleness + redstone + loop
-  -- lag on top of flight time. smoothingSeconds is the velocity
-  -- estimator's EMA time constant: lower follows jukes faster but
-  -- jitters more, higher is steadier but slower to notice turns.
+  -- lag on top of flight time. windowSeconds is the velocity estimation
+  -- window: speed is measured newest-minus-oldest across a short
+  -- position history (adjacent-tick differences are dominated by
+  -- detector update jitter). Lower follows jukes faster but jitters
+  -- more, higher is steadier but slower to notice turns.
   lead = {
     enabled = true,
     muzzleVelocity = 180,
     latencySeconds = 0.15,
-    smoothingSeconds = 0.3,
+    windowSeconds = 0.3,
   },
   -- Tracking loop period in seconds while a target is set. CC timers
   -- quantize to 0.05 (one game tick): 0.05 doubles the aim update rate
@@ -139,12 +142,19 @@ local DEFAULTS = {
     yaw = { min = -90, max = 90 },
     pitch = { min = -30, max = 60 },
   },
-  -- Drive tuning per axis: RPM = error degrees * speedGain, capped at
-  -- maxSpeed. The axes have different gearing/inertia, so they tune
-  -- separately -- if one oscillates around the target while the other
-  -- is clean, lower the oscillating axis's speedGain.
-  yawDrive = { speedGain = 6, maxSpeed = 120 },
-  pitchDrive = { speedGain = 3, maxSpeed = 100 },
+  -- Drive tuning per axis: RPM = error degrees * speedGain (capped at
+  -- maxSpeed) PLUS feedforward -- the aim point's own angular rate
+  -- divided by degPerSecPerRpm, so the barrel rides a moving setpoint
+  -- instead of trailing it. (A pure-P loop trails a crossing target by
+  -- targetSpeed/(degPerSecPerRpm*speedGain) blocks at ANY distance --
+  -- enough to keep the fire gate shut on anything faster than a walk.)
+  -- degPerSecPerRpm "auto" is measured during the boot calibration
+  -- wiggle: a direct-drive CBC mount moves 0.75 deg/s per RPM, gearing
+  -- changes it. Set it (or an invert flag) back to "auto" after
+  -- re-gearing. If an axis oscillates around the target, lower its
+  -- speedGain.
+  yawDrive = { speedGain = 6, maxSpeed = 120, degPerSecPerRpm = "auto" },
+  pitchDrive = { speedGain = 3, maxSpeed = 100, degPerSecPerRpm = "auto" },
   -- Names listed here are dimmed in the target list as a "friendly"
   -- reminder; they can still be clicked deliberately. Works for player
   -- names AND ship callsigns -- when the cannon's own ship runs CCMinimap,
@@ -382,13 +392,24 @@ local function angleDiff(target, current)
   return ((target - current + 180) % 360) - 180
 end
 
--- Proportional controller: RPM scales with error, capped per axis.
-local function speedFor(diff, invert, drive)
-  if math.abs(diff) < cfg.tolerance then return 0 end
-  local speed = math.min(math.abs(diff) * drive.speedGain, drive.maxSpeed)
-  local sign = diff > 0 and 1 or -1
-  if invert then sign = -sign end
-  return speed * sign
+-- Per-axis drive command: proportional on error (deadband at tolerance)
+-- plus feedforward of the setpoint's own angular rate, converted to RPM
+-- through the calibrated degPerSecPerRpm. The P term parks inside the
+-- deadband; the FF term keeps the barrel moving WITH a moving aim point
+-- so the error stays inside the deadband instead of regrowing each tick.
+local function speedFor(diff, invert, drive, ffRate)
+  local rpm = 0
+  if math.abs(diff) >= cfg.tolerance then
+    rpm = math.min(math.abs(diff) * drive.speedGain, drive.maxSpeed)
+    if diff < 0 then rpm = -rpm end
+  end
+  local degPerSec = drive.degPerSecPerRpm
+  if ffRate and type(degPerSec) == "number" and degPerSec > 0 then
+    rpm = rpm + ffRate / degPerSec
+  end
+  rpm = math.max(-drive.maxSpeed, math.min(rpm, drive.maxSpeed))
+  if invert then rpm = -rpm end
+  return rpm
 end
 
 -- World-space target position -> desired mount yaw/pitch in degrees, plus
@@ -443,31 +464,68 @@ end
 
 -- ------------------------------------------------------------- prediction --
 
--- Target velocity estimate: EMA-smoothed finite differences over the
--- tracked target's position samples. One shared track -- it resets on
--- every target change.
-local track = { x = nil, y = nil, z = nil, t = nil, vx = 0, vy = 0, vz = 0 }
+-- Target velocity estimate: newest-minus-oldest over a short position
+-- history window (cfg.lead.windowSeconds). Adjacent-tick differences are
+-- dominated by detector update jitter -- positions change on server
+-- ticks, so 0.05s deltas alternate between zero and double the true
+-- motion; the window averages that out. One shared track -- it resets on
+-- every target change. aimYaw/aimPitch/rates feed the drive feedforward.
+local track = {
+  hist = {},                  -- { {x,y,z,t}, ... } newest last
+  vx = 0, vy = 0, vz = 0,
+  aimT = nil,                 -- last aim setpoint sample, for feedforward
+  yawRate = 0, pitchRate = 0, -- setpoint angular rates, deg/s
+}
+local LEAD_MIN_SPAN = 0.1  -- seconds of history before velocity is trusted
 
 local function resetLead()
-  track.t = nil
+  track.hist = {}
   track.vx, track.vy, track.vz = 0, 0, 0
+  track.aimT = nil
+  track.yawRate, track.pitchRate = 0, 0
 end
 
 local function updateLead(pos)
+  local hist = track.hist
   local t = os.clock()
-  if track.t then
-    local dt = t - track.t
-    if dt > 1 then
-      -- Sample gap (target was LOST a while): old velocity is fiction.
-      track.vx, track.vy, track.vz = 0, 0, 0
-    elseif dt > 0 then
-      local a = dt / (cfg.lead.smoothingSeconds + dt)
-      track.vx = track.vx + a * ((pos.x - track.x) / dt - track.vx)
-      track.vy = track.vy + a * ((pos.y - track.y) / dt - track.vy)
-      track.vz = track.vz + a * ((pos.z - track.z) / dt - track.vz)
+  local last = hist[#hist]
+  if last and t - last.t > 1 then
+    -- Sample gap (target was LOST a while): old samples are fiction.
+    resetLead()
+    hist = track.hist
+  end
+  hist[#hist + 1] = { x = pos.x, y = pos.y, z = pos.z, t = t }
+  local maxSamples = math.max(2,
+    math.floor(cfg.lead.windowSeconds / cfg.trackSeconds + 0.5) + 1)
+  while #hist > maxSamples do table.remove(hist, 1) end
+  local o, n = hist[1], hist[#hist]
+  local span = n.t - o.t
+  if span >= LEAD_MIN_SPAN then
+    track.vx = (n.x - o.x) / span
+    track.vy = (n.y - o.y) / span
+    track.vz = (n.z - o.z) / span
+  end
+end
+
+-- Setpoint angular rates for the drive feedforward, finite-differenced
+-- between ticks and lightly smoothed. Measured on the FINAL clamped aim
+-- angles, so it automatically covers target motion, lead changes, and
+-- the own ship turning -- and goes to zero while parked at an arc limit.
+local function updateAimRates(aimYaw, aimPitch)
+  local t = os.clock()
+  if track.aimT then
+    local dt = t - track.aimT
+    if dt > 0 and dt < 0.5 then
+      local a = dt / (0.15 + dt)
+      track.yawRate = track.yawRate
+        + a * ((aimYaw - track.aimYaw) / dt - track.yawRate)
+      track.pitchRate = track.pitchRate
+        + a * ((aimPitch - track.aimPitch) / dt - track.pitchRate)
+    elseif dt >= 0.5 then
+      track.yawRate, track.pitchRate = 0, 0 -- stale: reprime
     end
   end
-  track.x, track.y, track.z, track.t = pos.x, pos.y, pos.z, t
+  track.aimYaw, track.aimPitch, track.aimT = aimYaw, aimPitch, t
 end
 
 -- Intercept point: where the target will be after the shell's flight time
@@ -538,11 +596,13 @@ end
 
 -- ----------------------------------------------------------- calibration --
 
--- Empirically determine the drive sign for one axis: nudge the controller
--- and watch which way the mount's angle moves. Tries both directions so it
--- still works when the axis starts resting against a clamp (pitch limits).
+-- Empirically determine the drive sign AND slew rate for one axis: nudge
+-- the controller and watch which way (and how far) the mount's angle
+-- moves. Tries both directions so it still works when the axis starts
+-- resting against a clamp (pitch limits). Returns invert, degPerSecPerRpm.
 local function calibrateAxis(label, controller, nbtKey, wraps)
-  for _, rpm in ipairs({ 8, -8 }) do
+  local NUDGE_RPM, NUDGE_SECONDS = 8, 0.6
+  for _, rpm in ipairs({ NUDGE_RPM, -NUDGE_RPM }) do
     local data = blockReader.getBlockData()
     local before = data and data[nbtKey]
     if not before then
@@ -550,34 +610,39 @@ local function calibrateAxis(label, controller, nbtKey, wraps)
         :format(nbtKey), 0)
     end
     controller.setTargetSpeed(rpm)
-    sleep(0.6)
+    sleep(NUDGE_SECONDS)
     controller.setTargetSpeed(0)
     sleep(0.2) -- let the angle settle before re-reading
     local after = blockReader.getBlockData()[nbtKey]
     local delta = wraps and angleDiff(after, before) or (after - before)
     if math.abs(delta) >= 0.5 then
       local invert = (delta > 0) ~= (rpm > 0)
-      print(("calibrated %s: %+d RPM moved %+.1f deg -> invert%s = %s")
-        :format(label, rpm, delta, label:gsub("^%l", string.upper), tostring(invert)))
-      return invert
+      local rate = math.abs(delta) / NUDGE_SECONDS / NUDGE_RPM
+      print(("calibrated %s: %+d RPM moved %+.1f deg -> invert = %s, %.3f deg/s/RPM")
+        :format(label, rpm, delta, tostring(invert), rate))
+      return invert, rate
     end
   end
   error(("calibration failed: %s axis did not move in either direction -- check gearing")
     :format(label), 0)
 end
 
--- Run once per axis while its invert flag is "auto", then persist the
--- measured sign so later boots skip the wiggle.
+-- Run once per axis while its invert flag or drive rate is "auto", then
+-- persist the measured values so later boots skip the wiggle. An explicit
+-- (non-auto) invert flag is kept even when the rate triggers the nudge.
 local function calibrate()
   local changed = false
-  if cfg.invertYaw == "auto" then
-    cfg.invertYaw = calibrateAxis("yaw", yaw, "CannonYaw", true)
+  local function axis(invertKey, drive, label, controller, nbtKey, wraps)
+    if cfg[invertKey] ~= "auto" and drive.degPerSecPerRpm ~= "auto" then
+      return
+    end
+    local invert, rate = calibrateAxis(label, controller, nbtKey, wraps)
+    if cfg[invertKey] == "auto" then cfg[invertKey] = invert end
+    drive.degPerSecPerRpm = rate
     changed = true
   end
-  if cfg.invertPitch == "auto" then
-    cfg.invertPitch = calibrateAxis("pitch", pitch, "CannonPitch", false)
-    changed = true
-  end
+  axis("invertYaw", cfg.yawDrive, "yaw", yaw, "CannonYaw", true)
+  axis("invertPitch", cfg.pitchDrive, "pitch", pitch, "CannonPitch", false)
   if changed then
     writeFile(CONFIG, Cfg.jsonPretty(cfg) .. "\n")
     print("Calibration saved to " .. CONFIG)
@@ -879,6 +944,8 @@ local function drawDebugScreen(w, h)
       ("%+.1f / %+.1f"):format(state.yawErr, state.pitchErr))
     line("arc", state.outOfArc and "OUT (parked at limit)" or "in",
       state.outOfArc and colors.orange or colors.lime)
+    line("aim rate y/p", ("%+.1f / %+.1f deg/s"):format(
+      track.yawRate, track.pitchRate))
     if state.targetKind == "ship" then
       local area, avoid = shipArea(state.targetName)
       line("hull miss", state.miss
@@ -1047,10 +1114,11 @@ local function trackLoop()
                   and math.abs(state.yawErr) < cfg.tolerance
                   and math.abs(state.pitchErr) < cfg.tolerance)
             end
+            updateAimRates(aimYaw, aimPitch)
             yaw.setTargetSpeed(speedFor(state.yawErr, cfg.invertYaw,
-              cfg.yawDrive))
+              cfg.yawDrive, track.yawRate))
             pitch.setTargetSpeed(speedFor(state.pitchErr, cfg.invertPitch,
-              cfg.pitchDrive))
+              cfg.pitchDrive, track.pitchRate))
           else
             -- No mount reading: don't keep reporting (or firing on) a lock
             -- computed from stale angles.
