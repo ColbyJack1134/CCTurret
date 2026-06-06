@@ -83,14 +83,15 @@ local DEFAULTS = {
   invertYaw = "auto",
   invertPitch = "auto",
   tolerance = 1,    -- degrees of acceptable aim error per axis
-  -- Player targets: a player hitbox is 0.6 wide x 1.8 tall and
-  -- getPlayerPos returns the FEET, so the turret aims at center mass
-  -- (feet + height/2) and opens fire while the shot would pass within
-  -- width/2 horizontally and height/2 vertically of that point -- even
-  -- before both axes settle inside `tolerance` (which still locks on its
-  -- own at long range, where the box subtends less than the deadband).
-  -- Pad the numbers if the gate feels too strict at your ranges.
-  playerHitbox = { width = 0.6, height = 1.8 },
+  -- Player targets: a player hitbox is 0.6 wide x 1.8 tall. getPlayerPos
+  -- returns roughly HEAD level (observed in-game; docs suggest feet), so
+  -- aimOffset is added to the reported Y to reach center mass -- tweak it
+  -- if shots ride high or low. Fire opens while the shot would pass
+  -- within width/2 horizontally and height/2 vertically of the aim
+  -- point -- even before both axes settle inside `tolerance` (which
+  -- still locks on its own at long range, where the box subtends less
+  -- than the deadband). Pad the numbers if the gate feels too strict.
+  playerHitbox = { width = 0.6, height = 1.8, aimOffset = -0.9 },
   -- Tracking loop period in seconds while a target is set. CC timers
   -- quantize to 0.05 (one game tick): 0.05 doubles the aim update rate
   -- for twice the peripheral traffic; the roster (1s) and idle ship fix
@@ -867,14 +868,14 @@ local function trackLoop()
         state.lost = false
         -- Ship targets: aim below the transponder, never at it (the
         -- broadcast position is the block keeping the target on the air).
-        -- Players: getPlayerPos returns the feet; aim at center mass.
+        -- Players: getPlayerPos reads ~head level; offset to center mass.
         local area, avoid
         local aimY
         if state.targetKind == "ship" then
           area, avoid = shipArea(state.targetName)
           aimY = pos.y - avoid * 1.5
         else
-          aimY = pos.y + cfg.playerHitbox.height / 2
+          aimY = pos.y + cfg.playerHitbox.aimOffset
         end
         local relYaw, relPitch, dist = anglesFor(pos.x, aimY, pos.z)
         if not relYaw then
