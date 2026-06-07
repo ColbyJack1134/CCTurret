@@ -48,6 +48,19 @@ default) the fire line is held high whenever the turret is locked on and
 dropped the moment lock is lost — autocannon behavior; a pulse/reload
 mode for regular cannons is planned.
 
+Auto-fire is range-gated: beyond `maxDistance` blocks (default 50) the
+line holds and the status shows OUT OF RANGE, while tracking continues
+so fire resumes the moment the target closes back in. Manual `F` is not
+gated. In the other direction, **burst hysteresis** (`burst` in the
+config, on by default) keeps an opened gate from chattering: once
+firing, the line stays high while the miss is still within
+`burst.widen`× the normal gate (hitbox / hull ring / tolerance), and
+only drops after `burst.holdSeconds` straight outside that widened
+gate — ammo for coverage on a juking target. `burst.enabled = false`
+reverts to the strict instant-drop gate. The widened hull ring grows
+outward only; `avoidRadius` still protects the transponder during a
+burst hold.
+
 Player targets are aimed with **predictive lead** (`lead` in the
 config): target velocity is measured across a short position history
 (`windowSeconds`, newest-minus-oldest — adjacent-tick differences are

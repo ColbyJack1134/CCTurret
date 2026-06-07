@@ -84,6 +84,12 @@ local DEFAULTS = {
   invertYaw = "auto",
   invertPitch = "auto",
   tolerance = 1,    -- degrees of acceptable aim error per axis
+  -- Auto-fire range gate: while armed, the fire line holds (status shows
+  -- OUT OF RANGE) whenever the aim point is farther than this many
+  -- blocks. The turret keeps tracking so fire resumes the moment the
+  -- target closes back in; manual F is not gated. Mind that rounds
+  -- despawn anyway (cast iron ~99, bronze ~187, steel ~540 blocks).
+  maxDistance = 50,
   -- Player targets. getPlayerPos returns roughly HEAD level (observed
   -- in-game; docs suggest feet). The turret locks onto the reported Y
   -- plus aimOffset (0 = the head); the fire gate is a box anchored to
@@ -113,6 +119,13 @@ local DEFAULTS = {
     latencySeconds = 0.15,
     windowSeconds = 0.3,
   },
+  -- Burst hysteresis on the auto-fire gate: once the gate opens, keep
+  -- the line high while the miss stays within `widen` x the normal gate
+  -- (hitbox / hull ring / tolerance), and only drop it after the miss
+  -- has been outside that widened gate for holdSeconds straight. Spends
+  -- ammo to keep coverage on a juking target; enabled = false reverts
+  -- to the strict gate (line drops the instant the gate closes).
+  burst = { enabled = true, widen = 2, holdSeconds = 0.3 },
   -- Tracking loop period in seconds while a target is set. CC timers
   -- quantize to 0.05 (one game tick): 0.05 doubles the aim update rate
   -- for twice the peripheral traffic; the roster (1s) and idle ship fix
@@ -360,11 +373,14 @@ local state = {
   lost = false,      -- target set but offline / other dim / transponder quiet
   noFix = false,     -- ship mode and GPS/nav stopped answering
   outOfArc = false,  -- aim solution clamped to a travel limit
+  outOfRange = false,-- aim point beyond cfg.maxDistance (auto-fire held)
   locked = false,    -- both axes within tolerance
+  bursting = false,  -- fire line held by burst hysteresis past a closed gate
   armed = false,     -- auto-fire master switch (ARM button / A key)
   firing = false,    -- fire line currently held high by auto-fire
   yawErr = 0,
   pitchErr = 0,
+  dist = nil,        -- distance to the aim point in blocks
   miss = nil,        -- ship target: radial miss distance in blocks
   missH = nil,       -- player target: signed horizontal / vertical miss
   missV = nil,       --   in blocks (drives the hitbox fire gate)
@@ -568,6 +584,37 @@ local function hullGate(center, mount, area, avoid)
   return miss <= area and miss >= avoid, miss
 end
 
+-- Burst hysteresis (cfg.burst): the raw gate opening latches `open`; a
+-- closed raw gate then keeps firing while the miss is still within the
+-- WIDENED gate, and past that only after holdSeconds straight outside
+-- does the latch drop. Loses its state on target change / lost target /
+-- missing mount data -- never bridge a gap with stale geometry.
+local burst = { open = false, outsideSince = nil }
+
+local function resetBurst()
+  burst.open = false
+  burst.outsideSince = nil
+end
+
+local function burstGate(rawGate, withinWide)
+  if not cfg.burst.enabled then return rawGate end
+  if rawGate then
+    burst.open = true
+    burst.outsideSince = nil
+    return true
+  end
+  if not burst.open then return false end
+  if withinWide then
+    burst.outsideSince = nil
+    return true
+  end
+  local t = os.clock()
+  burst.outsideSince = burst.outsideSince or t
+  if t - burst.outsideSince < cfg.burst.holdSeconds then return true end
+  resetBurst()
+  return false
+end
+
 local function stopMotors()
   yaw.setTargetSpeed(0)
   pitch.setTargetSpeed(0)
@@ -738,10 +785,14 @@ local function setTarget(kind, name)
   state.targetName = name
   state.lost = false
   state.locked = false
+  state.bursting = false
   state.outOfArc = false
+  state.outOfRange = false
   state.miss, state.missH, state.missV = nil, nil, nil
   state.lead = nil
+  state.dist = nil
   resetLead()
+  resetBurst()
   setFiring(false) -- never carry a held fire line across a target change
   if not name then stopMotors() end
 end
@@ -787,6 +838,9 @@ local function drawStatus()
       if state.firing then
         term.setTextColor(colors.orange)
         term.write(" FIRING")
+      elseif state.outOfRange then
+        term.setTextColor(colors.orange)
+        term.write(" OUT OF RANGE")
       end
     elseif state.outOfArc then
       term.setTextColor(colors.orange)
@@ -800,6 +854,14 @@ local function drawStatus()
         term.write((" miss %.0fm"):format(state.miss))
       elseif state.missH then
         term.write((" h%+.1f v%+.1f"):format(state.missH, state.missV))
+      end
+      if state.firing then
+        -- Burst hysteresis holding the line through a momentary miss.
+        term.setTextColor(colors.orange)
+        term.write(" FIRING")
+      elseif state.outOfRange then
+        term.setTextColor(colors.orange)
+        term.write(" RANGE") -- short: this line already carries the errors
       end
     end
   elseif cfg.ship.enabled then
@@ -958,6 +1020,14 @@ local function drawDebugScreen(w, h)
       ("%+.1f / %+.1f"):format(state.yawErr, state.pitchErr))
     line("arc", state.outOfArc and "OUT (parked at limit)" or "in",
       state.outOfArc and colors.orange or colors.lime)
+    line("dist / max", state.dist
+      and ("%.0f / %d"):format(state.dist, cfg.maxDistance) or "?",
+      state.outOfRange and colors.red or colors.lime)
+    if cfg.burst.enabled then
+      line("burst", state.bursting and "HOLDING (gate left box)"
+        or (burst.open and "latched" or "idle"),
+        state.bursting and colors.orange or nil)
+    end
     line("aim rate y/p", ("%+.1f / %+.1f deg/s"):format(
       track.yawRate, track.pitchRate))
     if state.targetKind == "ship" then
@@ -1077,9 +1147,13 @@ local function trackLoop()
           -- Stale ship fix: hold rather than aim with old coords/heading.
           state.noFix = true
           state.locked = false
+          state.bursting = false
+          resetBurst()
           stopMotors()
         else
           state.noFix = false
+          state.dist = dist
+          state.outOfRange = dist > cfg.maxDistance
           local data = blockReader.getBlockData()
           state.mount = data
           if data and data.CannonYaw and data.CannonPitch then
@@ -1105,11 +1179,17 @@ local function trackLoop()
             state.outOfArc = aimYaw ~= tgtYaw or aimPitch ~= relPitch
             state.yawErr = aimYaw - cy
             state.pitchErr = aimPitch - data.CannonPitch
+            local withinWide -- widened gate, feeds the burst hysteresis
+            local wd = cfg.burst.widen
             if area then
               -- Hull gate replaces the per-axis tolerance lock: fire as
               -- soon as the shot would land on the hull ring, while the
               -- motors keep converging on the below-transponder aim point.
               state.locked, state.miss = hullGate(pos, data, area, avoid)
+              -- Widened ring grows outward only: avoidRadius still
+              -- protects the transponder during a burst hold.
+              withinWide = state.miss ~= nil
+                and state.miss <= area * wd and state.miss >= avoid
             else
               -- Hitbox gate: fire while the shot would pass through the
               -- body box hanging below the reported head Y, OR once both
@@ -1130,7 +1210,14 @@ local function trackLoop()
                 or (not state.outOfArc
                   and math.abs(state.yawErr) < cfg.tolerance
                   and math.abs(state.pitchErr) < cfg.tolerance)
+              withinWide = (math.abs(state.missH) <= hb.width / 2 * wd
+                  and vHead <= hb.up * wd and vHead >= -hb.down * wd)
+                or (not state.outOfArc
+                  and math.abs(state.yawErr) < cfg.tolerance * wd
+                  and math.abs(state.pitchErr) < cfg.tolerance * wd)
             end
+            state.bursting = burstGate(state.locked, withinWide)
+              and not state.locked
             updateAimRates(aimYaw, aimPitch)
             yaw.setTargetSpeed(speedFor(state.yawErr, cfg.invertYaw,
               cfg.yawDrive, track.yawRate))
@@ -1140,14 +1227,19 @@ local function trackLoop()
             -- No mount reading: don't keep reporting (or firing on) a lock
             -- computed from stale angles.
             state.locked = false
+            state.bursting = false
+            resetBurst()
           end
         end
       else
         state.lost = true
         state.locked = false
+        state.bursting = false
+        resetBurst()
         stopMotors()
       end
-      setFiring(state.armed and state.locked)
+      setFiring(state.armed and (state.locked or state.bursting)
+        and not state.outOfRange)
       draw()
       sleep(cfg.trackSeconds)
     else
