@@ -147,6 +147,19 @@ Auto-fire still respects `maxDistance` (raise it for long shots) and the
 arc gate (**NO ARC** past max range); manual `F` is ungated, so you can
 lob a ranging shot at anything.
 
+While a land target is set, the DEBUG tab forward-flies a shot from the
+barrel's **actual current angle** (not the solver's answer) and shows
+`impact xyz` (a world coordinate to go watch), `impact off` (how far that
+landing is from the target), and `v.miss@range` (how high/low the shell
+crosses the target's distance — `+` high, `−` low). It shares the flight
+model with the solver, so a large `v.miss@range` means the barrel fired
+before it settled onto the solution (loosen the slew or tighten
+`tolerance`) or the angle convention is off; it does **not** validate
+muzzle speed — for that, compare the predicted `impact xyz` to where the
+shell is actually seen to land. Note `tolerance` is angular: 1° is ~3.5
+blocks of miss at 200, ~10 at 600, so artillery wants it tight (≈0.2°),
+which in turn needs the drive tuned enough to settle that close.
+
 ## Transponder targets
 
 With any wireless modem attached, the TARGETS tab also lists every ship

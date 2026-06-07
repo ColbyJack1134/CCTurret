@@ -137,6 +137,41 @@ local inside = B.solve{ v0 = 200, gravity = HE.gravity, drag = HE.drag,
   dx = 5, dy = 0, muzzle = 12.5 }
 check("target inside barrel -> no solutions", #inside == 0)
 
+-- B.impact (forward shot) inverts B.solve: at the solver's own pitch the
+-- shell's height when it reaches the target's range must equal the target
+-- height (hAtTarget - dy ~ 0), for the shallow AND steep arc -- including
+-- the dy+40 case the solver hits on the way UP.
+for _, c in ipairs({
+  { v0 = 200, p = HE, dx = 400, dy = 0,   muzzle = 12.5 },
+  { v0 = 200, p = HE, dx = 650, dy = -10, muzzle = 12.5 },
+  { v0 = 200, p = HE, dx = 300, dy = 40,  muzzle = 12.5 },
+  { v0 = 180, p = AC, dx = 80,  dy = 0,   muzzle = 0.5 },
+}) do
+  local sols = B.solve{ v0 = c.v0, gravity = c.p.gravity, drag = c.p.drag,
+    dx = c.dx, dy = c.dy, muzzle = c.muzzle }
+  for i, s in ipairs(sols) do
+    local imp = B.impact{ v0 = c.v0, gravity = c.p.gravity, drag = c.p.drag,
+      muzzle = c.muzzle, pitch = s.pitch, dx = c.dx, dy = c.dy }
+    check(("impact dx=%d arc %d height at target"):format(c.dx, i),
+      imp.hAtTarget and math.abs(imp.hAtTarget - c.dy) < 0.2,
+      imp.hAtTarget and ("%.2f vs %d"):format(imp.hAtTarget, c.dy)
+        or "no crossing")
+  end
+end
+
+-- Aimed 2 deg under the solution, the shell passes LOW at the target's
+-- range -- the diagnostic's whole point (catches a barrel that fired
+-- before it finished slewing onto the solution).
+do
+  local sols = B.solve{ v0 = 200, gravity = HE.gravity, drag = HE.drag,
+    dx = 400, dy = 0, muzzle = 12.5 }
+  local imp = B.impact{ v0 = 200, gravity = HE.gravity, drag = HE.drag,
+    muzzle = 12.5, pitch = sols[1].pitch - 2, dx = 400, dy = 0 }
+  check("under-elevated shot is low at target range",
+    imp.hAtTarget and imp.hAtTarget < 0,
+    imp.hAtTarget and ("h %.1f"):format(imp.hAtTarget) or "nil")
+end
+
 -- Profile -> muzzle speed resolution, including loud failures.
 check("bigcannon 5 charges = 200 b/s",
   B.muzzleSpeed{ kind = "bigcannon", charges = 5 } == 200)

@@ -133,4 +133,52 @@ function B.solve(opts)
   return sols
 end
 
+-- Forward shot: fire a shell at a GIVEN pitch and report where it goes.
+-- Fed the barrel's ACTUAL current angle (not the solver's answer) this is
+-- a diagnostic -- it predicts the real shot so you can compare it to the
+-- target and to where the shell is seen to land. opts:
+--   v0/gravity/drag/muzzle  as in solve()
+--   pitch    launch pitch in degrees
+--   dx       target's horizontal distance, blocks (optional)
+--   dy       target's height above the mount, blocks
+-- Returns a table with whichever it can compute:
+--   hAtTarget  shell height when it crosses dx -- so hAtTarget - dy is
+--              the vertical miss AT the target's range, the precise aim
+--              error in blocks (+ high, - low/short). nil past max range.
+--   range/tof  horizontal blocks / seconds to where the shell DESCENDS
+--              back through dy -- the ground impact for an arcing shot,
+--              i.e. the spot to go watch. nil if it never comes down to
+--              dy. Per-tick integration (CBC-native), capped so a
+--              pathological angle can't spin.
+function B.impact(opts)
+  local q = 1 - opts.drag
+  local r = math.rad(opts.pitch)
+  local v0 = opts.v0 / TPS
+  local muzzle = opts.muzzle or 0
+  local x = muzzle * math.cos(r)
+  local y = muzzle * math.sin(r)
+  local vx = v0 * math.cos(r)
+  local vy = v0 * math.sin(r)
+  local dy, dx = opts.dy, opts.dx
+  local hAtTarget, range, tof
+  for t = 1, 6000 do
+    local px, py = x, y
+    x = x + vx
+    y = y + vy
+    vx = vx * q
+    vy = vy * q + opts.gravity
+    if dx and not hAtTarget and px <= dx and x >= dx then
+      local f = (x == px) and 0 or (dx - px) / (x - px)
+      hAtTarget = py + (y - py) * f
+    end
+    -- Descending crossing of the target plane (vy < 0 skips the way up).
+    if not range and vy < 0 and py >= dy and y <= dy then
+      local f = (py == y) and 0 or (py - dy) / (py - y)
+      range, tof = px + (x - px) * f, (t - 1 + f) / TPS
+    end
+    if range and (not dx or hAtTarget) then break end
+  end
+  return { hAtTarget = hAtTarget, range = range, tof = tof }
+end
+
 return B

@@ -478,6 +478,8 @@ local state = {
   roster = {},       -- { {kind, name, x, y, z, dist?}, ... } sorted by distance
   peerShips = {},    -- transponder ships by callsign: {x,y,z,heading,seenAt}
   mount = nil,       -- last block-reader NBT, for the debug tab
+  impact = nil,      -- static-mode diagnostic: predicted impact from the
+                     -- ACTUAL barrel angle {x,y,z, off, vmiss, tof}
   flash = nil,       -- transient status message (e.g. "FIRED")
 }
 
@@ -940,6 +942,7 @@ local function setTarget(kind, name)
   state.lead = nil
   state.dist = nil
   state.tof, state.hasArc = nil, nil
+  state.impact = nil
   resetLead()
   resetBurst()
   setFiring(false) -- never carry a held fire line across a target change
@@ -1223,6 +1226,20 @@ local function drawDebugScreen(w, h)
       or (state.tof and ("%s arc, tof %.2fs"):format(
         cfg.profile.arc, state.tof) or "?"),
       state.hasArc == false and colors.red or nil)
+    -- Predicted shot from the ACTUAL barrel angle (static mode): a spot to
+    -- go watch, plus how high/low it crosses the target's range right now.
+    if state.impact then
+      if state.impact.x then
+        line("impact xyz", ("%.0f %.0f %.0f"):format(
+          state.impact.x, state.impact.y, state.impact.z), colors.yellow)
+        line("impact off", ("%.1fm from target"):format(state.impact.off),
+          state.impact.off < 2 and colors.lime or colors.orange)
+      end
+      if state.impact.vmiss then
+        line("v.miss@range", ("%+.1f blocks"):format(state.impact.vmiss),
+          math.abs(state.impact.vmiss) < 1 and colors.lime or colors.orange)
+      end
+    end
     if cfg.profile.kind == "bigcannon" then
       local wait = pulse.nextAt - os.clock()
       line("reload", wait > 0 and ("%.1fs"):format(wait) or "ready",
@@ -1375,6 +1392,40 @@ local function trackLoop()
           local data = blockReader.getBlockData()
           state.mount = data
           if data and data.CannonYaw and data.CannonPitch then
+            -- Diagnostic (static mode): forward-fly a shot from the
+            -- barrel's ACTUAL current angle -- NOT the solver's answer --
+            -- so the debug tab can show where this shell is really headed
+            -- (a coord to go watch) and how high/low it crosses the
+            -- target's range. Inverts anglesFor's static convention:
+            -- worldYaw = CannonYaw + yawOffset, worldPitch = CannonPitch
+            -- - pitchOffset. Shares the flight model with the solver, so
+            -- it catches an unsettled barrel / wrong angle convention,
+            -- NOT a wrong muzzle speed (compare the coord to where the
+            -- shell is actually seen to land for that).
+            if not cfg.ship.enabled then
+              local cc = cannonPos()
+              if cc then
+                local wy = math.rad(data.CannonYaw + cfg.yawOffset)
+                local wp = data.CannonPitch - cfg.pitchOffset
+                local tdx, tdz = pos.x - cc.x, pos.z - cc.z
+                local tdy = pos.y - cc.y
+                local imp = Ballistics.impact{ v0 = muzzleSpeed,
+                  gravity = proj.gravity, drag = proj.drag,
+                  muzzle = muzzleLen, pitch = wp,
+                  dx = math.sqrt(tdx * tdx + tdz * tdz), dy = tdy }
+                local rec = { vmiss = imp.hAtTarget
+                  and (imp.hAtTarget - tdy) or nil }
+                if imp.range then
+                  rec.x = cc.x + imp.range * math.cos(wy)
+                  rec.y = pos.y
+                  rec.z = cc.z + imp.range * math.sin(wy)
+                  local ox, oz = rec.x - pos.x, rec.z - pos.z
+                  rec.off = math.sqrt(ox * ox + oz * oz)
+                  rec.tof = imp.tof
+                end
+                state.impact = rec
+              end
+            end
             -- Travel limits: drive toward the solution clamped into the
             -- arc (parks at the edge while the target is outside, ready
             -- for re-entry). Errors are plain unwrapped differences, NOT
