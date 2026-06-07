@@ -30,6 +30,14 @@ Run `cannon.lua`. First boot writes `cannon.cfg` with defaults — edit the
 peripheral names, cannon position, and `yawOffset` to match your build,
 then rerun.
 
+Stationary builds can skip hardcoding the mount coords: set
+`cannon.gps = true` (wireless modem + GPS constellation required) and
+the computer locates itself once at boot, deriving the mount position
+as the fix plus `cannon.offset` — mount minus computer in **world**
+axes (+x east, +y up, +z south). Boot fails loudly if there's no fix;
+rerun the program after moving the build. The DEBUG tab shows the
+derived position.
+
 ## Airship mode
 
 Set `ship.enabled = true` in `cannon.cfg`. Requires a wireless modem

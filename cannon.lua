@@ -66,8 +66,15 @@ local DEFAULTS = {
   },
   -- Center of the cannon mount (use the mount block's coords + 0.5).
   -- Only used while ship.enabled = false; aboard a ship the position is
-  -- derived live from GPS + ship.offset instead.
-  cannon = { x = 0.5, y = 64.5, z = 0.5 },
+  -- derived live from GPS + ship.offset instead. For a stationary
+  -- build, gps = true locates the COMPUTER once at boot (wireless
+  -- modem + GPS constellation required -- the boot fails loudly
+  -- without a fix) and derives the mount as fix + offset in WORLD axes
+  -- (+x east, +y up, +z south; mount minus computer). x/y/z are
+  -- ignored while gps = true. Explicit flag, not modem auto-detect:
+  -- a wireless modem may be there for transponder targets only.
+  cannon = { x = 0.5, y = 64.5, z = 0.5, gps = false,
+             offset = { x = 0, y = 0, z = 0 } },
   -- Airship mode: locate the COMPUTER via GPS (wireless modem required),
   -- read ship yaw from the navigation table (CCMinimap-style needle math),
   -- and derive the cannon's world position by rotating `offset` -- the
@@ -334,6 +341,32 @@ if transponderModem then
   if not rednet.isOpen(modemName) then rednet.open(modemName) end
 end
 
+-- Static-mode cannon position: configured directly, or derived ONCE at
+-- boot from a GPS fix of the computer plus a world-axis offset -- a
+-- stationary build doesn't move, so one fix is enough (rerun the
+-- program after relocating). Fails loudly rather than aiming from a
+-- guessed position.
+local staticCannon = nil
+if not cfg.ship.enabled then
+  if cfg.cannon.gps then
+    if not transponderModem then
+      error("cannon.gps = true but no wireless modem attached", 0)
+    end
+    local x, y, z = gps.locate(2)
+    if not x then
+      error("cannon.gps = true but no GPS fix -- is a GPS constellation "
+        .. "in range? (or set cannon.gps = false and fill cannon x/y/z)", 0)
+    end
+    local o = cfg.cannon.offset
+    staticCannon = { x = x + o.x, y = y + o.y, z = z + o.z }
+    print(("GPS fix %.1f %.1f %.1f + offset -> cannon %.1f %.1f %.1f")
+      :format(x, y, z, staticCannon.x, staticCannon.y, staticCannon.z))
+    sleep(1.5) -- long enough to read before the UI clears the terminal
+  else
+    staticCannon = cfg.cannon
+  end
+end
+
 -- Live ship fix: computer world position, heading, and the derived cannon
 -- position. freshUntil guards against aiming on stale data when GPS or the
 -- nav table stop answering.
@@ -408,9 +441,10 @@ local function updateShip()
 end
 
 -- Where the cannon is right now (world frame), or nil when the ship fix
--- has gone stale. Static mode just returns the configured position.
+-- has gone stale. Static mode returns the boot-resolved position
+-- (configured coords, or the one-shot GPS fix + offset).
 local function cannonPos()
-  if not cfg.ship.enabled then return cfg.cannon end
+  if not cfg.ship.enabled then return staticCannon end
   if os.clock() > ship.freshUntil then return nil end
   return ship.cannon
 end
@@ -1119,8 +1153,9 @@ local function drawDebugScreen(w, h)
       end
     end
   else
-    line("mode", "static (land)")
-    line("cannon xyz", fmtPos(cfg.cannon), colors.yellow)
+    line("mode", cfg.cannon.gps and "static (land), GPS fix"
+      or "static (land)")
+    line("cannon xyz", fmtPos(staticCannon), colors.yellow)
   end
   line("yawOffset", cfg.yawOffset)
   line("profile", ("%s %s %.0f b/s"):format(cfg.profile.kind,
