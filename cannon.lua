@@ -455,8 +455,9 @@ for _, name in ipairs(cfg.whitelist) do whitelisted[name] = true end
 -- Shared state between the tracking loop and the input loop.
 local running = true
 local state = {
-  targetKind = nil,  -- "player" | "ship", or nil
-  targetName = nil,  -- player name / ship callsign we're locked onto
+  targetKind = nil,  -- "player" | "ship" | "coord", or nil
+  targetName = nil,  -- player name / ship callsign / coord label we track
+  coordTarget = nil, -- fixed world point {x,y,z} when targetKind == "coord"
   lost = false,      -- target set but offline / other dim / transponder quiet
   noFix = false,     -- ship mode and GPS/nav stopped answering
   outOfArc = false,  -- aim solution clamped to a travel limit
@@ -488,6 +489,7 @@ local ui = {
   activeTab = "targets",
   cells = {},  -- clickable regions: {col1, col2, row, cmd, name?}
   scroll = 0,
+  prompt = nil,  -- active modal line editor: { text, err } (XYZ entry)
 }
 
 -- ---------------------------------------------------------------- aiming --
@@ -873,6 +875,9 @@ end
 -- Current world position of the tracked target, or nil when it's lost
 -- (player offline/other dim, ship transponder gone quiet).
 local function targetPos()
+  if state.targetKind == "coord" then
+    return state.coordTarget -- a fixed point, never lost
+  end
   if state.targetKind == "ship" then
     local peer = state.peerShips[state.targetName]
     return peerFresh(peer) and peer or nil
@@ -941,6 +946,27 @@ local function setTarget(kind, name)
   if not name then stopMotors() end
 end
 
+-- Parse free-form "x y z" (any mix of spaces/commas) into a world point,
+-- or nil + a short reason. Accepts decimals and negatives.
+local function parseCoord(s)
+  local nums = {}
+  for tok in tostring(s):gmatch("[-%d%.]+") do
+    nums[#nums + 1] = tonumber(tok)
+  end
+  if #nums ~= 3 or not (nums[1] and nums[2] and nums[3]) then
+    return nil, "need: x y z"
+  end
+  return { x = nums[1], y = nums[2], z = nums[3] }
+end
+
+-- Lock onto a fixed XYZ point (a stationary aim target, mainly for
+-- range/falloff testing). Reuses setTarget so all the per-target state
+-- resets the same way; the label doubles as the "name" for the status line.
+local function setCoordTarget(c)
+  state.coordTarget = c
+  setTarget("coord", ("%g, %g, %g"):format(c.x, c.y, c.z))
+end
+
 -- ---------------------------------------------------------------- drawing --
 
 local function drawTabBar(w)
@@ -966,10 +992,13 @@ local function drawStatus()
   term.clearLine()
   if state.targetName then
     local isShip = state.targetKind == "ship"
+    local isCoord = state.targetKind == "coord"
     term.setTextColor(colors.lightGray)
     term.write("Target ")
-    term.setTextColor(isShip and colors.orange or colors.cyan)
-    term.write((isShip and "#" or "@") .. state.targetName .. " ")
+    term.setTextColor(isShip and colors.orange
+      or (isCoord and colors.lightBlue or colors.cyan))
+    term.write((isShip and "#" or (isCoord and "*" or "@"))
+      .. state.targetName .. " ")
     if state.lost then
       term.setTextColor(colors.red)
       term.write("LOST")
@@ -1030,7 +1059,7 @@ local function drawStatus()
     end
   else
     term.setTextColor(colors.lightGray)
-    term.write("No target -- click a player or ship")
+    term.write("No target -- click a player, ship, or XYZ")
   end
   if state.armed and not state.firing then
     term.setTextColor(colors.red)
@@ -1043,7 +1072,18 @@ local function drawStatus()
 end
 
 local function drawTargetsList(w, h)
-  local listTop, listBot = 3, h - 1
+  -- Row 3 is a standing button: open the XYZ-coordinate prompt. A fixed
+  -- aim point (mainly for range/falloff testing); the active coord shows
+  -- on the status line, and STOP clears it like any other target.
+  term.setCursorPos(1, 3)
+  term.setBackgroundColor(state.targetKind == "coord" and colors.gray
+    or colors.black)
+  term.clearLine()
+  term.setTextColor(colors.lightBlue)
+  term.write((" + set XYZ coord"):sub(1, w))
+  ui.cells[#ui.cells + 1] = { col1 = 1, col2 = w, row = 3, cmd = "coordprompt" }
+
+  local listTop, listBot = 4, h - 1
   local visRows = listBot - listTop + 1
   local maxScroll = math.max(0, #state.roster - visRows)
   if ui.scroll > maxScroll then ui.scroll = maxScroll end
@@ -1206,7 +1246,7 @@ local function drawDebugScreen(w, h)
         and ("%+.2f / %+.2f (box %g +%g/-%g)"):format(
           state.missH, state.missV, hb.width, hb.up, hb.down)
         or "?", state.locked and colors.lime or colors.yellow)
-      if cfg.lead.enabled then
+      if cfg.lead.enabled and state.targetKind == "player" then
         line("lead", state.lead
           and ("%.1fm @ %.1fm/s (t %.2fs)"):format(
             state.lead.blocks, state.lead.speed, state.lead.tof)
@@ -1229,6 +1269,17 @@ local function drawButtonBar(w, h)
   term.setCursorPos(1, h)
   term.setBackgroundColor(colors.black)
   term.clearLine()
+  -- Modal XYZ entry takes over the bar: shared draw() so the track
+  -- loop's redraws keep the live text instead of fighting a read().
+  if ui.prompt then
+    term.setTextColor(colors.lightBlue)
+    term.write(("XYZ: %s_"):format(ui.prompt.text):sub(1, w))
+    if ui.prompt.err then
+      term.setTextColor(colors.red)
+      term.write((" [%s]"):format(ui.prompt.err))
+    end
+    return
+  end
   local col = 1
   local function button(label, cmd, fg, enabled)
     term.setCursorPos(col, h)
@@ -1245,10 +1296,10 @@ local function drawButtonBar(w, h)
   button(state.armed and " DISARM " or " ARM ", "arm",
     state.armed and colors.red or colors.lime, true)
   button(" STOP ", "stop", colors.white, state.targetName ~= nil)
-  term.setCursorPos(w - 18, h)
+  term.setCursorPos(w - 24, h)
   term.setBackgroundColor(colors.black)
   term.setTextColor(colors.gray)
-  term.write("F=fire A=arm Q=quit")
+  term.write("F=fire A=arm C=xyz Q=quit")
 end
 
 local function draw()
@@ -1296,7 +1347,7 @@ local function trackLoop()
         if state.targetKind == "ship" then
           area, avoid = shipArea(state.targetName)
           ay = ay - avoid * 1.5
-        else
+        elseif state.targetKind == "player" then
           if cfg.lead.enabled then
             updateLead(pos)
             local p, tof = leadPoint(pos)
@@ -1306,7 +1357,7 @@ local function trackLoop()
             ax, ay, az = p.x, p.y, p.z
           end
           ay = ay + cfg.playerHitbox.aimOffset
-        end
+        end -- coord: aim at the exact point, no lead / no hitbox offset
         local relYaw, relPitch, dist, tof, hasArc = anglesFor(ax, ay, az)
         if not relYaw then
           -- Stale ship fix: hold rather than aim with old coords/heading.
@@ -1357,6 +1408,18 @@ local function trackLoop()
               -- protects the transponder during a burst hold.
               withinWide = state.miss ~= nil
                 and state.miss <= area * wd and state.miss >= avoid
+            elseif state.targetKind == "coord" then
+              -- Fixed point: no hitbox, just the per-axis tolerance lock.
+              -- missH/missV are kept for the debug tab's aim-miss line.
+              state.missH, state.missV = missComponents(
+                angleDiff(relYaw, data.CannonYaw),
+                relPitch - data.CannonPitch, data.CannonPitch, dist)
+              state.locked = not state.outOfArc
+                and math.abs(state.yawErr) < cfg.tolerance
+                and math.abs(state.pitchErr) < cfg.tolerance
+              withinWide = not state.outOfArc
+                and math.abs(state.yawErr) < cfg.tolerance * wd
+                and math.abs(state.pitchErr) < cfg.tolerance * wd
             else
               -- Hitbox gate: fire while the shot would pass through the
               -- body box hanging below the reported head Y, OR once both
@@ -1446,6 +1509,8 @@ local function handleCommand(cell)
     fire()
   elseif cell.cmd == "arm" then
     toggleArm()
+  elseif cell.cmd == "coordprompt" then
+    ui.prompt = { text = "" }
   elseif cell.cmd == "stop" then
     setTarget(state.targetKind, state.targetName) -- toggle off
   elseif cell.cmd:sub(1, 4) == "tab_" then
@@ -1468,14 +1533,49 @@ local function rednetLoop()
   end
 end
 
+-- Modal line editor for the XYZ prompt. Returns true while it owns the
+-- keyboard so inputLoop routes everything here. Enter parses "x y z" and
+-- locks the point; a bad parse keeps the editor open with a hint;
+-- backspace edits, escape cancels.
+local function handlePromptEvent(event)
+  -- Opening with the `C` key queues a stray "c" char right behind the key
+  -- event; drop that one so it doesn't seed the field.
+  if ui.prompt.swallow then
+    ui.prompt.swallow = nil
+    if event[1] == "char" then return end
+  end
+  if event[1] == "char" then
+    ui.prompt.text = ui.prompt.text .. event[2]
+  elseif event[1] == "key" then
+    local k = event[2]
+    if k == keys.enter then
+      local c, why = parseCoord(ui.prompt.text)
+      if c then
+        ui.prompt = nil
+        setCoordTarget(c)
+      else
+        ui.prompt.text, ui.prompt.err = "", why
+      end
+    elseif k == keys.backspace then
+      ui.prompt.text = ui.prompt.text:sub(1, -2)
+    elseif k == keys.escape then
+      ui.prompt = nil
+    end
+  end
+end
+
 local function inputLoop()
   while running do
     local event = { os.pullEvent() }
-    if event[1] == "key" then
+    if ui.prompt then
+      handlePromptEvent(event)
+    elseif event[1] == "key" then
       if event[2] == keys.f then
         fire()
       elseif event[2] == keys.a then
         toggleArm()
+      elseif event[2] == keys.c then
+        ui.prompt = { text = "", swallow = true }
       elseif event[2] == keys.q then
         running = false
       end

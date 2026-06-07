@@ -50,7 +50,8 @@ means "cannon rest direction relative to ship-forward". Ship pitch/roll
 are assumed level for now. If GPS or the nav table stop answering, the
 turret holds and shows NO FIX rather than aiming on stale data.
 
-Keys: `F` fire (manual pulse), `A` arm/disarm, `Q` quit. The turret
+Keys: `F` fire (manual pulse), `A` arm/disarm, `C` enter an XYZ
+target, `Q` quit. The turret
 continuously tracks the selected player; `LOCKED` means both axes are
 within `tolerance`. While **armed** (ARM button or `A`; disarmed by
 default) the fire line is held high whenever the turret is locked on and
@@ -128,6 +129,23 @@ line goes high while the turret keeps converging on the head. The status line sh
 / vertical miss until lock. `trackSeconds` (default 0.1, minimum 0.05 —
 one game tick) sets the tracking loop period if you want faster aim
 updates for more peripheral traffic.
+
+## Coordinate targets
+
+Press `C` (or click **+ set XYZ coord** at the top of the TARGETS tab)
+and type a world point as `x y z` (spaces or commas, decimals and
+negatives fine) — Enter locks it, Escape cancels, a bad entry reprompts
+with a hint. The point is shown on the status line as `*x, y, z` in
+light blue and cleared with **STOP** like any other target.
+
+It's a fixed aim point: no lead and no hitbox box — the turret arc-solves
+straight at the coordinate and locks when both axes are within
+`tolerance`, so it's the cleanest way to test ballistics. Stand off at a
+known spot, read its F3 coords, target them, and watch where the shell
+lands versus the DEBUG tab's predicted distance and time-of-flight.
+Auto-fire still respects `maxDistance` (raise it for long shots) and the
+arc gate (**NO ARC** past max range); manual `F` is ungated, so you can
+lob a ranging shot at anything.
 
 ## Transponder targets
 
