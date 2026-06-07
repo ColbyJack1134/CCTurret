@@ -22,6 +22,7 @@ Shared libraries come from the CCMinimap submodule (`git submodule update
 flat:
 
 - `cannon.lua`
+- `ballistics.lua`
 - `vendor/CCMinimap/computercraft/cfgutil.lua` → `cfgutil.lua`
 - `vendor/CCMinimap/computercraft/heading.lua` → `heading.lua`
 
@@ -65,21 +66,50 @@ Player targets are aimed with **predictive lead** (`lead` in the
 config): target velocity is measured across a short position history
 (`windowSeconds`, newest-minus-oldest — adjacent-tick differences are
 detector-jitter noise) and the turret aims where the target will be
-after the shell's flight time —
-`distance / muzzleVelocity` plus `latencySeconds` of fixed lag. The
-fire gate follows the predicted box, so shells are gated on where the
-target *will* be, not where it was. `enabled = false` reverts to
-aiming at the live position. The DEBUG tab shows the live lead
-distance, target speed, and lead time.
+after the shell's flight time — the arc solver's true time-of-flight
+plus `latencySeconds` of fixed lag. The fire gate follows the
+predicted box, so shells are gated on where the target *will* be, not
+where it was. `enabled = false` reverts to aiming at the live
+position. The DEBUG tab shows the live lead distance, target speed,
+and lead time.
 
-`muzzleVelocity` is in blocks/second. CBC autocannon muzzle speed is
-set by the cannon, not the round:
-`20 × (baseSpeed + perBarrel × min(barrels, cap))` blocks/sec —
-cast iron `20×(5 + 2×b≤2)`, bronze `20×(3 + 1.5×b≤3)`, steel
-`20×(3 + 1.5×b≤4)`; a full-length steel or cast-iron gun is 180.
-Fine-tune on a strafing target: shots trailing behind = value too
-high, leading in front = too low. Mind `projectileLifetime`: cast iron
-rounds despawn after ~99 blocks, bronze ~187, steel ~540.
+## Cannon profile
+
+`profile` in the config describes the gun; it drives both the fire
+mode and the ballistics:
+
+- `kind`: `autocannon` holds the fire line while the gate is open;
+  `bigcannon` pulses `firePulseSeconds` per shot and waits
+  `profile.reloadSeconds` before the next (reload countdown on the
+  DEBUG tab).
+- `projectile`: keys the constants table in `ballistics.lua` —
+  big-cannon shells fall at −0.05 b/t², autocannon rounds and the
+  mortar stone at −0.025, drag 0.99/tick for all (verified from CBC
+  source; datapacks can override, so re-verify on a tuned server).
+- `charges` (bigcannon): powder charges loaded — muzzle speed is
+  2 b/t per charge. 5 charges = 200 b/s ≈ 693 blocks max range.
+- `muzzleVelocity` (autocannon, blocks/sec): set by the cannon, not
+  the round: `20 × (baseSpeed + perBarrel × min(barrels, cap))` —
+  cast iron `20×(5 + 2×b≤2)`, bronze `20×(3 + 1.5×b≤3)`, steel
+  `20×(3 + 1.5×b≤4)`; a full-length steel or cast-iron gun is 180.
+  Fine-tune on a strafing target: shots trailing behind = value too
+  high, leading in front = too low. Mind projectile lifetime: cast
+  iron rounds despawn after ~99 blocks, bronze ~187, steel ~540.
+  (Old configs: `lead.muzzleVelocity` migrates here automatically.)
+- `barrelBlocks`: mount pivot → muzzle tip, in blocks. CBC spawns the
+  shell ~`barrelBlocks − 1.5` out along the barrel; on a long gun
+  ignoring that shifts arcing shots by 15–25 blocks at range.
+- `arc`: `shallow` (flat, fast) or `steep` (lobbed) when both
+  solutions exist.
+
+Pitch is solved ballistically every tick (gravity + drag, closed-form
+horizontal time-of-flight + bisected pitch — `ballistics.lua`,
+unit-tested against a per-tick simulation in `tests/`), launching from
+the muzzle rather than the mount, and the solver's time-of-flight
+feeds the lead solve. A target no arc reaches shows **NO ARC**: the
+barrel tracks line-of-sight as a ready posture and auto-fire stays
+gated until the target closes in. `pitchOffset` remains a plain aim
+bias on top of the solution.
 
 Player targets lock onto the head (`getPlayerPos` reports ~head level;
 `playerHitbox.aimOffset` shifts the setpoint if shots ride high or
@@ -139,6 +169,6 @@ in the config instead of regearing.
 
 ## Later
 
-- Ballistic pitch (projectile drop / muzzle velocity) instead of line-of-sight.
-- GPS for cannon position instead of hardcoded coords.
 - Web interface for remote targeting (player or XYZ), Spruce-style.
+- Multi-turret: one computer driving several mounts; rednet commander
+  for ground artillery batteries.

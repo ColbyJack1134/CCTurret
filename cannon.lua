@@ -20,6 +20,7 @@
 
 local Cfg = dofile("cfgutil.lua")
 local Heading = dofile("heading.lua")
+local Ballistics = dofile("ballistics.lua")
 
 local CONFIG = "cannon.cfg"
 
@@ -38,6 +39,31 @@ local DEFAULTS = {
   -- Relays only accept relative names: top/bottom/front/back/left/right.
   fireSide = "top",
   firePulseSeconds = 0.4,
+  -- What this cannon is: drives both the fire mode and the ballistics.
+  -- kind "autocannon" holds the fire line while the gate is open;
+  -- "bigcannon" pulses firePulseSeconds per shot and waits
+  -- reloadSeconds before the next. projectile keys the constants table
+  -- in ballistics.lua (big-cannon shells fall at -0.05 b/t^2,
+  -- autocannon rounds at -0.025). Muzzle speed: big cannons get 2 b/t
+  -- per powder charge (charges); autocannons are set by cannon
+  -- material + barrel count (muzzleVelocity, BLOCKS/SECOND):
+  -- 20 * (base + perBarrel * min(barrels, cap)) -- cast iron
+  -- 20*(5+2b<=2), bronze 20*(3+1.5b<=3), steel 20*(3+1.5b<=4); e.g.
+  -- full-length steel = 180. Fine-tune on a moving target: shots
+  -- trailing behind = value too high, leading in front = too low.
+  -- barrelBlocks = mount pivot -> muzzle tip in blocks: CBC spawns the
+  -- shell ~barrelBlocks-1.5 along the barrel, which matters for arcing
+  -- big-cannon shots. arc picks the "shallow" (flat, fast) or "steep"
+  -- (lobbed) solution when both exist.
+  profile = {
+    kind = "autocannon",
+    projectile = "ap_autocannon",
+    muzzleVelocity = 180, -- autocannon only, blocks/sec
+    charges = 1,          -- bigcannon only, powder charges loaded
+    barrelBlocks = 2,
+    reloadSeconds = 5,    -- bigcannon only, pause between auto shots
+    arc = "shallow",
+  },
   -- Center of the cannon mount (use the mount block's coords + 0.5).
   -- Only used while ship.enabled = false; aboard a ship the position is
   -- derived live from GPS + ship.offset instead.
@@ -102,11 +128,7 @@ local DEFAULTS = {
   playerHitbox = { width = 0.6, up = 0.2, down = 1.8, aimOffset = 0 },
   -- Predictive lead for player targets: aim where the target WILL be
   -- when the shell arrives -- pos + velocity * (flight time + latency).
-  -- muzzleVelocity is the shell speed in BLOCKS/SECOND. CBC autocannons:
-  -- 20 * (baseSpeed + perBarrel * min(barrels, cap)) -- cast iron
-  -- 20*(5+2b<=2), bronze 20*(3+1.5b<=3), steel 20*(3+1.5b<=4); e.g.
-  -- full-length steel = 180. Fine-tune on a moving target: shots
-  -- trailing behind = value too high, leading in front = too low.
+  -- Flight time comes from the arc solver (profile + ballistics.lua).
   -- latencySeconds covers detector staleness + redstone + loop
   -- lag on top of flight time. windowSeconds is the velocity estimation
   -- window: speed is measured newest-minus-oldest across a short
@@ -115,7 +137,6 @@ local DEFAULTS = {
   -- more, higher is steadier but slower to notice turns.
   lead = {
     enabled = true,
-    muzzleVelocity = 180,
     latencySeconds = 0.15,
     windowSeconds = 0.3,
   },
@@ -197,6 +218,15 @@ local function loadConfig()
     if ok and type(parsed) == "table" then cfg = parsed end
   end
   local added = Cfg.deepMergeMissing(DEFAULTS, cfg)
+  -- Migration: muzzle velocity moved from lead.muzzleVelocity into the
+  -- cannon profile (it belongs to the gun, not the lead solve). Carry
+  -- a tuned value over once, then drop the old key.
+  if type(cfg.lead) == "table" and cfg.lead.muzzleVelocity ~= nil then
+    cfg.profile.muzzleVelocity = cfg.lead.muzzleVelocity
+    cfg.lead.muzzleVelocity = nil
+    print("Moved lead.muzzleVelocity -> profile.muzzleVelocity ("
+      .. tostring(cfg.profile.muzzleVelocity) .. ")")
+  end
   writeFile(CONFIG, Cfg.jsonPretty(cfg) .. "\n")
   if #added > 0 then
     print("Added config keys: " .. table.concat(added, ", "))
@@ -205,6 +235,29 @@ local function loadConfig()
 end
 
 local cfg = loadConfig()
+
+-- Resolve the cannon profile against the ballistics tables, loudly --
+-- a typo'd projectile name must not become a silent default.
+local proj = Ballistics.PROJECTILES[cfg.profile.projectile]
+if not proj then
+  local known = {}
+  for k in pairs(Ballistics.PROJECTILES) do known[#known + 1] = k end
+  table.sort(known)
+  error(("unknown profile.projectile %q in %s -- known: %s")
+    :format(tostring(cfg.profile.projectile), CONFIG,
+      table.concat(known, ", ")), 0)
+end
+local muzzleSpeed = Ballistics.muzzleSpeed(cfg.profile) -- blocks/sec
+if cfg.profile.arc ~= "shallow" and cfg.profile.arc ~= "steep" then
+  error(('profile.arc must be "shallow" or "steep", got %q')
+    :format(tostring(cfg.profile.arc)), 0)
+end
+if type(cfg.profile.barrelBlocks) ~= "number"
+  or cfg.profile.barrelBlocks < 1 then
+  error("profile.barrelBlocks must be the mount->muzzle length in blocks (>= 1)", 0)
+end
+-- CBC spawns the shell ~1.5 blocks short of one-past-the-tip.
+local muzzleLen = math.max(0, cfg.profile.barrelBlocks - 1.5)
 
 local function need(name, what)
   local p = peripheral.wrap(name)
@@ -381,6 +434,8 @@ local state = {
   yawErr = 0,
   pitchErr = 0,
   dist = nil,        -- distance to the aim point in blocks
+  tof = nil,         -- solver time-of-flight to the aim point, seconds
+  hasArc = nil,      -- false = ballistically unreachable (NO ARC)
   miss = nil,        -- ship target: radial miss distance in blocks
   missH = nil,       -- player target: signed horizontal / vertical miss
   missV = nil,       --   in blocks (drives the hitbox fire gate)
@@ -435,32 +490,73 @@ local function speedFor(diff, invert, drive, ffRate)
   return rpm
 end
 
--- World-space target position -> desired mount yaw/pitch in degrees, plus
--- the distance in blocks. Returns nil when the cannon position is unknown
--- (stale ship fix).
+-- Ballistic solution toward a world-frame offset: dh blocks horizontal,
+-- dy up. profile.arc picks between the two solutions when both exist.
+-- The solver bounds come from the mount's pitch limits -- mount-frame,
+-- which only matches world pitch on a level deck; at hover attitudes
+-- the few degrees of difference just shave the extreme ends of the
+-- envelope. nil = ballistically unreachable.
+local function solveArc(dh, dy)
+  local sols = Ballistics.solve{
+    v0 = muzzleSpeed, gravity = proj.gravity, drag = proj.drag,
+    dx = dh, dy = dy, muzzle = muzzleLen,
+    minPitch = cfg.limits.pitch.min, maxPitch = cfg.limits.pitch.max,
+  }
+  if #sols == 0 then return nil end
+  return cfg.profile.arc == "steep" and sols[#sols] or sols[1]
+end
+
+-- World-space target position -> desired mount yaw/pitch in degrees,
+-- the distance in blocks, the shell's flight time in seconds, and
+-- whether a ballistic solution exists. Yaw is geometric; pitch comes
+-- from the arc solver in the world vertical plane (gravity is world-
+-- down), and the resulting aim DIRECTION is projected through the ship
+-- basis -- a rolled deck couples world pitch into both mount axes, so
+-- the projection must see the vector, not the angle. With no solution
+-- (target past max range) the barrel falls back to line-of-sight pitch
+-- as a ready posture and hasArc=false keeps the fire gate shut.
+-- Returns nil when the cannon position is unknown (stale ship fix).
 local function anglesFor(tx, ty, tz)
   local c = cannonPos()
   if not c then return nil end
   local dx, dy, dz = tx - c.x, ty - c.y, tz - c.z
   local distance = math.sqrt(dx ^ 2 + dy ^ 2 + dz ^ 2)
+  local dh = math.sqrt(dx * dx + dz * dz)
+  local sol = dh > 1e-6 and solveArc(dh, dy) or nil
+  local worldPitch, tof, hasArc
+  if sol then
+    worldPitch, tof, hasArc = sol.pitch, sol.tof, true
+  else
+    worldPitch = math.deg(math.asin(dy / distance))
+    tof = distance / muzzleSpeed
+    hasArc = false
+  end
   if cfg.ship.enabled then
-    -- Project the target direction onto the ship frame: the mount's
-    -- yaw/pitch are deck-relative, and a rolled deck couples roll into
-    -- BOTH axes -- a constant heading subtraction can't express that.
+    -- Build the world aim direction from the solved pitch and project
+    -- it onto the ship frame: the mount's yaw/pitch are deck-relative,
+    -- and a rolled deck couples roll into BOTH axes -- a constant
+    -- heading subtraction can't express that.
+    local pr = math.rad(worldPitch)
+    local hx, hz = 0, 0
+    if dh > 1e-6 then hx, hz = dx / dh, dz / dh end
+    local ux = hx * math.cos(pr)
+    local uy = math.sin(pr)
+    local uz = hz * math.cos(pr)
     local b = ship.basis
-    local df = (dx * b.f.x + dy * b.f.y + dz * b.f.z) / distance
-    local du = (dx * b.u.x + dy * b.u.y + dz * b.u.z) / distance
-    local dr = (dx * b.r.x + dy * b.r.y + dz * b.r.z) / distance
-    local relPitch = math.deg(math.asin(du)) + cfg.pitchOffset
+    local df = ux * b.f.x + uy * b.f.y + uz * b.f.z
+    local du = ux * b.u.x + uy * b.u.y + uz * b.u.z
+    local dr = ux * b.r.x + uy * b.r.y + uz * b.r.z
+    local relPitch = math.deg(math.asin(math.max(-1, math.min(1, du))))
+      + cfg.pitchOffset
     -- -90: deck yaw is measured from ship-forward here, while the old
     -- yaw-only formula measured from ship-right; keeps the tuned
     -- yawOffset meaning what it always meant.
     local relYaw = angleDiff(math.deg(math.atan(dr, df)) - 90 - cfg.yawOffset, 0)
-    return relYaw, relPitch, distance
+    return relYaw, relPitch, distance, tof, hasArc
   end
-  local relPitch = math.deg(math.asin(dy / distance)) + cfg.pitchOffset
+  local relPitch = worldPitch + cfg.pitchOffset
   local worldYaw = math.deg(math.atan(dz, dx))
-  return angleDiff(worldYaw - cfg.yawOffset, 0), relPitch, distance
+  return angleDiff(worldYaw - cfg.yawOffset, 0), relPitch, distance, tof, hasArc
 end
 
 -- areaRadius/avoidRadius for a ship target, per-callsign override first.
@@ -553,16 +649,20 @@ end
 
 -- Intercept point: where the target will be after the shell's flight time
 -- (plus fixed latency), with one refinement pass so the flight time is
--- measured to the predicted point, not the current one. Returns the aim
--- position and the lead time used.
+-- measured to the predicted point, not the current one. Flight time
+-- comes from the arc solver (true ballistic TOF); past max range the
+-- flat-line estimate keeps the readouts alive while hasArc holds fire.
+-- Returns the aim position and the lead time used.
 local function leadPoint(pos)
   local c = cannonPos()
-  local v0 = cfg.lead.muzzleVelocity
-  if not c or v0 <= 0 then return pos, 0 end
+  if not c then return pos, 0 end
   local function leadTime(p)
     local dx, dy, dz = p.x - c.x, p.y - c.y, p.z - c.z
-    return math.sqrt(dx * dx + dy * dy + dz * dz) / v0
-      + cfg.lead.latencySeconds
+    local dh = math.sqrt(dx * dx + dz * dz)
+    local sol = dh > 1e-6 and solveArc(dh, dy) or nil
+    local t = sol and sol.tof
+      or math.sqrt(dx * dx + dy * dy + dz * dz) / muzzleSpeed
+    return t + cfg.lead.latencySeconds
   end
   local t1 = leadTime(pos)
   local t2 = leadTime({ x = pos.x + track.vx * t1, y = pos.y + track.vy * t1,
@@ -577,12 +677,21 @@ end
 -- Ship-target fire gate: would the shot land within `area` blocks of the
 -- transponder, but no closer than `avoid`? Returns gate, missBlocks.
 local function hullGate(center, mount, area, avoid)
-  local relYaw, relPitch, dist = anglesFor(center.x, center.y, center.z)
-  if not relYaw then return false, nil end
+  local relYaw, relPitch, dist, _, hasArc =
+    anglesFor(center.x, center.y, center.z)
+  -- No arc to the hull: the "solution" is line-of-sight posture, and a
+  -- miss measured against it would be fiction. Gate closed.
+  if not relYaw or not hasArc then return false, nil end
   local miss = missDistance(angleDiff(relYaw, mount.CannonYaw),
     relPitch - mount.CannonPitch, mount.CannonPitch, dist)
   return miss <= area and miss >= avoid, miss
 end
+
+-- Big-cannon auto-fire pacing: one firePulseSeconds pulse per shot,
+-- then hold the line low for profile.reloadSeconds. The reload clock
+-- survives target changes -- the loader is busy regardless of what the
+-- barrel points at.
+local pulse = { offAt = 0, nextAt = 0 }
 
 -- Burst hysteresis (cfg.burst): the raw gate opening latches `open`; a
 -- closed raw gate then keeps firing while the miss is still within the
@@ -791,6 +900,7 @@ local function setTarget(kind, name)
   state.miss, state.missH, state.missV = nil, nil, nil
   state.lead = nil
   state.dist = nil
+  state.tof, state.hasArc = nil, nil
   resetLead()
   resetBurst()
   setFiring(false) -- never carry a held fire line across a target change
@@ -832,6 +942,15 @@ local function drawStatus()
     elseif state.noFix then
       term.setTextColor(colors.red)
       term.write("NO FIX")
+    elseif state.hasArc == false then
+      -- Ballistically unreachable: barrel tracks line-of-sight as a
+      -- ready posture, fire stays gated until the target closes in.
+      term.setTextColor(colors.red)
+      term.write("NO ARC")
+      if state.dist then
+        term.setTextColor(colors.lightGray)
+        term.write((" %dm"):format(state.dist))
+      end
     elseif state.locked then
       term.setTextColor(colors.lime)
       term.write("LOCKED")
@@ -1004,6 +1123,8 @@ local function drawDebugScreen(w, h)
     line("cannon xyz", fmtPos(cfg.cannon), colors.yellow)
   end
   line("yawOffset", cfg.yawOffset)
+  line("profile", ("%s %s %.0f b/s"):format(cfg.profile.kind,
+    cfg.profile.projectile, muzzleSpeed))
   local m = state.mount
   line("CannonYaw", fmtDeg(m and m.CannonYaw))
   line("CannonPitch", fmtDeg(m and m.CannonPitch))
@@ -1023,6 +1144,15 @@ local function drawDebugScreen(w, h)
     line("dist / max", state.dist
       and ("%.0f / %d"):format(state.dist, cfg.maxDistance) or "?",
       state.outOfRange and colors.red or colors.lime)
+    line("solution", state.hasArc == false and "NO ARC (LOS posture)"
+      or (state.tof and ("%s arc, tof %.2fs"):format(
+        cfg.profile.arc, state.tof) or "?"),
+      state.hasArc == false and colors.red or nil)
+    if cfg.profile.kind == "bigcannon" then
+      local wait = pulse.nextAt - os.clock()
+      line("reload", wait > 0 and ("%.1fs"):format(wait) or "ready",
+        wait > 0 and colors.yellow or colors.lime)
+    end
     if cfg.burst.enabled then
       line("burst", state.bursting and "HOLDING (gate left box)"
         or (burst.open and "latched" or "idle"),
@@ -1142,7 +1272,7 @@ local function trackLoop()
           end
           ay = ay + cfg.playerHitbox.aimOffset
         end
-        local relYaw, relPitch, dist = anglesFor(ax, ay, az)
+        local relYaw, relPitch, dist, tof, hasArc = anglesFor(ax, ay, az)
         if not relYaw then
           -- Stale ship fix: hold rather than aim with old coords/heading.
           state.noFix = true
@@ -1153,6 +1283,8 @@ local function trackLoop()
         else
           state.noFix = false
           state.dist = dist
+          state.tof = tof
+          state.hasArc = hasArc
           state.outOfRange = dist > cfg.maxDistance
           local data = blockReader.getBlockData()
           state.mount = data
@@ -1238,8 +1370,24 @@ local function trackLoop()
         resetBurst()
         stopMotors()
       end
-      setFiring(state.armed and (state.locked or state.bursting)
-        and not state.outOfRange)
+      -- Auto-fire actuation. The gate additionally requires a real
+      -- ballistic solution -- NO ARC means the barrel is only posing.
+      local gate = state.armed and (state.locked or state.bursting)
+        and not state.outOfRange and state.hasArc == true
+      if cfg.profile.kind == "bigcannon" then
+        -- Pulse + reload: one firePulseSeconds pulse per shot, next
+        -- shot no sooner than reloadSeconds after the trigger.
+        local now = os.clock()
+        if state.firing and now >= pulse.offAt then setFiring(false) end
+        if gate and not state.firing and now >= pulse.nextAt then
+          setFiring(true)
+          pulse.offAt = now + cfg.firePulseSeconds
+          pulse.nextAt = now + math.max(cfg.profile.reloadSeconds,
+            cfg.firePulseSeconds + 0.1)
+        end
+      else
+        setFiring(gate)
+      end
       draw()
       sleep(cfg.trackSeconds)
     else
