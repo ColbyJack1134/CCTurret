@@ -137,7 +137,15 @@ local DEFAULTS = {
   -- "auto" whenever you re-gear the build.
   invertYaw = "auto",
   invertPitch = "auto",
-  tolerance = 1,    -- degrees of acceptable aim error per axis
+  tolerance = 1,    -- degrees of acceptable aim error per axis (lock window)
+  -- Best-achievable lock: also count an axis as locked once it's as close
+  -- as the hardware can get -- when the proportional command has fallen
+  -- below the speed controller's minSpeed floor, so no finer correction
+  -- is possible (the barrel would only stall or overshoot). Lets you set a
+  -- tolerance tighter than the 1-RPM resolution and still fire. The
+  -- achievable precision is roughly minSpeed/speedGain degrees, so RAISE
+  -- speedGain to tighten it. false = strict tolerance only.
+  lockWhenStalled = true,
   -- Auto-fire range gate: while armed, the fire line holds (status shows
   -- OUT OF RANGE) whenever the aim point is farther than this many
   -- blocks. The turret keeps tracking so fire resumes the moment the
@@ -210,13 +218,25 @@ local DEFAULTS = {
   -- instead of trailing it. (A pure-P loop trails a crossing target by
   -- targetSpeed/(degPerSecPerRpm*speedGain) blocks at ANY distance --
   -- enough to keep the fire gate shut on anything faster than a walk.)
-  -- degPerSecPerRpm "auto" is measured during the boot calibration
-  -- wiggle: a direct-drive CBC mount moves 0.75 deg/s per RPM, gearing
-  -- changes it. Set it (or an invert flag) back to "auto" after
-  -- re-gearing. If an axis oscillates around the target, lower its
-  -- speedGain.
-  yawDrive = { speedGain = 6, maxSpeed = 120, degPerSecPerRpm = "auto" },
-  pitchDrive = { speedGain = 3, maxSpeed = 100, degPerSecPerRpm = "auto" },
+  --
+  -- minSpeed is the speed controller's floor (it can't turn slower than
+  -- ~1 RPM). The drive never commands BETWEEN 0 and minSpeed -- a
+  -- sub-floor command just stalls the mount in place -- so it either
+  -- drives at >= minSpeed or parks at 0. That makes the natural settling
+  -- point ~minSpeed/speedGain degrees: HIGHER speedGain parks tighter
+  -- (the opposite of the pure-P intuition, because there's no deadband to
+  -- overshoot -- it parks the instant it can't usefully drive). Raise
+  -- speedGain until the barrel just starts to hunt, then back off a hair;
+  -- pair with lockWhenStalled to fire at that floor. Only lower speedGain
+  -- if an axis visibly oscillates AROUND the target (overshoot), not when
+  -- it stops SHORT (that's the floor -- raise it).
+  --
+  -- degPerSecPerRpm "auto" is measured during the calibration wiggle (boot
+  -- or the CAL button): a direct-drive CBC mount moves 0.75 deg/s per RPM,
+  -- gearing changes it. Set it (or an invert flag) back to "auto" after
+  -- re-gearing, or just press CAL.
+  yawDrive = { speedGain = 6, maxSpeed = 120, minSpeed = 1, degPerSecPerRpm = "auto" },
+  pitchDrive = { speedGain = 3, maxSpeed = 100, minSpeed = 1, degPerSecPerRpm = "auto" },
   -- Names listed here are dimmed in the target list as a "friendly"
   -- reminder; they can still be clicked deliberately. Works for player
   -- names AND ship callsigns -- when the cannon's own ship runs CCMinimap,
@@ -511,6 +531,8 @@ local state = {
   impact = nil,      -- static-mode diagnostic: predicted impact from the
                      -- ACTUAL barrel angle {x,y,z, off, vmiss, tof}
   flash = nil,       -- transient status message (e.g. "FIRED")
+  recalRequest = false, -- UI asked for a recalibration; serviced in trackLoop
+  calibrating = false,  -- recalibration wiggle in progress (status line)
 }
 
 local ui = {
@@ -531,29 +553,57 @@ local function angleDiff(target, current)
   return ((target - current + 180) % 360) - 180
 end
 
--- Per-axis drive command: proportional on error (deadband at tolerance)
--- plus feedforward of the setpoint's own angular rate, converted to RPM
--- through the calibrated degPerSecPerRpm. The P term parks inside the
--- deadband; the FF term keeps the barrel moving WITH a moving aim point
--- so the error stays inside the deadband instead of regrowing each tick.
+-- The smallest aim error this axis can still usefully drive on: below it
+-- the proportional command falls under the speed controller's minSpeed
+-- floor, so the barrel can only stall or overshoot. This is both where
+-- the drive parks and (with lockWhenStalled) the best-achievable lock.
+local function settleBand(drive)
+  return drive.minSpeed / drive.speedGain
+end
+
+-- An axis is "on target" within the lock tolerance, or -- when
+-- lockWhenStalled -- once it's parked at the hardware floor (settleBand),
+-- where no finer correction is possible. Used by the fire gates.
+local function axisSettled(err, drive)
+  err = math.abs(err)
+  if err < cfg.tolerance then return true end
+  return cfg.lockWhenStalled and err <= settleBand(drive)
+end
+
+-- Per-axis drive command: proportional on error plus feedforward of the
+-- setpoint's own angular rate (converted to RPM through the calibrated
+-- degPerSecPerRpm). The speed controller can't turn slower than minSpeed,
+-- so a sub-minSpeed command does nothing but stall the mount -- the drive
+-- therefore commands >= minSpeed or parks at 0, never in between. The
+-- park point is settleBand (minSpeed/speedGain) degrees; that's the
+-- closest a static target can be driven, and lockWhenStalled fires there.
 local function speedFor(diff, invert, drive, ffRate)
   local ff = 0
   local degPerSec = drive.degPerSecPerRpm
   if ffRate and type(degPerSec) == "number" and degPerSec > 0 then
     ff = ffRate / degPerSec
   end
-  -- The deadband only exists so a PARKED barrel doesn't hunt. While the
-  -- setpoint is moving (ff active) the P term must stay live inside it,
-  -- or the barrel -- always entering the deadband from behind on a
-  -- mover -- settles at its trailing edge and every shot lands a touch
-  -- behind: an offset relative to the setpoint itself, which no
-  -- latencySeconds value can compensate.
+  -- Drive only when the P term can clear the floor, or the setpoint is
+  -- itself moving (ff) -- a mover kept live so it doesn't trail, an error
+  -- parked at its trailing edge landing every shot a touch behind, which
+  -- no latencySeconds value can compensate. Otherwise park at 0: we're
+  -- inside settleBand, closer than the controller can usefully turn, so
+  -- driving would only stall or hunt (and detector-noise ff can't twitch
+  -- a parked barrel).
+  local p = math.abs(diff) * drive.speedGain
   local rpm = 0
-  if math.abs(diff) >= cfg.tolerance or math.abs(ff) > 0.5 then
-    rpm = math.min(math.abs(diff) * drive.speedGain, drive.maxSpeed)
+  if p >= drive.minSpeed or math.abs(ff) > 0.5 then
+    rpm = math.min(p, drive.maxSpeed)
     if diff < 0 then rpm = -rpm end
+    rpm = rpm + ff
+    -- Don't emit a magnitude the controller floors to zero (P and ff can
+    -- partly cancel); round up to minSpeed in its direction so the
+    -- intended move actually happens.
+    if math.abs(rpm) < drive.minSpeed then
+      rpm = rpm >= 0 and drive.minSpeed or -drive.minSpeed
+    end
   end
-  rpm = math.max(-drive.maxSpeed, math.min(rpm + ff, drive.maxSpeed))
+  rpm = math.max(-drive.maxSpeed, math.min(rpm, drive.maxSpeed))
   if invert then rpm = -rpm end
   return rpm
 end
@@ -964,6 +1014,16 @@ local function calibrate()
   end
 end
 
+-- Force a fresh wiggle on both axes from the UI (CAL button / K key):
+-- reset sign + slew rate to "auto" so calibrate() re-measures and saves
+-- them. Use after re-gearing or re-mounting. Runs from the track loop,
+-- which owns the motors, so it never fights the aim commands.
+local function recalibrate()
+  cfg.invertYaw, cfg.yawDrive.degPerSecPerRpm = "auto", "auto"
+  cfg.invertPitch, cfg.pitchDrive.degPerSecPerRpm = "auto", "auto"
+  calibrate()
+end
+
 -- -------------------------------------------------------------- targeting --
 
 -- Ingest one transponder broadcast (CCMinimap handlePeerState pattern).
@@ -1106,6 +1166,11 @@ local function drawStatus()
   term.setCursorPos(1, 2)
   term.setBackgroundColor(colors.black)
   term.clearLine()
+  if state.calibrating then
+    term.setTextColor(colors.yellow)
+    term.write("CALIBRATING -- wiggling both axes...")
+    return
+  end
   if state.targetName then
     local isShip = state.targetKind == "ship"
     local isCoord = state.targetKind == "coord"
@@ -1439,10 +1504,11 @@ local function drawButtonBar(w, h)
   button(state.armed and " DISARM " or " ARM ", "arm",
     state.armed and colors.red or colors.lime, true)
   button(" STOP ", "stop", colors.white, state.targetName ~= nil)
-  term.setCursorPos(w - 24, h)
+  button(" CAL ", "recal", colors.yellow, not state.calibrating)
+  term.setCursorPos(w - 30, h)
   term.setBackgroundColor(colors.black)
   term.setTextColor(colors.gray)
-  term.write("F=fire A=arm C=xyz Q=quit")
+  term.write("F=fire A=arm C=xyz K=cal Q=quit")
 end
 
 local function draw()
@@ -1477,6 +1543,20 @@ local function trackLoop()
     end
     if tick % rosterTicks == 0 then refreshRoster() end
     tick = tick + 1
+    -- Serviced here (not in the input loop) because calibration drives the
+    -- motors and must not race the aim commands. pcall so a failed wiggle
+    -- (axis didn't move) just flashes instead of killing the loop.
+    if state.recalRequest then
+      state.recalRequest = false
+      state.calibrating = true
+      stopMotors()
+      draw()
+      local ok = pcall(recalibrate)
+      state.calibrating = false
+      state.flash = ok and "CALIBRATED" or "CAL FAILED"
+      term.setBackgroundColor(colors.black)
+      term.clear()
+    end
     -- Advance the physical reload cycle every frame, target or not, so a
     -- shot fired just before the target dropped still rebuilds the gun.
     if cfg.reload.enabled and cfg.profile.kind == "bigcannon" then
@@ -1597,8 +1677,8 @@ local function trackLoop()
                 angleDiff(relYaw, data.CannonYaw),
                 relPitch - data.CannonPitch, data.CannonPitch, dist)
               state.locked = not state.outOfArc
-                and math.abs(state.yawErr) < cfg.tolerance
-                and math.abs(state.pitchErr) < cfg.tolerance
+                and axisSettled(state.yawErr, cfg.yawDrive)
+                and axisSettled(state.pitchErr, cfg.pitchDrive)
               withinWide = not state.outOfArc
                 and math.abs(state.yawErr) < cfg.tolerance * wd
                 and math.abs(state.pitchErr) < cfg.tolerance * wd
@@ -1620,8 +1700,8 @@ local function trackLoop()
               state.locked = (math.abs(state.missH) <= hb.width / 2
                   and vHead <= hb.up and vHead >= -hb.down)
                 or (not state.outOfArc
-                  and math.abs(state.yawErr) < cfg.tolerance
-                  and math.abs(state.pitchErr) < cfg.tolerance)
+                  and axisSettled(state.yawErr, cfg.yawDrive)
+                  and axisSettled(state.pitchErr, cfg.pitchDrive))
               withinWide = (math.abs(state.missH) <= hb.width / 2 * wd
                   and vHead <= hb.up * wd and vHead >= -hb.down * wd)
                 or (not state.outOfArc
@@ -1708,6 +1788,8 @@ local function handleCommand(cell)
     ui.prompt = { text = "" }
   elseif cell.cmd == "stop" then
     setTarget(state.targetKind, state.targetName) -- toggle off
+  elseif cell.cmd == "recal" then
+    state.recalRequest = true
   elseif cell.cmd:sub(1, 4) == "tab_" then
     ui.activeTab = cell.cmd:sub(5)
     ui.scroll = 0 -- the tabs share the scroll offset; start each at the top
@@ -1771,6 +1853,8 @@ local function inputLoop()
         toggleArm()
       elseif event[2] == keys.c then
         ui.prompt = { text = "", swallow = true }
+      elseif event[2] == keys.k then
+        state.recalRequest = true
       elseif event[2] == keys.q then
         running = false
       end

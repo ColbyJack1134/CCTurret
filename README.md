@@ -54,7 +54,7 @@ are assumed level for now. If GPS or the nav table stop answering, the
 turret holds and shows NO FIX rather than aiming on stale data.
 
 Keys: `F` fire (manual pulse), `A` arm/disarm, `C` enter an XYZ
-target, `Q` quit. The turret
+target, `K` recalibrate the drive, `Q` quit. The turret
 continuously tracks the selected player; `LOCKED` means both axes are
 within `tolerance`. While **armed** (ARM button or `A`; disarmed by
 default) the fire line is held high whenever the turret is locked on and
@@ -237,10 +237,32 @@ RPM command. Without it, a pure-P loop trails any crossing target by
 `speed / (rate × gain)` blocks at every distance — enough to keep the
 fire gate closed against anything faster than a walk. Set
 `degPerSecPerRpm` (or an invert flag) back to `"auto"` after
-re-gearing to re-measure.
+re-gearing to re-measure — or just press the **CAL** button (or `K`),
+which re-runs the wiggle live and saves the result.
 
 If an axis spins away from the target, flip `invertYaw` / `invertPitch`
 in the config instead of regearing.
+
+## Settling and lock
+
+A Create speed controller can't turn slower than ~1 RPM (`minSpeed`).
+The drive never commands *between* 0 and that floor — a sub-floor
+command just stalls the mount in place — so it drives at ≥ `minSpeed`
+or parks at 0. The barrel therefore settles about `minSpeed / speedGain`
+degrees from the target: **raise `speedGain` to settle tighter** (the
+opposite of the usual pure-P intuition, because there's no deadband to
+overshoot — it parks the instant it can't usefully drive). Only lower
+`speedGain` if an axis visibly oscillates *around* the target; if it
+stops *short*, that's the floor — raise the gain.
+
+Because 1 RPM is a hard floor, you can't always reach an arbitrarily
+tight `tolerance`. `lockWhenStalled` (on by default) counts an axis as
+locked once it's parked at that floor — as close as the hardware can
+get — so the gun still fires at its best achievable aim even when the
+error can't be driven below `tolerance`. The achievable precision is
+~`minSpeed / speedGain`°, so a tighter lock means a higher `speedGain`
+(and, ultimately, a finer gear reduction to lower `degPerSecPerRpm`).
+Set `lockWhenStalled = false` for a strict tolerance-only lock.
 
 ## Later
 
