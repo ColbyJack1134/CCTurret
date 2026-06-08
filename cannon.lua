@@ -39,6 +39,27 @@ local DEFAULTS = {
   -- Relays only accept relative names: top/bottom/front/back/left/right.
   fireSide = "top",
   firePulseSeconds = 0.4,
+  -- Physical reload cycle for a manually-loaded big cannon (no
+  -- autoloader). Bigcannon only; ignored for autocannons. When enabled,
+  -- assemblySide is held HIGH = assembled (the default state); after a
+  -- shot the sequence runs: drop assemblySide (disassemble), wait
+  -- settleSeconds, pulse reloadSide to kick off the loader, wait
+  -- profile.reloadSeconds for it to finish, raise assemblySide
+  -- (reassemble), wait settleSeconds, ready to fire again. The motors
+  -- hold (stopped) for the whole cycle since the contraption is gone.
+  -- enabled = false keeps the old autoloader behavior (a plain pulse +
+  -- profile.reloadSeconds time gate, no assembly line). relay = "same"
+  -- shares the fire relay (fire/assembly/reload on three of its sides);
+  -- name a second redstone relay to drive the assembly/reload lines from
+  -- there instead. Sides take the usual relative names.
+  reload = {
+    enabled = false,
+    relay = "same",
+    assemblySide = "back",
+    reloadSide = "left",
+    reloadPulseSeconds = 0.4,
+    settleSeconds = 1.0,
+  },
   -- What this cannon is: drives both the fire mode and the ballistics.
   -- kind "autocannon" holds the fire line while the gate is open;
   -- "bigcannon" pulses firePulseSeconds per shot and waits
@@ -301,6 +322,15 @@ local blockReader = resolve(cfg.peripherals.blockReader, "block_reader",
 local entDet = resolve(cfg.peripherals.playerDetector, "player_detector",
   "player detector")
 local relay = resolve(cfg.peripherals.relay, "redstone_relay", "redstone relay")
+
+-- Relay driving the assembly/reload lines for the bigcannon reload cycle.
+-- "same" shares the fire relay; a name wraps a second relay block. Only
+-- needed when cfg.reload.enabled, but resolved loudly here at boot so a
+-- typo'd name fails before the first shot rather than mid-reload.
+local reloadRelay = relay
+if cfg.reload.enabled and cfg.reload.relay ~= "same" then
+  reloadRelay = need(cfg.reload.relay, "reload redstone relay")
+end
 
 -- Airship mode prerequisites: a wireless modem for gps.locate and a
 -- navigation table for heading. Checked loudly at boot, not at first use.
@@ -725,11 +755,35 @@ local function hullGate(center, mount, area, avoid)
   return miss <= area and miss >= avoid, miss
 end
 
--- Big-cannon auto-fire pacing: one firePulseSeconds pulse per shot,
--- then hold the line low for profile.reloadSeconds. The reload clock
--- survives target changes -- the loader is busy regardless of what the
--- barrel points at.
+-- Big-cannon auto-fire pacing (cfg.reload.enabled = false, the autoloader
+-- path): one firePulseSeconds pulse per shot, then hold the line low for
+-- profile.reloadSeconds. The reload clock survives target changes -- the
+-- loader is busy regardless of what the barrel points at.
 local pulse = { offAt = 0, nextAt = 0 }
+
+-- Physical reload cycle (cfg.reload.enabled, bigcannon only). A
+-- non-blocking phase machine keyed off os.clock(): after a shot the
+-- cannon tears down to be reloaded and rebuilds. Phases advance one per
+-- track tick when the deadline `at` passes; any phase but "ready" means
+-- the contraption is gone, so the drive holds and the fire gate is shut.
+-- Ticked at the top of the track loop so the cycle finishes even if the
+-- target is dropped mid-reload -- the loader is busy regardless.
+local reloadSeq = { phase = "ready", at = 0 }
+local function reloadActive()
+  return cfg.reload.enabled and reloadSeq.phase ~= "ready"
+end
+local startShot -- assigned below (needs setFiring); manual fire routes through it
+
+-- Assembly line held HIGH = assembled (the default); reload line is a
+-- momentary pulse. Both no-op unless cfg.reload.enabled, so callers don't
+-- have to guard. They drive reloadRelay, which is the fire relay unless a
+-- separate one is named.
+local function setAssembly(on)
+  if cfg.reload.enabled then reloadRelay.setOutput(cfg.reload.assemblySide, on) end
+end
+local function setReloadLine(on)
+  if cfg.reload.enabled then reloadRelay.setOutput(cfg.reload.reloadSide, on) end
+end
 
 -- Burst hysteresis (cfg.burst): the raw gate opening latches `open`; a
 -- closed raw gate then keeps firing while the miss is still within the
@@ -770,11 +824,26 @@ end
 local function stopAll()
   stopMotors()
   relay.setOutput(cfg.fireSide, false)
+  -- Leave the gun assembled (the safe default) with the loader idle. Also
+  -- the boot state: stopAll() runs before calibrate(), which needs the
+  -- contraption built to nudge the mount.
+  setReloadLine(false)
+  setAssembly(true)
+  reloadSeq.phase, reloadSeq.at = "ready", 0
 end
 
 -- Manual single pulse (F key / FIRE button).
 local function fire()
   if state.firing then return end -- auto-fire already holds the line high
+  -- Bigcannon with a physical reload: a manual shot empties the gun too,
+  -- so route it through the same disassemble/load/assemble cycle (the
+  -- track loop drives it). Ignore the trigger while a reload is running.
+  if cfg.profile.kind == "bigcannon" and cfg.reload.enabled then
+    if reloadSeq.phase ~= "ready" then return end
+    startShot(os.clock())
+    state.flash = "FIRED"
+    return
+  end
   relay.setOutput(cfg.fireSide, true)
   sleep(cfg.firePulseSeconds)
   relay.setOutput(cfg.fireSide, false)
@@ -782,8 +851,8 @@ local function fire()
 end
 
 -- Auto-fire (autocannon): hold the fire line high while armed and locked,
--- drop it the moment lock is lost. A regular (single-shot) big cannon will
--- need a pulse + reload-delay mode here once cannon type is configurable.
+-- drop it the moment lock is lost. Bigcannons instead pulse it (the
+-- autoloader path) or run the full reload cycle below.
 local function setFiring(on)
   if state.firing == on then return end
   state.firing = on
@@ -793,6 +862,50 @@ end
 local function toggleArm()
   state.armed = not state.armed
   if not state.armed then setFiring(false) end
+end
+
+-- Kick off a shot under the physical-reload model: pulse the fire line,
+-- then hand off to tickReload, which drops it and runs the cycle.
+function startShot(now)
+  setFiring(true)
+  reloadSeq.phase = "firing"
+  reloadSeq.at = now + cfg.firePulseSeconds
+end
+
+-- Advance the physical reload cycle. One edge per call (one relay change
+-- per track tick keeps the redstone clean); a phase whose deadline hasn't
+-- passed is left alone. settleSeconds = 0 just means the next edge fires
+-- on the following tick. Called every frame from the track loop.
+local function tickReload(now)
+  if reloadSeq.phase == "ready" or now < reloadSeq.at then return end
+  local p = reloadSeq.phase
+  if p == "firing" then
+    setFiring(false)        -- end the fire pulse
+    setAssembly(false)      -- disassemble to expose the breech
+    reloadSeq.phase, reloadSeq.at = "disassembled", now + cfg.reload.settleSeconds
+  elseif p == "disassembled" then
+    setReloadLine(true)     -- pulse the loader
+    reloadSeq.phase, reloadSeq.at = "pulsing", now + cfg.reload.reloadPulseSeconds
+  elseif p == "pulsing" then
+    setReloadLine(false)
+    reloadSeq.phase, reloadSeq.at = "loading", now + math.max(0, cfg.profile.reloadSeconds)
+  elseif p == "loading" then
+    setAssembly(true)       -- loader done: reassemble
+    reloadSeq.phase, reloadSeq.at = "assembling", now + cfg.reload.settleSeconds
+  elseif p == "assembling" then
+    reloadSeq.phase, reloadSeq.at = "ready", 0
+  end
+end
+
+-- Human-readable reload state for the status / debug lines.
+local RELOAD_LABEL = {
+  firing = "FIRING", disassembled = "DISASSEMBLING", pulsing = "LOADING",
+  loading = "LOADING", assembling = "ASSEMBLING",
+}
+local function reloadStatus()
+  local label = RELOAD_LABEL[reloadSeq.phase]
+  if not label then return nil end
+  return label, math.max(0, reloadSeq.at - os.clock())
 end
 
 -- ----------------------------------------------------------- calibration --
@@ -1064,6 +1177,13 @@ local function drawStatus()
     term.setTextColor(colors.lightGray)
     term.write("No target -- click a player, ship, or XYZ")
   end
+  if reloadActive() then
+    local label, remain = reloadStatus()
+    if label then
+      term.setTextColor(colors.yellow)
+      term.write(("  %s %.1fs"):format(label, remain))
+    end
+  end
   if state.armed and not state.firing then
     term.setTextColor(colors.red)
     term.write("  ARMED")
@@ -1241,9 +1361,15 @@ local function drawDebugScreen(w, h)
       end
     end
     if cfg.profile.kind == "bigcannon" then
-      local wait = pulse.nextAt - os.clock()
-      line("reload", wait > 0 and ("%.1fs"):format(wait) or "ready",
-        wait > 0 and colors.yellow or colors.lime)
+      if cfg.reload.enabled then
+        local label, remain = reloadStatus()
+        line("reload", label and ("%s %.1fs"):format(label, remain) or "ready",
+          label and colors.yellow or colors.lime)
+      else
+        local wait = pulse.nextAt - os.clock()
+        line("reload", wait > 0 and ("%.1fs"):format(wait) or "ready",
+          wait > 0 and colors.yellow or colors.lime)
+      end
     end
     if cfg.burst.enabled then
       line("burst", state.bursting and "HOLDING (gate left box)"
@@ -1351,6 +1477,11 @@ local function trackLoop()
     end
     if tick % rosterTicks == 0 then refreshRoster() end
     tick = tick + 1
+    -- Advance the physical reload cycle every frame, target or not, so a
+    -- shot fired just before the target dropped still rebuilds the gun.
+    if cfg.reload.enabled and cfg.profile.kind == "bigcannon" then
+      tickReload(os.clock())
+    end
     if state.targetName then
       local pos = targetPos()
       if pos then
@@ -1524,15 +1655,26 @@ local function trackLoop()
       local gate = state.armed and (state.locked or state.bursting)
         and not state.outOfRange and state.hasArc == true
       if cfg.profile.kind == "bigcannon" then
-        -- Pulse + reload: one firePulseSeconds pulse per shot, next
-        -- shot no sooner than reloadSeconds after the trigger.
-        local now = os.clock()
-        if state.firing and now >= pulse.offAt then setFiring(false) end
-        if gate and not state.firing and now >= pulse.nextAt then
-          setFiring(true)
-          pulse.offAt = now + cfg.firePulseSeconds
-          pulse.nextAt = now + math.max(cfg.profile.reloadSeconds,
-            cfg.firePulseSeconds + 0.1)
+        if cfg.reload.enabled then
+          -- Physical reload: fire only from a fully assembled gun; while
+          -- the cycle runs the contraption is gone, so hold the drive
+          -- (tickReload at the loop top advances the relay sequence).
+          if reloadSeq.phase == "ready" then
+            if gate then startShot(os.clock()) end
+          else
+            stopMotors()
+          end
+        else
+          -- Autoloader path: one firePulseSeconds pulse per shot, next
+          -- shot no sooner than reloadSeconds after the trigger.
+          local now = os.clock()
+          if state.firing and now >= pulse.offAt then setFiring(false) end
+          if gate and not state.firing and now >= pulse.nextAt then
+            setFiring(true)
+            pulse.offAt = now + cfg.firePulseSeconds
+            pulse.nextAt = now + math.max(cfg.profile.reloadSeconds,
+              cfg.firePulseSeconds + 0.1)
+          end
         end
       else
         setFiring(gate)
@@ -1541,13 +1683,15 @@ local function trackLoop()
       sleep(cfg.trackSeconds)
     else
       stopMotors()
-      setFiring(false)
+      -- Don't cut a fire pulse short or fight an in-flight reload cycle.
+      if not reloadActive() then setFiring(false) end
       -- Idle aim loop doesn't touch the mount; keep the debug tab live.
       if ui.activeTab == "debug" then
         state.mount = blockReader.getBlockData()
       end
       draw()
-      sleep(0.5)
+      -- Tick fast while a reload runs so its phase deadlines stay crisp.
+      sleep(reloadActive() and cfg.trackSeconds or 0.5)
     end
     state.flash = nil
   end

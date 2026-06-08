@@ -11,9 +11,12 @@ on CC:Tweaked, based on [pastebin tb4aiueb](https://pastebin.com/tb4aiueb)
 - **Block Reader** (Advanced Peripherals) against the cannon mount — reads the
   `CannonYaw` / `CannonPitch` NBT for closed-loop feedback.
 - **Player Detector** (Advanced Peripherals) — target acquisition.
-- **Redstone Relay** (CC:Tweaked) — one line: fire. (Assembly and clutch lines
-  from earlier plans are unnecessary: the speed controllers hold at 0 RPM and
-  the block reader gives absolute angles.)
+- **Redstone Relay** (CC:Tweaked) — one line: fire. Aiming needs no assembly
+  or clutch line: the speed controllers hold at 0 RPM and the block reader
+  gives absolute angles. A big cannon with a **physical reload** (`reload`
+  config) adds two more lines — an assembly line held high (drop it to
+  disassemble) and a momentary loader-trigger line — on the same relay's
+  spare sides or a second relay.
 
 ## Usage
 
@@ -90,7 +93,9 @@ mode and the ballistics:
 - `kind`: `autocannon` holds the fire line while the gate is open;
   `bigcannon` pulses `firePulseSeconds` per shot and waits
   `profile.reloadSeconds` before the next (reload countdown on the
-  DEBUG tab).
+  DEBUG tab). By default that wait assumes an autoloader — the line
+  just sits low. Set `reload.enabled` for a gun that must be torn down
+  to reload (see **Reload cycle**).
 - `projectile`: keys the constants table in `ballistics.lua` —
   big-cannon shells fall at −0.05 b/t², autocannon rounds and the
   mortar stone at −0.025, drag 0.99/tick for all (verified from CBC
@@ -129,6 +134,37 @@ line goes high while the turret keeps converging on the head. The status line sh
 / vertical miss until lock. `trackSeconds` (default 0.1, minimum 0.05 —
 one game tick) sets the tracking loop period if you want faster aim
 updates for more peripheral traffic.
+
+## Reload cycle
+
+A real big cannon can't be reloaded while assembled — it has to be torn
+back into blocks, loaded, and rebuilt. Set `reload.enabled = true` (a
+`bigcannon` profile) and the controller drives that sequence on two
+extra redstone lines instead of the autoloader's silent timer:
+
+1. **Fire** — pulse `fireSide` for `firePulseSeconds`.
+2. **Disassemble** — drop `assemblySide` (held high the rest of the
+   time = assembled). Wait `reload.settleSeconds`.
+3. **Load** — pulse `reloadSide` for `reload.reloadPulseSeconds` to kick
+   off whatever loads the breech, then wait `profile.reloadSeconds` for
+   it to finish.
+4. **Reassemble** — raise `assemblySide`. Wait `reload.settleSeconds`,
+   then the gun is ready for the next shot.
+
+The cannon is **assembled by default**: the assembly line is high at
+boot (the gun is built for the calibration nudge) and on quit, and only
+drops during a reload. The whole cycle is non-blocking — aiming, the UI,
+and transponder tracking keep running — but the barrel **holds** while
+the contraption is torn down (it can't move what isn't there) and the
+fire gate stays shut until reassembly. A manual `F` shot runs the same
+cycle. The status line and the DEBUG `reload` line show the live phase
+(`DISASSEMBLING` / `LOADING` / `ASSEMBLING`) and countdown.
+
+Wiring: by default all three lines (`fireSide`, `assemblySide`,
+`reloadSide`) are sides of the one fire relay — pick three that aren't
+wired together. To drive the assembly/reload lines from a **second**
+relay, set `reload.relay` to that relay's peripheral name. Don't care
+about a settle pause? Set `reload.settleSeconds = 0`.
 
 ## Coordinate targets
 
