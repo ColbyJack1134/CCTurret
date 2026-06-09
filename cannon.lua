@@ -11,7 +11,8 @@
 -- click a row to track it, click again or [ STOP ] to release.
 --
 -- Keys: F = fire, A = arm/disarm, K = calibrate+tune, O = capture yawOffset
--- from the rest pose, L = trace log, Q = quit. Mouse/touch for the rest.
+-- from the rest pose, L = diagnostic trace (drive + fire-gate), Q = quit.
+-- Mouse/touch for the rest.
 -- While armed, the fire line is held high whenever both axes are locked on
 -- (autocannon assumption) and dropped the moment lock is lost.
 --
@@ -157,14 +158,15 @@ local DEFAULTS = {
   -- "auto" whenever you re-gear the build.
   invertYaw = "auto",
   invertPitch = "auto",
-  tolerance = 1,    -- degrees of acceptable aim error per axis (lock window)
+  tolerance = 0.4,  -- degrees of acceptable aim error per axis (lock window)
   -- Best-achievable lock: also count an axis as locked once it's as close
-  -- as the hardware can get -- when the proportional command has fallen
-  -- below the speed controller's minSpeed floor, so no finer correction
-  -- is possible (the barrel would only stall or overshoot). Lets you set a
-  -- tolerance tighter than the 1-RPM resolution and still fire. The
-  -- achievable precision is roughly minSpeed/speedGain degrees, so RAISE
-  -- speedGain to tighten it. false = strict tolerance only.
+  -- as the hardware can get -- when the drive command has fallen below the
+  -- speed controller's minSpeed floor, so no finer correction is possible
+  -- (the barrel would only stall or overshoot). Lets you set a tolerance
+  -- tighter than the drive can hold and still fire. The achievable precision
+  -- is settleBand() -- the WIDER of minSpeed/speedGain and the overshoot
+  -- guard's minSpeed*loopT*dps/approach -- so raise speedGain AND/OR approach
+  -- to tighten it (whichever is the binding floor). false = strict tolerance.
   lockWhenStalled = true,
   -- Auto-fire range gate: while armed, the fire line holds (status shows
   -- OUT OF RANGE) whenever the aim point is farther than this many
@@ -191,10 +193,17 @@ local DEFAULTS = {
   -- position history (adjacent-tick differences are dominated by
   -- detector update jitter). Lower follows jukes faster but jitters
   -- more, higher is steadier but slower to notice turns.
+  -- minSpeed (blocks/sec) is a stationary deadband: below it the velocity
+  -- is treated as zero so detector jitter on a STANDING player can't wander
+  -- the lead point and keep the barrel from settling (a fixed coord locks
+  -- because it has no such jitter -- this makes a still player behave the
+  -- same). Set it above the standing-jitter speed (~0.3) but below a walk
+  -- (~4.3); 1.0 cleanly separates the two. Lead resumes above it.
   lead = {
     enabled = true,
     latencySeconds = 0.15,
     windowSeconds = 0.3,
+    minSpeed = 1.0,
   },
   -- Burst hysteresis on the auto-fire gate: once the gate opens, keep
   -- the line high while the miss stays within `widen` x the normal gate
@@ -752,20 +761,31 @@ local function angleDiff(target, current)
 end
 
 -- The smallest aim error this axis can still usefully drive on: below it
--- the proportional command falls under the speed controller's minSpeed
--- floor, so the barrel can only stall or overshoot. This is both where
--- the drive parks and (with lockWhenStalled) the best-achievable lock.
-local function settleBand(drive)
-  return drive.minSpeed / drive.speedGain
+-- speedFor commands 0 and the barrel parks. TWO floors can stop it, and the
+-- barrel parks at whichever is hit FIRST (the larger error):
+--   * the minSpeed floor:        err < minSpeed/speedGain
+--   * the overshoot guard's cap:  err < minSpeed*loopT*dps/approach
+-- The guard (speedFor's approach cap) was added after this function and is
+-- often the binding limit, so ignoring it made lockWhenStalled reject a
+-- barrel that genuinely can't aim tighter. loopT (the live loop period) is
+-- needed for the guard term; without it, fall back to the minSpeed floor.
+local function settleBand(drive, loopT)
+  local band = drive.minSpeed / drive.speedGain
+  local dps = drive.degPerSecPerRpm
+  if type(dps) == "number" and dps > 0 and drive.approach and drive.approach > 0
+      and loopT and loopT > 0 then
+    band = math.max(band, drive.minSpeed * loopT * dps / drive.approach)
+  end
+  return band
 end
 
 -- An axis is "on target" within the lock tolerance, or -- when
 -- lockWhenStalled -- once it's parked at the hardware floor (settleBand),
 -- where no finer correction is possible. Used by the fire gates.
-local function axisSettled(err, drive)
+local function axisSettled(err, drive, loopT)
   err = math.abs(err)
   if err < cfg.tolerance then return true end
-  return cfg.lockWhenStalled and err <= settleBand(drive)
+  return cfg.lockWhenStalled and err <= settleBand(drive, loopT)
 end
 
 -- Per-axis drive command: proportional on error, feedforward of the
@@ -778,8 +798,9 @@ end
 -- moving target (steady tracking -> ~0 error rate). kd = 0 is pure P+ff.
 -- The speed controller can't turn slower than minSpeed, so a sub-minSpeed
 -- command does nothing but stall the mount -- the drive therefore commands
--- >= minSpeed or parks at 0, never in between. The park point is settleBand
--- (minSpeed/speedGain) degrees; lockWhenStalled fires there.
+-- >= minSpeed or parks at 0, never in between. The park point is settleBand()
+-- degrees (the wider of the minSpeed floor and the overshoot-guard cap);
+-- lockWhenStalled fires there.
 local function speedFor(diff, invert, drive, ffRate, dRate, loopT)
   local ff, d = 0, 0
   local degPerSec = drive.degPerSecPerRpm
@@ -961,9 +982,16 @@ local function updateLead(pos)
   local o, n = hist[1], hist[#hist]
   local span = n.t - o.t
   if span >= LEAD_MIN_SPAN then
-    track.vx = (n.x - o.x) / span
-    track.vy = (n.y - o.y) / span
-    track.vz = (n.z - o.z) / span
+    local vx = (n.x - o.x) / span
+    local vy = (n.y - o.y) / span
+    local vz = (n.z - o.z) / span
+    -- Stationary deadband: below minSpeed the motion is detector jitter, not
+    -- travel. Zeroing it keeps the lead point (and so the aim setpoint) still
+    -- enough for the barrel to settle and lock on a standing target.
+    if math.sqrt(vx * vx + vy * vy + vz * vz) < (cfg.lead.minSpeed or 0) then
+      vx, vy, vz = 0, 0, 0
+    end
+    track.vx, track.vy, track.vz = vx, vy, vz
   end
 end
 
@@ -1004,21 +1032,24 @@ end
 -- ----------------------------------------------------------- diagnostics --
 
 -- Diagnostic trace: while on, the track loop appends the per-tick drive
--- signals to cannon.trace.csv, so a recorded lock / oscillation can be read
--- back offline -- the real sensor noise, loop latency, and oscillation period
--- the idealized tuning model can't see. Toggle with L (or the CLI); it
+-- signals AND the fire-gate decision to cannon.trace.csv, so a recorded lock
+-- / oscillation / "locked but won't fire" can be read back offline -- the
+-- real sensor noise, loop latency, oscillation period, and the exact gate
+-- terms the idealized model can't see. Toggle with L (or the CLI); it
 -- auto-stops after TRACE_MAX seconds so a forgotten trace can't grow forever.
 local TRACE_MAX = 40
 local TRACE_FILE = "cannon.trace.csv"
 -- Buffered in memory and written once on stop, so recording adds NO per-tick
 -- file I/O -- an earlier per-row flush() was itself slowing the loop and
 -- contaminating the very timing it was meant to measure. The `dt` column is
--- the real loop period (the thing the overshoot guard adapts to).
+-- the real loop period (the thing the overshoot guard adapts to). The gate
+-- columns (locked..dist) answer why the auto-fire line is/isn't held.
 local trace = { on = false, rows = nil, t0 = 0, lastT = nil }
 local function traceStart()
   if trace.on then return end
   trace.rows = { "t,dt,target,aimYaw,mountYaw,yawErr,yawErrRate,yawRpm,"
-    .. "aimPitch,mountPitch,pitchErr,pitchErrRate,pitchRpm" }
+    .. "aimPitch,mountPitch,pitchErr,pitchErrRate,pitchRpm,"
+    .. "locked,bursting,hasArc,outOfRange,outOfArc,missH,missV,dist,phase" }
   trace.t0 = os.clock()
   trace.lastT = nil
   trace.on = true
@@ -1033,17 +1064,23 @@ local function traceStop()
   end
   trace.on = false
 end
-local function traceRow(aimYaw, mountYaw, yawRpm, aimPitch, mountPitch, pitchRpm)
+local function traceRow(aimYaw, mountYaw, yawRpm, aimPitch, mountPitch, pitchRpm, phase)
   if not (trace.on and trace.rows) then return end
   local t = os.clock() - trace.t0
   if t > TRACE_MAX then traceStop(); return end
   local dt = trace.lastT and (t - trace.lastT) or 0
   trace.lastT = t
+  local function n(v, fmt) return v and (fmt):format(v) or "" end
   trace.rows[#trace.rows + 1] =
-    ("%.3f,%.3f,%s,%.3f,%.3f,%.3f,%.3f,%.2f,%.3f,%.3f,%.3f,%.3f,%.2f")
+    ("%.3f,%.3f,%s,%.3f,%.3f,%.3f,%.3f,%.2f,%.3f,%.3f,%.3f,%.3f,%.2f,"
+      .. "%s,%s,%s,%s,%s,%s,%s,%s,%s")
       :format(t, dt, tostring(state.targetName), aimYaw, mountYaw, state.yawErr,
         track.yawErrRate, yawRpm, aimPitch, mountPitch, state.pitchErr,
-        track.pitchErrRate, pitchRpm)
+        track.pitchErrRate, pitchRpm,
+        tostring(state.locked), tostring(state.bursting), tostring(state.hasArc),
+        tostring(state.outOfRange), tostring(state.outOfArc),
+        n(state.missH, "%.2f"), n(state.missV, "%.2f"), n(state.dist, "%.0f"),
+        phase or "")
 end
 
 
@@ -1252,8 +1289,8 @@ local function tickPark(now)
     -- Shortest path home: angleDiff handles the continuous-ring +/-180 seam.
     local yawErr = angleDiff(-cfg.yawOffset, data.CannonYaw)
     local pitchErr = -data.CannonPitch
-    settled = axisSettled(yawErr, cfg.yawDrive)
-      and axisSettled(pitchErr, cfg.pitchDrive)
+    settled = axisSettled(yawErr, cfg.yawDrive, track.loopT)
+      and axisSettled(pitchErr, cfg.pitchDrive, track.loopT)
     if settled then
       stopMotors()
     else
@@ -1786,6 +1823,15 @@ local CONFIG_ITEMS = {
     values = { true, false },
     get = function() return cfg.lockWhenStalled end,
     set = function(v) cfg.lockWhenStalled = v end },
+  { group = "Aim", label = "lead", etype = "enum", file = "cfg",
+    values = { true, false },
+    get = function() return cfg.lead.enabled end,
+    set = function(v) cfg.lead.enabled = v end },
+  { group = "Aim", label = "lead minSpd", etype = "num", file = "cfg",
+    min = 0, max = 6, step = 0.1,
+    show = function() return cfg.lead.enabled end,
+    get = function() return cfg.lead.minSpeed end,
+    set = function(v) cfg.lead.minSpeed = v end },
   -- Position (land/static mode only). gps toggles between manual xyz and a
   -- GPS-fix-plus-offset derivation; static = true re-derives the mount
   -- position live (refreshStaticCannon) so no reboot is needed. Offsets are
@@ -2488,7 +2534,7 @@ local function drawButtonBar(w, h)
   term.setCursorPos(w - 30, h)
   term.setBackgroundColor(colors.black)
   term.setTextColor(colors.gray)
-  term.write("F=fire A=arm C=xyz K=cal+tune O=yaw0 L=log Q=quit")
+  term.write("F=fire A=arm C=xyz K=cal+tune O=yaw0 L=trace Q=quit")
 end
 
 local function draw()
@@ -2691,8 +2737,8 @@ local function trackLoop()
                 angleDiff(relYaw, data.CannonYaw),
                 relPitch - data.CannonPitch, data.CannonPitch, dist)
               state.locked = not state.outOfArc
-                and axisSettled(state.yawErr, cfg.yawDrive)
-                and axisSettled(state.pitchErr, cfg.pitchDrive)
+                and axisSettled(state.yawErr, cfg.yawDrive, track.loopT)
+                and axisSettled(state.pitchErr, cfg.pitchDrive, track.loopT)
               withinWide = not state.outOfArc
                 and math.abs(state.yawErr) < cfg.tolerance * wd
                 and math.abs(state.pitchErr) < cfg.tolerance * wd
@@ -2714,8 +2760,8 @@ local function trackLoop()
               state.locked = (math.abs(state.missH) <= hb.width / 2
                   and vHead <= hb.up and vHead >= -hb.down)
                 or (not state.outOfArc
-                  and axisSettled(state.yawErr, cfg.yawDrive)
-                  and axisSettled(state.pitchErr, cfg.pitchDrive))
+                  and axisSettled(state.yawErr, cfg.yawDrive, track.loopT)
+                  and axisSettled(state.pitchErr, cfg.pitchDrive, track.loopT))
               withinWide = (math.abs(state.missH) <= hb.width / 2 * wd
                   and vHead <= hb.up * wd and vHead >= -hb.down * wd)
                 or (not state.outOfArc
@@ -2752,7 +2798,7 @@ local function trackLoop()
               yawRpm, pitchRpm = 0, 0
             end
             traceRow(aimYaw, data.CannonYaw, yawRpm,
-              aimPitch, data.CannonPitch, pitchRpm)
+              aimPitch, data.CannonPitch, pitchRpm, reloadSeq.phase)
           else
             -- No mount reading: don't keep reporting (or firing on) a lock
             -- computed from stale angles.
@@ -2989,7 +3035,15 @@ local function inputLoop()
         end
       end
     elseif event[1] == "mouse_scroll" then
-      ui.scroll = math.max(0, ui.scroll + event[2])
+      -- The CONFIG screen scrolls by moving the selection (the draw keeps the
+      -- selected row on screen); setting ui.scroll directly would just snap
+      -- back. Other tabs use ui.scroll as the raw viewport offset.
+      if ui.activeTab == "config" then
+        local n = #visibleConfigItems()
+        ui.cfgSel = math.max(1, math.min(n, ui.cfgSel + event[2]))
+      else
+        ui.scroll = math.max(0, ui.scroll + event[2])
+      end
     end
     draw()
   end
