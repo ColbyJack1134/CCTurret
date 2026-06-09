@@ -51,7 +51,7 @@ local SEQUENCE = {
   { slot = SLOT.charge, name = "charge 3", rams = 2 },
 }
 
-local TRIGGER_SIDE = "back"  -- redstone rising edge here starts a cycle
+local TRIGGER_SIDE = "bottom"  -- redstone rising edge here starts a cycle
 local STROKE_DELAY = 0.25    -- seconds between place/ram strokes so the
                              -- server registers each block move before the next
 
