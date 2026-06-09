@@ -27,10 +27,13 @@ local function simulate(v0bs, gravity, drag, muzzle, pitchDeg, dx)
   local vy = v0bs / 20 * math.sin(r)
   for t = 1, 200000 do
     local px, py = x, y
-    x = x + vx
-    y = y + vy
-    vx = vx * q
-    vy = vy * q + gravity
+    -- CBC integration (AbstractCannonProjectile): a = -drag*v + g,
+    -- pos += v + 0.5*a, v += a  ==  pos += 0.5*(v_old + v_new).
+    local nvx = vx * q
+    local nvy = vy * q + gravity
+    x = x + 0.5 * (vx + nvx)
+    y = y + 0.5 * (vy + nvy)
+    vx, vy = nvx, nvy
     if x >= dx then
       local f = (dx - px) / (x - px)
       return py + (y - py) * f, (t - 1 + f) / 20
@@ -104,14 +107,15 @@ if #wide == 2 then
     y and ("miss %.3f"):format(math.abs(y)) or "no impact")
 end
 
--- Max range boundary (5 charges, no muzzle offset): ~693 on flat
--- ground, so 690 solves and 700 does not.
+-- Max range boundary (5 charges, no muzzle offset): ~686 on flat ground
+-- with the trapezoidal CBC integration (Euler over-predicted ~693), so
+-- 685 solves and 695 does not.
 local near = B.solve{ v0 = 200, gravity = HE.gravity, drag = HE.drag,
-  dx = 690, dy = 0, muzzle = 0 }
+  dx = 685, dy = 0, muzzle = 0 }
 local past = B.solve{ v0 = 200, gravity = HE.gravity, drag = HE.drag,
-  dx = 700, dy = 0, muzzle = 0 }
-check("690 within 5ch max range", #near >= 1)
-check("700 past 5ch max range", #past == 0)
+  dx = 695, dy = 0, muzzle = 0 }
+check("685 within 5ch max range", #near >= 1)
+check("695 past 5ch max range", #past == 0)
 
 -- Autocannon drop compensation: at 80 blocks the solver aims a little
 -- ABOVE line of sight (drop ~1 block -> ~0.7 deg), never below.
@@ -175,10 +179,27 @@ end
 -- Profile -> muzzle speed resolution, including loud failures.
 check("bigcannon 5 charges = 200 b/s",
   B.muzzleSpeed{ kind = "bigcannon", charges = 5 } == 200)
-check("autocannon passes muzzleVelocity through",
-  B.muzzleSpeed{ kind = "autocannon", muzzleVelocity = 180 } == 180)
+-- Autocannon speed is computed from material + barrels (20*(base+per*min(b,cap))).
+check("autocannon full steel (6 barrels, cap 4) = 180 b/s",
+  B.muzzleSpeed{ kind = "autocannon", material = "steel", barrels = 6 } == 180)
+check("autocannon full cast iron (cap 2) = 180 b/s",
+  B.muzzleSpeed{ kind = "autocannon", material = "cast_iron", barrels = 6 } == 180)
+check("autocannon bronze 3 barrels (cap 3) = 150 b/s",
+  B.muzzleSpeed{ kind = "autocannon", material = "bronze", barrels = 3 } == 150)
+check("autocannon steel 2 barrels (under cap) = 120 b/s",
+  B.muzzleSpeed{ kind = "autocannon", material = "steel", barrels = 2 } == 120)
+check("autocannonSpeed barrels capped",
+  B.autocannonSpeed("steel", 99) == B.autocannonSpeed("steel", 4))
+check("muzzleVelocityOverride forces the speed",
+  B.muzzleSpeed{ kind = "autocannon", material = "steel", barrels = 6,
+    muzzleVelocityOverride = 250 } == 250)
+check("override 0 falls back to the formula",
+  B.muzzleSpeed{ kind = "autocannon", material = "steel", barrels = 6,
+    muzzleVelocityOverride = 0 } == 180)
 check("bigcannon without charges errors",
   not pcall(B.muzzleSpeed, { kind = "bigcannon" }))
+check("autocannon unknown material errors",
+  not pcall(B.muzzleSpeed, { kind = "autocannon", material = "titanium", barrels = 4 }))
 check("unknown kind errors",
   not pcall(B.muzzleSpeed, { kind = "railgun" }))
 

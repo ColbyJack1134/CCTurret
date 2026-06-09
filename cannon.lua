@@ -21,16 +21,21 @@
 local Cfg = dofile("cfgutil.lua")
 local Heading = dofile("heading.lua")
 local Ballistics = dofile("ballistics.lua")
+local Autotune = dofile("autotune.lua")
 
-local CONFIG = "cannon.cfg"
+local CONFIG = "cannon.cfg"   -- hand-authored intent
+local CALFILE = "cannon.cal"  -- machine-measured, safe to delete (CAL rebuilds)
 
 local DEFAULTS = {
   -- "auto" finds the single attached peripheral of that type (errors if
   -- there are zero or several). The two speed controllers share a type,
-  -- so yaw and pitch must always be named explicitly.
+  -- so "auto" yaw/pitch are told apart by the calibration wiggle: each
+  -- controller is nudged and whichever of CannonYaw/CannonPitch moves
+  -- names it. The resolved names are saved to cannon.cal. Leave them
+  -- "auto" for hands-off setup, or pin explicit names here to skip it.
   peripherals = {
-    yaw = "Create_RotationSpeedController_0",
-    pitch = "Create_RotationSpeedController_1",
+    yaw = "auto",
+    pitch = "auto",
     blockReader = "auto",
     playerDetector = "auto",
     relay = "auto",
@@ -65,13 +70,17 @@ local DEFAULTS = {
   -- "bigcannon" pulses firePulseSeconds per shot and waits
   -- reloadSeconds before the next. projectile keys the constants table
   -- in ballistics.lua (big-cannon shells fall at -0.05 b/t^2,
-  -- autocannon rounds at -0.025). Muzzle speed: big cannons get 2 b/t
-  -- per powder charge (charges); autocannons are set by cannon
-  -- material + barrel count (muzzleVelocity, BLOCKS/SECOND):
-  -- 20 * (base + perBarrel * min(barrels, cap)) -- cast iron
-  -- 20*(5+2b<=2), bronze 20*(3+1.5b<=3), steel 20*(3+1.5b<=4); e.g.
-  -- full-length steel = 180. Fine-tune on a moving target: shots
-  -- trailing behind = value too high, leading in front = too low.
+  -- autocannon rounds at -0.025).
+  --
+  -- Muzzle speed is COMPUTED from the build, never typed by hand:
+  --  * bigcannon: 2 b/t per powder charge -> charges.
+  --  * autocannon: 20 * (base + perBarrel * min(barrels, cap)) with
+  --    base/perBarrel/cap from material ("cast_iron" / "bronze" /
+  --    "steel"); e.g. full-length steel or cast iron = 180 b/s. So set
+  --    material + barrels, not a velocity. muzzleVelocityOverride > 0
+  --    forces a speed instead (only for a datapack-tuned server whose
+  --    numbers differ from the published ones); 0 = compute.
+  --
   -- barrelBlocks = mount pivot -> muzzle tip in blocks: CBC spawns the
   -- shell ~barrelBlocks-1.5 along the barrel, which matters for arcing
   -- big-cannon shots. arc picks the "shallow" (flat, fast) or "steep"
@@ -79,10 +88,12 @@ local DEFAULTS = {
   profile = {
     kind = "autocannon",
     projectile = "ap_autocannon",
-    muzzleVelocity = 180, -- autocannon only, blocks/sec
-    charges = 1,          -- bigcannon only, powder charges loaded
+    material = "steel",          -- autocannon: cast_iron / bronze / steel
+    barrels = 6,                 -- autocannon: barrel count (cap applies)
+    muzzleVelocityOverride = 0,  -- autocannon: >0 forces b/s, 0 = compute
+    charges = 1,                 -- bigcannon only, powder charges loaded
     barrelBlocks = 2,
-    reloadSeconds = 5,    -- bigcannon only, pause between auto shots
+    reloadSeconds = 5,           -- bigcannon only, pause between auto shots
     arc = "shallow",
   },
   -- Center of the cannon mount (use the mount block's coords + 0.5).
@@ -125,8 +136,9 @@ local DEFAULTS = {
     },
   },
   -- Subtracted from the world-space yaw so 0 matches the cannon's rest
-  -- orientation. The original script's "facing south" cannon used 90.
-  yawOffset = 0,
+  -- orientation. Most builds land on 90 (the original "facing south"
+  -- cannon), so that's the default; editable in the CONFIG tab.
+  yawOffset = 90,
   -- Added to the computed pitch, in degrees: -1 aims 1 degree below the
   -- target, +1 above. Plain aim bias -- not a sign fix.
   pitchOffset = 0,
@@ -235,13 +247,41 @@ local DEFAULTS = {
   -- or the CAL button): a direct-drive CBC mount moves 0.75 deg/s per RPM,
   -- gearing changes it. Set it (or an invert flag) back to "auto" after
   -- re-gearing, or just press CAL.
-  yawDrive = { speedGain = 6, maxSpeed = 120, minSpeed = 1, degPerSecPerRpm = "auto" },
-  pitchDrive = { speedGain = 3, maxSpeed = 100, minSpeed = 1, degPerSecPerRpm = "auto" },
+  --
+  -- approach is the OVERSHOOT GUARD (the main fix for pre-lock oscillation).
+  -- The control loop runs at a finite period (peripheral-limited, often
+  -- ~0.2-0.25s); a pure-P command builds up enough slew speed that the barrel
+  -- flies PAST the target before the next correction and rings down. This
+  -- caps the correction speed to what the mount can stop within one loop
+  -- period: |rpm| <= approach * |err| / (loopT * degPerSecPerRpm). 0.5 holds
+  -- the approach to half the "just reaches it" speed -- no overshoot even at a
+  -- slow loop, verified against in-game traces. A faster loop relaxes the cap
+  -- automatically (full speed). Lower = gentler/no overshoot but slower;
+  -- raise toward 1+ for a snappier approach (risks overshoot at a slow loop);
+  -- a large value (e.g. 10) effectively disables the cap.
+  --
+  -- kd is the derivative-damping gain (the "D" of a PD loop), 0 = off. With
+  -- the approach cap doing the overshoot control it is usually unnecessary
+  -- (and a derivative is unreliable at a slow loop -- it lags the oscillation
+  -- and can pump it). Leave it 0 unless the cap alone leaves a residual hunt.
+  yawDrive = { speedGain = 6, maxSpeed = 120, minSpeed = 1, degPerSecPerRpm = "auto", approach = 0.5, kd = 0 },
+  pitchDrive = { speedGain = 3, maxSpeed = 100, minSpeed = 1, degPerSecPerRpm = "auto", approach = 0.5, kd = 0 },
   -- Names listed here are dimmed in the target list as a "friendly"
   -- reminder; they can still be clicked deliberately. Works for player
   -- names AND ship callsigns -- when the cannon's own ship runs CCMinimap,
   -- its transponder shows up in the roster too, so list its callsign here.
   whitelist = {},
+}
+
+-- Keys the calibration wiggle MEASURES (vs. hand-authored intent): these
+-- persist to cannon.cal, kept out of cannon.cfg so the hand-edited config
+-- stays clean and the measured file is safe to delete (CAL rebuilds it).
+-- Everything not listed here belongs to cannon.cfg.
+local CAL_PATHS = {
+  { "peripherals", "yaw" }, { "peripherals", "pitch" },
+  { "invertYaw" }, { "invertPitch" },
+  { "yawDrive", "degPerSecPerRpm" }, { "yawDrive", "minSpeed" },
+  { "pitchDrive", "degPerSecPerRpm" }, { "pitchDrive", "minSpeed" },
 }
 
 local function readFile(p)
@@ -258,54 +298,156 @@ local function writeFile(p, s)
   f.close()
 end
 
+local function readJSON(p)
+  local raw = readFile(p)
+  if not raw then return nil end
+  local ok, parsed = pcall(textutils.unserialiseJSON, raw)
+  if ok and type(parsed) == "table" then return parsed end
+  return nil
+end
+
+local function deepCopy(v)
+  if type(v) ~= "table" then return v end
+  local out = {}
+  for k, val in pairs(v) do out[k] = deepCopy(val) end
+  return out
+end
+
+-- Overwrite dst with src, recursing into matching sub-tables (src leaves win).
+local function deepOverlay(dst, src)
+  for k, v in pairs(src) do
+    if type(v) == "table" and type(dst[k]) == "table" then
+      deepOverlay(dst[k], v)
+    else
+      dst[k] = deepCopy(v)
+    end
+  end
+end
+
+local function getPath(t, path)
+  for _, k in ipairs(path) do
+    if type(t) ~= "table" then return nil end
+    t = t[k]
+  end
+  return t
+end
+
+local function setPath(t, path, v)
+  for i = 1, #path - 1 do
+    local k = path[i]
+    if type(t[k]) ~= "table" then t[k] = {} end
+    t = t[k]
+  end
+  t[path[#path]] = v
+end
+
+local function delPath(t, path)
+  for i = 1, #path - 1 do
+    local k = path[i]
+    if type(t[k]) ~= "table" then return end
+    t = t[k]
+  end
+  t[path[#path]] = nil
+end
+
+-- The cannon.cal projection of a config: only the measured paths, nested.
+local function calView(src)
+  local out = {}
+  for _, path in ipairs(CAL_PATHS) do
+    local v = getPath(src, path)
+    if v ~= nil then setPath(out, path, v) end
+  end
+  return out
+end
+
+-- The cannon.cfg projection: a deep copy with the measured paths removed.
+local function cfgView(src)
+  local out = deepCopy(src)
+  for _, path in ipairs(CAL_PATHS) do delPath(out, path) end
+  return out
+end
+
+local function writeCfg(c) writeFile(CONFIG, Cfg.jsonPretty(cfgView(c)) .. "\n") end
+local function writeCal(c) writeFile(CALFILE, Cfg.jsonPretty(calView(c)) .. "\n") end
+
 local function loadConfig()
-  local cfg = {}
-  local raw = readFile(CONFIG)
-  if raw then
-    local ok, parsed = pcall(textutils.unserialiseJSON, raw)
-    if ok and type(parsed) == "table" then cfg = parsed end
+  local cfgFile = readJSON(CONFIG) or {}
+  local calFile = readJSON(CALFILE)
+
+  -- Migration from the old single-file scheme: no cannon.cal yet but the
+  -- cfg file carries measured values -> lift them out so a tuned
+  -- degPerSecPerRpm / invert / resolved controller names aren't lost.
+  local migrated = false
+  if calFile == nil then
+    calFile = calView(cfgFile)
+    migrated = next(calFile) ~= nil
   end
-  local added = Cfg.deepMergeMissing(DEFAULTS, cfg)
-  -- Migration: muzzle velocity moved from lead.muzzleVelocity into the
-  -- cannon profile (it belongs to the gun, not the lead solve). Carry
-  -- a tuned value over once, then drop the old key.
+
+  -- Effective config: defaults, then hand-authored intent (cfg), then
+  -- measured values (cal) -- cal wins for its own keys so a fresh wiggle
+  -- always overrides a stale copy lingering in cannon.cfg.
+  local cfg = deepCopy(DEFAULTS)
+  deepOverlay(cfg, cfgFile)
+  deepOverlay(cfg, calFile)
+
+  -- Migration: muzzle speed is now COMPUTED from material+barrels. An old
+  -- hand-tuned profile.muzzleVelocity (or the even older lead.muzzleVelocity)
+  -- becomes muzzleVelocityOverride so the tuned value still fires until the
+  -- user switches over to material+barrels.
+  local legacyVel = nil
   if type(cfg.lead) == "table" and cfg.lead.muzzleVelocity ~= nil then
-    cfg.profile.muzzleVelocity = cfg.lead.muzzleVelocity
+    legacyVel = cfg.lead.muzzleVelocity
     cfg.lead.muzzleVelocity = nil
-    print("Moved lead.muzzleVelocity -> profile.muzzleVelocity ("
-      .. tostring(cfg.profile.muzzleVelocity) .. ")")
   end
-  writeFile(CONFIG, Cfg.jsonPretty(cfg) .. "\n")
-  if #added > 0 then
-    print("Added config keys: " .. table.concat(added, ", "))
+  if cfg.profile.muzzleVelocity ~= nil then
+    legacyVel = cfg.profile.muzzleVelocity
+    cfg.profile.muzzleVelocity = nil
   end
+  if legacyVel and (cfg.profile.muzzleVelocityOverride == nil
+      or cfg.profile.muzzleVelocityOverride == 0) then
+    cfg.profile.muzzleVelocityOverride = legacyVel
+    print(("Carried muzzleVelocity %s -> profile.muzzleVelocityOverride")
+      :format(tostring(legacyVel)))
+  end
+
+  writeCfg(cfg)
+  writeCal(cfg)
+  if migrated then print("Split calibration values into " .. CALFILE) end
   return cfg
 end
 
 local cfg = loadConfig()
 
--- Resolve the cannon profile against the ballistics tables, loudly --
--- a typo'd projectile name must not become a silent default.
-local proj = Ballistics.PROJECTILES[cfg.profile.projectile]
-if not proj then
-  local known = {}
-  for k in pairs(Ballistics.PROJECTILES) do known[#known + 1] = k end
-  table.sort(known)
-  error(("unknown profile.projectile %q in %s -- known: %s")
-    :format(tostring(cfg.profile.projectile), CONFIG,
-      table.concat(known, ", ")), 0)
+-- Cannon profile resolved against the ballistics tables: the projectile
+-- constants, the computed muzzle speed (b/s), and the muzzle launch offset.
+-- Recomputed by refreshProfile() so live CONFIG-tab edits to the gun take
+-- effect without a restart. Boot calls it loudly -- a typo'd projectile or
+-- bad barrel length must not become a silent default.
+local proj, muzzleSpeed, muzzleLen
+local function refreshProfile()
+  local p = Ballistics.PROJECTILES[cfg.profile.projectile]
+  if not p then
+    local known = {}
+    for k in pairs(Ballistics.PROJECTILES) do known[#known + 1] = k end
+    table.sort(known)
+    error(("unknown profile.projectile %q in %s -- known: %s")
+      :format(tostring(cfg.profile.projectile), CONFIG,
+        table.concat(known, ", ")), 0)
+  end
+  if cfg.profile.arc ~= "shallow" and cfg.profile.arc ~= "steep" then
+    error(('profile.arc must be "shallow" or "steep", got %q')
+      :format(tostring(cfg.profile.arc)), 0)
+  end
+  if type(cfg.profile.barrelBlocks) ~= "number"
+    or cfg.profile.barrelBlocks < 1 then
+    error("profile.barrelBlocks must be the mount->muzzle length in blocks (>= 1)", 0)
+  end
+  proj = p
+  muzzleSpeed = Ballistics.muzzleSpeed(cfg.profile) -- blocks/sec
+  -- CBC spawns the shell ~1.5 blocks short of one-past-the-tip.
+  muzzleLen = math.max(0, cfg.profile.barrelBlocks - 1.5)
 end
-local muzzleSpeed = Ballistics.muzzleSpeed(cfg.profile) -- blocks/sec
-if cfg.profile.arc ~= "shallow" and cfg.profile.arc ~= "steep" then
-  error(('profile.arc must be "shallow" or "steep", got %q')
-    :format(tostring(cfg.profile.arc)), 0)
-end
-if type(cfg.profile.barrelBlocks) ~= "number"
-  or cfg.profile.barrelBlocks < 1 then
-  error("profile.barrelBlocks must be the mount->muzzle length in blocks (>= 1)", 0)
-end
--- CBC spawns the shell ~1.5 blocks short of one-past-the-tip.
-local muzzleLen = math.max(0, cfg.profile.barrelBlocks - 1.5)
+refreshProfile()
 
 local function need(name, what)
   local p = peripheral.wrap(name)
@@ -335,8 +477,18 @@ local function resolve(name, ptype, what)
   return matches[1]
 end
 
-local yaw = need(cfg.peripherals.yaw, "yaw speed controller")
-local pitch = need(cfg.peripherals.pitch, "pitch speed controller")
+-- yaw/pitch are wrapped here when named explicitly; an "auto" name defers
+-- to the calibration wiggle, which nudges each speed controller and reads
+-- whether CannonYaw or CannonPitch moved to tell them apart (resolveDrives,
+-- in the calibration section). Until then these stay nil, so stopMotors
+-- and friends guard for it.
+local yaw, pitch
+if cfg.peripherals.yaw ~= "auto" then
+  yaw = need(cfg.peripherals.yaw, "yaw speed controller")
+end
+if cfg.peripherals.pitch ~= "auto" then
+  pitch = need(cfg.peripherals.pitch, "pitch speed controller")
+end
 local blockReader = resolve(cfg.peripherals.blockReader, "block_reader",
   "block reader on cannon mount")
 local entDet = resolve(cfg.peripherals.playerDetector, "player_detector",
@@ -397,6 +549,7 @@ end
 -- program after relocating). Fails loudly rather than aiming from a
 -- guessed position.
 local staticCannon = nil
+local gpsFix = nil -- cached computer GPS fix (static gps mode), reused on live edits
 if not cfg.ship.enabled then
   if cfg.cannon.gps then
     if not transponderModem then
@@ -407,13 +560,14 @@ if not cfg.ship.enabled then
       error("cannon.gps = true but no GPS fix -- is a GPS constellation "
         .. "in range? (or set cannon.gps = false and fill cannon x/y/z)", 0)
     end
+    gpsFix = { x = x, y = y, z = z }
     local o = cfg.cannon.offset
     staticCannon = { x = x + o.x, y = y + o.y, z = z + o.z }
     print(("GPS fix %.1f %.1f %.1f + offset -> cannon %.1f %.1f %.1f")
       :format(x, y, z, staticCannon.x, staticCannon.y, staticCannon.z))
     sleep(1.5) -- long enough to read before the UI clears the terminal
   else
-    staticCannon = cfg.cannon
+    staticCannon = { x = cfg.cannon.x, y = cfg.cannon.y, z = cfg.cannon.z }
   end
 end
 
@@ -531,20 +685,46 @@ local state = {
   impact = nil,      -- static-mode diagnostic: predicted impact from the
                      -- ACTUAL barrel angle {x,y,z, off, vmiss, tof}
   flash = nil,       -- transient status message (e.g. "FIRED")
-  recalRequest = false, -- UI asked for a recalibration; serviced in trackLoop
-  calibrating = false,  -- recalibration wiggle in progress (status line)
+  recalRequest = false, -- UI asked for a calibrate+auto-tune; serviced in trackLoop
+  calibrating = false,  -- calibrate + auto-tune in progress (status line)
 }
 
 local ui = {
   tabs = {
     { id = "targets", label = " TARGETS " },
     { id = "debug", label = " DEBUG " },
+    { id = "config", label = " CONFIG " },
   },
   activeTab = "targets",
   cells = {},  -- clickable regions: {col1, col2, row, cmd, name?}
   scroll = 0,
-  prompt = nil,  -- active modal line editor: { text, err } (XYZ entry)
+  prompt = nil,  -- active modal line editor: { kind, text, err } (XYZ/cfg)
+  cfgSel = 1,    -- selected CONFIG row (index into the visible item list)
+  cfgBaseline = nil, -- captured values on tab entry, for dirty/CANCEL
 }
+
+-- (Re)derive the static-mode mount position from the live cannon config so the
+-- CONFIG tab can toggle gps / edit the offset or manual xyz without a reboot.
+-- Manual mode = the typed xyz; gps mode = the cached computer fix plus the
+-- world-axis offset (re-locates once if gps was off at boot). Quiet: flashes on
+-- a missing fix and keeps the last good position (the loud check is at boot).
+local function refreshStaticCannon()
+  if cfg.ship.enabled then return end
+  if cfg.cannon.gps then
+    if not gpsFix and transponderModem then
+      local x, y, z = gps.locate(2)
+      if x then gpsFix = { x = x, y = y, z = z } end
+    end
+    if gpsFix then
+      local o = cfg.cannon.offset
+      staticCannon = { x = gpsFix.x + o.x, y = gpsFix.y + o.y, z = gpsFix.z + o.z }
+    else
+      state.flash = transponderModem and "NO GPS FIX" or "NO MODEM"
+    end
+  else
+    staticCannon = { x = cfg.cannon.x, y = cfg.cannon.y, z = cfg.cannon.z }
+  end
+end
 
 -- ---------------------------------------------------------------- aiming --
 
@@ -570,18 +750,27 @@ local function axisSettled(err, drive)
   return cfg.lockWhenStalled and err <= settleBand(drive)
 end
 
--- Per-axis drive command: proportional on error plus feedforward of the
--- setpoint's own angular rate (converted to RPM through the calibrated
--- degPerSecPerRpm). The speed controller can't turn slower than minSpeed,
--- so a sub-minSpeed command does nothing but stall the mount -- the drive
--- therefore commands >= minSpeed or parks at 0, never in between. The
--- park point is settleBand (minSpeed/speedGain) degrees; that's the
--- closest a static target can be driven, and lockWhenStalled fires there.
-local function speedFor(diff, invert, drive, ffRate)
-  local ff = 0
+-- Per-axis drive command: proportional on error, feedforward of the
+-- setpoint's own angular rate, and a derivative term that damps overshoot --
+-- a PD + feedforward loop. ffRate (setpoint deg/s) and dRate (aim-error
+-- deg/s) are both converted to RPM through the calibrated degPerSecPerRpm.
+-- The D term is kd * d(err)/dt: when the error is closing fast the barrel
+-- eases off so it settles instead of overshooting; acting on the ERROR (not
+-- the mount velocity) means it stays out of the feedforward's way on a
+-- moving target (steady tracking -> ~0 error rate). kd = 0 is pure P+ff.
+-- The speed controller can't turn slower than minSpeed, so a sub-minSpeed
+-- command does nothing but stall the mount -- the drive therefore commands
+-- >= minSpeed or parks at 0, never in between. The park point is settleBand
+-- (minSpeed/speedGain) degrees; lockWhenStalled fires there.
+local function speedFor(diff, invert, drive, ffRate, dRate, loopT)
+  local ff, d = 0, 0
   local degPerSec = drive.degPerSecPerRpm
-  if ffRate and type(degPerSec) == "number" and degPerSec > 0 then
-    ff = ffRate / degPerSec
+  local haveRate = type(degPerSec) == "number" and degPerSec > 0
+  if haveRate then
+    if ffRate then ff = ffRate / degPerSec end
+    if dRate and drive.kd and drive.kd ~= 0 then
+      d = drive.kd * dRate / degPerSec
+    end
   end
   -- Drive only when the P term can clear the floor, or the setpoint is
   -- itself moving (ff) -- a mover kept live so it doesn't trail, an error
@@ -589,14 +778,25 @@ local function speedFor(diff, invert, drive, ffRate)
   -- no latencySeconds value can compensate. Otherwise park at 0: we're
   -- inside settleBand, closer than the controller can usefully turn, so
   -- driving would only stall or hunt (and detector-noise ff can't twitch
-  -- a parked barrel).
+  -- a parked barrel). The D term only shapes an already-active command --
+  -- it never opens this gate, so it can't drive a parked barrel backwards.
   local p = math.abs(diff) * drive.speedGain
+  -- Overshoot guard: never ask for more correction speed than the mount can
+  -- stop within one control-loop period. At a finite loop period a pure-P
+  -- command builds up enough slew speed to fly past the target before the
+  -- next correction (the in-game overshoot/ring-down); capping the P term to
+  -- approach*|err|/(loopT*dps) holds the approach to a stoppable speed and
+  -- kills the overshoot at any gain. Feedforward is added AFTER, uncapped --
+  -- tracking a moving setpoint is a legitimate high speed, not overshoot.
+  if haveRate and drive.approach and drive.approach > 0 and loopT and loopT > 0 then
+    p = math.min(p, drive.approach * math.abs(diff) / (loopT * degPerSec))
+  end
   local rpm = 0
   if p >= drive.minSpeed or math.abs(ff) > 0.5 then
     rpm = math.min(p, drive.maxSpeed)
     if diff < 0 then rpm = -rpm end
-    rpm = rpm + ff
-    -- Don't emit a magnitude the controller floors to zero (P and ff can
+    rpm = rpm + ff + d
+    -- Don't emit a magnitude the controller floors to zero (the terms can
     -- partly cancel); round up to minSpeed in its direction so the
     -- intended move actually happens.
     if math.abs(rpm) < drive.minSpeed then
@@ -711,7 +911,9 @@ local track = {
   hist = {},                  -- { {x,y,z,t}, ... } newest last
   vx = 0, vy = 0, vz = 0,
   aimT = nil,                 -- last aim setpoint sample, for feedforward
-  yawRate = 0, pitchRate = 0, -- setpoint angular rates, deg/s
+  yawRate = 0, pitchRate = 0, -- setpoint angular rates, deg/s (feedforward)
+  yawErrRate = 0, pitchErrRate = 0, -- aim-error rates, deg/s (D term)
+  loopT = 0.2, driveT = nil, -- measured control-loop period (overshoot guard)
 }
 local LEAD_MIN_SPAN = 0.1  -- seconds of history before velocity is trusted
 
@@ -720,6 +922,9 @@ local function resetLead()
   track.vx, track.vy, track.vz = 0, 0, 0
   track.aimT = nil
   track.yawRate, track.pitchRate = 0, 0
+  track.yawErrRate, track.pitchErrRate = 0, 0
+  track.yawErrPrev, track.pitchErrPrev = nil, nil
+  track.driveT = nil -- keep loopT (a build property, not target-specific)
 end
 
 local function updateLead(pos)
@@ -744,11 +949,12 @@ local function updateLead(pos)
   end
 end
 
--- Setpoint angular rates for the drive feedforward, finite-differenced
--- between ticks and lightly smoothed. Measured on the FINAL clamped aim
--- angles, so it automatically covers target motion, lead changes, and
--- the own ship turning -- and goes to zero while parked at an arc limit.
-local function updateAimRates(aimYaw, aimPitch)
+-- Drive-loop rates, finite-differenced between ticks and lightly smoothed:
+-- the SETPOINT angular rates (clamped aim angles -> feedforward, covering
+-- target motion / lead / the own ship turning, zero while parked at a
+-- limit), and the AIM-ERROR rates (-> the D term, which damps overshoot).
+-- Error-derivative is primed on the first sample (no kick from a nil prev).
+local function updateRates(aimYaw, aimPitch, yawErr, pitchErr)
   local t = os.clock()
   if track.aimT then
     local dt = t - track.aimT
@@ -758,12 +964,66 @@ local function updateAimRates(aimYaw, aimPitch)
         + a * ((aimYaw - track.aimYaw) / dt - track.yawRate)
       track.pitchRate = track.pitchRate
         + a * ((aimPitch - track.aimPitch) / dt - track.pitchRate)
+      if track.yawErrPrev then
+        track.yawErrRate = track.yawErrRate
+          + a * ((yawErr - track.yawErrPrev) / dt - track.yawErrRate)
+        track.pitchErrRate = track.pitchErrRate
+          + a * ((pitchErr - track.pitchErrPrev) / dt - track.pitchErrRate)
+      end
     elseif dt >= 0.5 then
       track.yawRate, track.pitchRate = 0, 0 -- stale: reprime
+      track.yawErrRate, track.pitchErrRate = 0, 0
     end
   end
   track.aimYaw, track.aimPitch, track.aimT = aimYaw, aimPitch, t
+  track.yawErrPrev, track.pitchErrPrev = yawErr, pitchErr
 end
+
+-- ----------------------------------------------------------- diagnostics --
+
+-- Diagnostic trace: while on, the track loop appends the per-tick drive
+-- signals to cannon.trace.csv, so a recorded lock / oscillation can be read
+-- back offline -- the real sensor noise, loop latency, and oscillation period
+-- the idealized tuning model can't see. Toggle with L (or the CLI); it
+-- auto-stops after TRACE_MAX seconds so a forgotten trace can't grow forever.
+local TRACE_MAX = 40
+local TRACE_FILE = "cannon.trace.csv"
+-- Buffered in memory and written once on stop, so recording adds NO per-tick
+-- file I/O -- an earlier per-row flush() was itself slowing the loop and
+-- contaminating the very timing it was meant to measure. The `dt` column is
+-- the real loop period (the thing the overshoot guard adapts to).
+local trace = { on = false, rows = nil, t0 = 0, lastT = nil }
+local function traceStart()
+  if trace.on then return end
+  trace.rows = { "t,dt,target,aimYaw,mountYaw,yawErr,yawErrRate,yawRpm,"
+    .. "aimPitch,mountPitch,pitchErr,pitchErrRate,pitchRpm" }
+  trace.t0 = os.clock()
+  trace.lastT = nil
+  trace.on = true
+  state.flash = "TRACE REC"
+end
+local function traceStop()
+  if trace.rows then
+    local f = fs.open(TRACE_FILE, "w")
+    if f then f.write(table.concat(trace.rows, "\n") .. "\n"); f.close() end
+    trace.rows = nil
+    state.flash = "TRACE SAVED"
+  end
+  trace.on = false
+end
+local function traceRow(aimYaw, mountYaw, yawRpm, aimPitch, mountPitch, pitchRpm)
+  if not (trace.on and trace.rows) then return end
+  local t = os.clock() - trace.t0
+  if t > TRACE_MAX then traceStop(); return end
+  local dt = trace.lastT and (t - trace.lastT) or 0
+  trace.lastT = t
+  trace.rows[#trace.rows + 1] =
+    ("%.3f,%.3f,%s,%.3f,%.3f,%.3f,%.3f,%.2f,%.3f,%.3f,%.3f,%.3f,%.2f")
+      :format(t, dt, tostring(state.targetName), aimYaw, mountYaw, state.yawErr,
+        track.yawErrRate, yawRpm, aimPitch, mountPitch, state.pitchErr,
+        track.pitchErrRate, pitchRpm)
+end
+
 
 -- Intercept point: where the target will be after the shell's flight time
 -- (plus fixed latency), with one refinement pass so the flight time is
@@ -867,8 +1127,9 @@ local function burstGate(rawGate, withinWide)
 end
 
 local function stopMotors()
-  yaw.setTargetSpeed(0)
-  pitch.setTargetSpeed(0)
+  -- nil before the auto-detect wiggle resolves which controller is which.
+  if yaw then yaw.setTargetSpeed(0) end
+  if pitch then pitch.setTargetSpeed(0) end
 end
 
 local function stopAll()
@@ -991,11 +1252,124 @@ local function calibrateAxis(label, controller, nbtKey, wraps)
     :format(label), 0)
 end
 
--- Run once per axis while its invert flag or drive rate is "auto", then
--- persist the measured values so later boots skip the wiggle. An explicit
--- (non-auto) invert flag is kept even when the rate triggers the nudge.
+-- Every attached rotational speed controller, by peripheral name. Create
+-- exposes them with "RotationSpeedController" in the type/name; the two on a
+-- cannon share a type, which is why they're told apart by motion below.
+local function findSpeedControllers()
+  local out = {}
+  for _, name in ipairs(peripheral.getNames()) do
+    local t = peripheral.getType(name)
+    if (t and tostring(t):find("RotationSpeedController"))
+      or name:find("RotationSpeedController") then
+      out[#out + 1] = name
+    end
+  end
+  return out
+end
+
+-- Nudge one controller and report which mount axis moved ("CannonYaw" /
+-- "CannonPitch"), or nil if neither did. Tries the other direction when the
+-- first nudge is blocked by a travel clamp.
+local function whichAxisMoves(controller)
+  local NUDGE_RPM, NUDGE_SECONDS = 8, 0.6
+  for _, rpm in ipairs({ NUDGE_RPM, -NUDGE_RPM }) do
+    local before = blockReader.getBlockData()
+    local by, bp = before and before.CannonYaw, before and before.CannonPitch
+    if not by or not bp then
+      error("auto-detect failed: block reader has no CannonYaw/CannonPitch -- "
+        .. "is it against the cannon mount?", 0)
+    end
+    controller.setTargetSpeed(rpm)
+    sleep(NUDGE_SECONDS)
+    controller.setTargetSpeed(0)
+    sleep(0.2)
+    local after = blockReader.getBlockData()
+    local dyaw = math.abs(angleDiff(after.CannonYaw, by))
+    local dpitch = math.abs(after.CannonPitch - bp)
+    if dyaw >= 0.5 or dpitch >= 0.5 then
+      return dyaw >= dpitch and "CannonYaw" or "CannonPitch"
+    end
+  end
+  return nil
+end
+
+-- Tell the yaw and pitch controllers apart by motion when either name is
+-- "auto": nudge each candidate and see which mount axis it drives, then set
+-- the yaw/pitch wraps and the resolved names (saved to the cal file by the
+-- caller). Returns true if it ran. Loud-fails on an ambiguous rig rather
+-- than guessing which is which.
+local function resolveDrives()
+  if cfg.peripherals.yaw ~= "auto" and cfg.peripherals.pitch ~= "auto" then
+    return false
+  end
+  local cands = findSpeedControllers()
+  if #cands ~= 2 then
+    error(("auto-detect needs exactly 2 rotation speed controllers, found %d%s "
+      .. "-- set peripherals.yaw/pitch explicitly in %s"):format(#cands,
+        #cands > 0 and " (" .. table.concat(cands, ", ") .. ")" or "", CONFIG), 0)
+  end
+  local byAxis = {}
+  for _, name in ipairs(cands) do
+    local axis = whichAxisMoves(peripheral.wrap(name))
+    if axis then
+      if byAxis[axis] then
+        error(("auto-detect: %s and %s both drove %s -- name peripherals.yaw/"
+          .. "pitch explicitly in %s"):format(byAxis[axis], name, axis, CONFIG), 0)
+      end
+      byAxis[axis] = name
+    end
+  end
+  if not byAxis.CannonYaw or not byAxis.CannonPitch then
+    error("auto-detect: a controller didn't move the mount (or only one axis "
+      .. "responded) -- check gearing, or name peripherals.yaw/pitch in "
+      .. CONFIG, 0)
+  end
+  cfg.peripherals.yaw, cfg.peripherals.pitch = byAxis.CannonYaw, byAxis.CannonPitch
+  yaw, pitch = peripheral.wrap(byAxis.CannonYaw), peripheral.wrap(byAxis.CannonPitch)
+  print(("detected drives: yaw=%s pitch=%s")
+    :format(byAxis.CannonYaw, byAxis.CannonPitch))
+  return true
+end
+
+-- Find the lowest commanded RPM that actually turns the mount -- the speed
+-- controller's floor, below which a command just stalls. Probes small
+-- magnitudes (the mount barely drifts) and steps each non-mover back so
+-- successive probes don't walk it into a limit. Returns the floor in RPM,
+-- or nil if even the top probe didn't move (caller falls back to 1).
+local function probeMinSpeed(label, controller, nbtKey, wraps)
+  local PROBE_SECONDS = 0.5
+  for _, rpm in ipairs({ 0.5, 1, 1.5, 2, 3 }) do
+    local before = blockReader.getBlockData()[nbtKey]
+    controller.setTargetSpeed(rpm)
+    sleep(PROBE_SECONDS)
+    controller.setTargetSpeed(0)
+    sleep(0.2)
+    local after = blockReader.getBlockData()[nbtKey]
+    local delta = wraps and angleDiff(after, before) or (after - before)
+    if math.abs(delta) >= 0.3 then
+      print(("calibrated %s minSpeed: %.1f RPM moved %.1f deg")
+        :format(label, rpm, delta))
+      return rpm
+    end
+    controller.setTargetSpeed(-rpm)   -- step back toward the start
+    sleep(PROBE_SECONDS)
+    controller.setTargetSpeed(0)
+    sleep(0.2)
+  end
+  return nil
+end
+
+-- Resolve which controller is which (if "auto"), then for each axis whose
+-- invert flag or drive rate is "auto", wiggle to measure sign + slew rate
+-- and probe the minSpeed floor. Persists everything measured to cannon.cal
+-- (not cannon.cfg). An explicit (non-auto) invert flag is kept even when
+-- the rate triggers the nudge.
 local function calibrate()
-  local changed = false
+  local changed = resolveDrives()
+  -- Names from cal are wrapped at load; this only fires on an edge case.
+  if not yaw then yaw = need(cfg.peripherals.yaw, "yaw speed controller") end
+  if not pitch then pitch = need(cfg.peripherals.pitch, "pitch speed controller") end
+
   local function axis(invertKey, drive, label, controller, nbtKey, wraps)
     if cfg[invertKey] ~= "auto" and drive.degPerSecPerRpm ~= "auto" then
       return
@@ -1003,25 +1377,108 @@ local function calibrate()
     local invert, rate = calibrateAxis(label, controller, nbtKey, wraps)
     if cfg[invertKey] == "auto" then cfg[invertKey] = invert end
     drive.degPerSecPerRpm = rate
+    drive.minSpeed = probeMinSpeed(label, controller, nbtKey, wraps) or 1
     changed = true
   end
   axis("invertYaw", cfg.yawDrive, "yaw", yaw, "CannonYaw", true)
   axis("invertPitch", cfg.pitchDrive, "pitch", pitch, "CannonPitch", false)
   if changed then
-    writeFile(CONFIG, Cfg.jsonPretty(cfg) .. "\n")
-    print("Calibration saved to " .. CONFIG)
+    writeCal(cfg)
+    print("Calibration saved to " .. CALFILE)
     sleep(1)
   end
 end
 
--- Force a fresh wiggle on both axes from the UI (CAL button / K key):
--- reset sign + slew rate to "auto" so calibrate() re-measures and saves
--- them. Use after re-gearing or re-mounting. Runs from the track loop,
--- which owns the motors, so it never fights the aim commands.
+-- ------------------------------------------------------------- auto-tune --
+
+-- Measure the real control-loop period WITHOUT needing a target: run the track
+-- loop's per-tick peripheral work (block read + both drive writes + the paced
+-- sleep) a few times and take the median os.clock delta. draw() is pure
+-- terminal output (no game-tick yield), so leaving it out doesn't change the
+-- period. Feeds the live overshoot guard and the auto-tune.
+local function measureLoopPeriod()
+  local periods = {}
+  for i = 1, 16 do
+    local t0 = os.clock()
+    blockReader.getBlockData()
+    if yaw then yaw.setTargetSpeed(0) end
+    if pitch then pitch.setTargetSpeed(0) end
+    sleep(math.max(0.05, cfg.trackSeconds - (os.clock() - t0)))
+    if i > 4 then periods[#periods + 1] = os.clock() - t0 end
+  end
+  table.sort(periods)
+  return periods[math.floor(#periods / 2) + 1] or cfg.trackSeconds
+end
+
+local TUNE_LOG = "cannon.tune.log"
+local function tuneLog(msg)
+  local f = fs.open(TUNE_LOG, "a")
+  if f then f.writeLine(msg); f.close() end
+end
+
+-- Abstract axis interface autotune.lua drives: read the mount angle, command
+-- the controller, carry the calibrated constants + the measured loop period.
+local function tuneAxisIO(controller, nbtKey, drive, lim)
+  return {
+    dps = drive.degPerSecPerRpm, minSpeed = drive.minSpeed,
+    maxSpeed = drive.maxSpeed, loopT = track.loopT,
+    lo = lim.min, hi = lim.max, log = tuneLog,
+    readAngle = function()
+      local d = blockReader.getBlockData()
+      return d and d[nbtKey]
+    end,
+    setRpm = function(rpm) controller.setTargetSpeed(rpm) end,
+    wait = function(s) sleep(s) end,
+    now = function() return os.clock() end,
+  }
+end
+
+-- Auto-tune the per-axis approach cap by measured step responses: the largest
+-- no-overshoot value, found by driving real steps through the live control law
+-- on INTERNAL angle targets (no world target needed). Writes the tuned approach
+-- + speedGain to cannon.cfg, logs every probe to cannon.tune.log.
+local function runAutotune()
+  local f = fs.open(TUNE_LOG, "w")
+  if f then f.writeLine("CCBigCannon drive auto-tune"); f.close() end
+  tuneLog(("loop period: %.0f ms"):format(track.loopT * 1000))
+  local function ctrl(inv)
+    return function(err, drive, loopT)
+      return speedFor(err, inv, drive, nil, nil, loopT) -- D off; the cap damps
+    end
+  end
+  tuneLog("--- yaw ---")
+  local ry = Autotune.tuneAxis(
+    tuneAxisIO(yaw, "CannonYaw", cfg.yawDrive, cfg.limits.yaw), ctrl(cfg.invertYaw))
+  stopMotors()
+  tuneLog("--- pitch ---")
+  local rp = Autotune.tuneAxis(
+    tuneAxisIO(pitch, "CannonPitch", cfg.pitchDrive, cfg.limits.pitch),
+    ctrl(cfg.invertPitch))
+  stopMotors()
+  local function r2(v) return math.floor(v * 100 + 0.5) / 100 end
+  local function r1(v) return math.floor(v * 10 + 0.5) / 10 end
+  cfg.yawDrive.approach, cfg.yawDrive.speedGain = r2(ry.approach), r1(ry.speedGain)
+  cfg.pitchDrive.approach, cfg.pitchDrive.speedGain = r2(rp.approach), r1(rp.speedGain)
+  cfg.yawDrive.kd, cfg.pitchDrive.kd = 0, 0 -- the cap supersedes the D term
+  writeCfg(cfg)
+  tuneLog(("RESULT  yaw: approach %.2f gain %.1f | pitch: approach %.2f gain %.1f")
+    :format(cfg.yawDrive.approach, cfg.yawDrive.speedGain,
+      cfg.pitchDrive.approach, cfg.pitchDrive.speedGain))
+end
+
+-- The CAL button / K key: full automatic drive setup in ONE action. Re-detects
+-- which controller is which (if "auto"), re-measures sign + slew rate + the
+-- minSpeed floor (the wiggle), measures the real loop period, then auto-tunes
+-- the per-axis approach cap by driving step responses on internal targets --
+-- no world target needed. Takes ~1-2 min (the barrel steps on its own). Runs
+-- from the track loop, which owns the motors. Boot only does the quick wiggle
+-- (calibrate()); the tune lives here so it doesn't lengthen every boot.
 local function recalibrate()
   cfg.invertYaw, cfg.yawDrive.degPerSecPerRpm = "auto", "auto"
   cfg.invertPitch, cfg.pitchDrive.degPerSecPerRpm = "auto", "auto"
   calibrate()
+  track.loopT = measureLoopPeriod()
+  runAutotune()
 end
 
 -- -------------------------------------------------------------- targeting --
@@ -1143,7 +1600,366 @@ local function setCoordTarget(c)
   setTarget("coord", ("%g, %g, %g"):format(c.x, c.y, c.z))
 end
 
+-- ------------------------------------------------------------- config tab --
+
+-- Sorted projectile names for the enum cycler.
+local PROJECTILE_NAMES = {}
+for k in pairs(Ballistics.PROJECTILES) do
+  PROJECTILE_NAMES[#PROJECTILE_NAMES + 1] = k
+end
+table.sort(PROJECTILE_NAMES)
+
+-- Live-editable settings, CCMinimap-style. etype: "num" (+/- step, clamped
+-- to min/max, also text-editable), "enum" (cycle a fixed value list), "text"
+-- (modal entry, parsed to a number when numeric). file: which file SAVE
+-- writes it to (cfg = intent, cal = measured). profile=true rebuilds the
+-- cached gun (muzzle speed etc.) on change. show gates visibility on kind.
+local CONFIG_ITEMS = {
+  { group = "Build", label = "kind", etype = "enum", file = "cfg", profile = true,
+    values = { "autocannon", "bigcannon" },
+    get = function() return cfg.profile.kind end,
+    set = function(v) cfg.profile.kind = v end },
+  { group = "Build", label = "projectile", etype = "enum", file = "cfg", profile = true,
+    values = PROJECTILE_NAMES,
+    get = function() return cfg.profile.projectile end,
+    set = function(v) cfg.profile.projectile = v end },
+  { group = "Build", label = "material", etype = "enum", file = "cfg", profile = true,
+    values = { "cast_iron", "bronze", "steel" },
+    show = function() return cfg.profile.kind == "autocannon" end,
+    get = function() return cfg.profile.material end,
+    set = function(v) cfg.profile.material = v end },
+  { group = "Build", label = "barrels", etype = "num", file = "cfg", profile = true,
+    min = 0, max = 16, step = 1,
+    show = function() return cfg.profile.kind == "autocannon" end,
+    get = function() return cfg.profile.barrels end,
+    set = function(v) cfg.profile.barrels = v end },
+  { group = "Build", label = "speedOverride", etype = "num", file = "cfg", profile = true,
+    min = 0, max = 400, step = 10,
+    show = function() return cfg.profile.kind == "autocannon" end,
+    get = function() return cfg.profile.muzzleVelocityOverride end,
+    set = function(v) cfg.profile.muzzleVelocityOverride = v end },
+  { group = "Build", label = "charges", etype = "num", file = "cfg", profile = true,
+    min = 1, max = 10, step = 1,
+    show = function() return cfg.profile.kind == "bigcannon" end,
+    get = function() return cfg.profile.charges end,
+    set = function(v) cfg.profile.charges = v end },
+  { group = "Build", label = "barrelBlocks", etype = "num", file = "cfg", profile = true,
+    min = 1, max = 24, step = 1,
+    get = function() return cfg.profile.barrelBlocks end,
+    set = function(v) cfg.profile.barrelBlocks = v end },
+  { group = "Build", label = "arc", etype = "enum", file = "cfg", profile = true,
+    values = { "shallow", "steep" },
+    get = function() return cfg.profile.arc end,
+    set = function(v) cfg.profile.arc = v end },
+  { group = "Build", label = "reloadSecs", etype = "num", file = "cfg",
+    min = 0, max = 30, step = 0.5,
+    show = function() return cfg.profile.kind == "bigcannon" end,
+    get = function() return cfg.profile.reloadSeconds end,
+    set = function(v) cfg.profile.reloadSeconds = v end },
+  { group = "Aim", label = "yawOffset", etype = "num", file = "cfg",
+    min = -180, max = 180, step = 5,
+    get = function() return cfg.yawOffset end,
+    set = function(v) cfg.yawOffset = v end },
+  { group = "Aim", label = "pitchOffset", etype = "num", file = "cfg",
+    min = -45, max = 45, step = 1,
+    get = function() return cfg.pitchOffset end,
+    set = function(v) cfg.pitchOffset = v end },
+  { group = "Aim", label = "tolerance", etype = "num", file = "cfg",
+    min = 0.1, max = 10, step = 0.1,
+    get = function() return cfg.tolerance end,
+    set = function(v) cfg.tolerance = v end },
+  { group = "Aim", label = "maxDistance", etype = "num", file = "cfg",
+    min = 10, max = 2000, step = 10,
+    get = function() return cfg.maxDistance end,
+    set = function(v) cfg.maxDistance = v end },
+  { group = "Aim", label = "lockStalled", etype = "enum", file = "cfg",
+    values = { true, false },
+    get = function() return cfg.lockWhenStalled end,
+    set = function(v) cfg.lockWhenStalled = v end },
+  -- Position (land/static mode only). gps toggles between manual xyz and a
+  -- GPS-fix-plus-offset derivation; static = true re-derives the mount
+  -- position live (refreshStaticCannon) so no reboot is needed. Offsets are
+  -- typed floats (world axes: +x east, +y up, +z south).
+  { group = "Position", label = "gps", etype = "enum", file = "cfg", static = true,
+    values = { false, true },
+    show = function() return not cfg.ship.enabled end,
+    get = function() return cfg.cannon.gps end,
+    set = function(v) cfg.cannon.gps = v end },
+  { group = "Position", label = "mount x", etype = "float", file = "cfg", static = true,
+    show = function() return not cfg.ship.enabled and not cfg.cannon.gps end,
+    get = function() return cfg.cannon.x end,
+    set = function(v) cfg.cannon.x = v end },
+  { group = "Position", label = "mount y", etype = "float", file = "cfg", static = true,
+    show = function() return not cfg.ship.enabled and not cfg.cannon.gps end,
+    get = function() return cfg.cannon.y end,
+    set = function(v) cfg.cannon.y = v end },
+  { group = "Position", label = "mount z", etype = "float", file = "cfg", static = true,
+    show = function() return not cfg.ship.enabled and not cfg.cannon.gps end,
+    get = function() return cfg.cannon.z end,
+    set = function(v) cfg.cannon.z = v end },
+  { group = "Position", label = "offset x", etype = "float", file = "cfg", static = true,
+    show = function() return not cfg.ship.enabled and cfg.cannon.gps end,
+    get = function() return cfg.cannon.offset.x end,
+    set = function(v) cfg.cannon.offset.x = v end },
+  { group = "Position", label = "offset y", etype = "float", file = "cfg", static = true,
+    show = function() return not cfg.ship.enabled and cfg.cannon.gps end,
+    get = function() return cfg.cannon.offset.y end,
+    set = function(v) cfg.cannon.offset.y = v end },
+  { group = "Position", label = "offset z", etype = "float", file = "cfg", static = true,
+    show = function() return not cfg.ship.enabled and cfg.cannon.gps end,
+    get = function() return cfg.cannon.offset.z end,
+    set = function(v) cfg.cannon.offset.z = v end },
+  -- Arc travel limits (mount-frame degrees; read live by the solver and the
+  -- slew clamps, so edits take effect immediately). Typed floats.
+  { group = "Arc limits", label = "yaw min", etype = "float", file = "cfg",
+    get = function() return cfg.limits.yaw.min end,
+    set = function(v) cfg.limits.yaw.min = v end },
+  { group = "Arc limits", label = "yaw max", etype = "float", file = "cfg",
+    get = function() return cfg.limits.yaw.max end,
+    set = function(v) cfg.limits.yaw.max = v end },
+  { group = "Arc limits", label = "pitch min", etype = "float", file = "cfg",
+    get = function() return cfg.limits.pitch.min end,
+    set = function(v) cfg.limits.pitch.min = v end },
+  { group = "Arc limits", label = "pitch max", etype = "float", file = "cfg",
+    get = function() return cfg.limits.pitch.max end,
+    set = function(v) cfg.limits.pitch.max = v end },
+  { group = "Drive", label = "yaw gain", etype = "num", file = "cfg",
+    min = 0.5, max = 40, step = 0.5,
+    get = function() return cfg.yawDrive.speedGain end,
+    set = function(v) cfg.yawDrive.speedGain = v end },
+  { group = "Drive", label = "pitch gain", etype = "num", file = "cfg",
+    min = 0.5, max = 40, step = 0.5,
+    get = function() return cfg.pitchDrive.speedGain end,
+    set = function(v) cfg.pitchDrive.speedGain = v end },
+  { group = "Drive", label = "yaw approach", etype = "num", file = "cfg",
+    min = 0.1, max = 10, step = 0.05,
+    get = function() return cfg.yawDrive.approach end,
+    set = function(v) cfg.yawDrive.approach = v end },
+  { group = "Drive", label = "pitch approach", etype = "num", file = "cfg",
+    min = 0.1, max = 10, step = 0.05,
+    get = function() return cfg.pitchDrive.approach end,
+    set = function(v) cfg.pitchDrive.approach = v end },
+  { group = "Drive", label = "yaw kd", etype = "num", file = "cfg",
+    min = 0, max = 5, step = 0.05,
+    get = function() return cfg.yawDrive.kd end,
+    set = function(v) cfg.yawDrive.kd = v end },
+  { group = "Drive", label = "pitch kd", etype = "num", file = "cfg",
+    min = 0, max = 5, step = 0.05,
+    get = function() return cfg.pitchDrive.kd end,
+    set = function(v) cfg.pitchDrive.kd = v end },
+  { group = "Drive", label = "yaw maxRPM", etype = "num", file = "cfg",
+    min = 5, max = 256, step = 5,
+    get = function() return cfg.yawDrive.maxSpeed end,
+    set = function(v) cfg.yawDrive.maxSpeed = v end },
+  { group = "Drive", label = "pitch maxRPM", etype = "num", file = "cfg",
+    min = 5, max = 256, step = 5,
+    get = function() return cfg.pitchDrive.maxSpeed end,
+    set = function(v) cfg.pitchDrive.maxSpeed = v end },
+  -- cannon.cal: measured by CAL; editable here for a manual override.
+  { group = "Calibrated", label = "yaw periph", etype = "text", file = "cal",
+    get = function() return cfg.peripherals.yaw end,
+    set = function(v) cfg.peripherals.yaw = v end },
+  { group = "Calibrated", label = "pitch periph", etype = "text", file = "cal",
+    get = function() return cfg.peripherals.pitch end,
+    set = function(v) cfg.peripherals.pitch = v end },
+  { group = "Calibrated", label = "invertYaw", etype = "enum", file = "cal",
+    values = { "auto", false, true },
+    get = function() return cfg.invertYaw end,
+    set = function(v) cfg.invertYaw = v end },
+  { group = "Calibrated", label = "invertPitch", etype = "enum", file = "cal",
+    values = { "auto", false, true },
+    get = function() return cfg.invertPitch end,
+    set = function(v) cfg.invertPitch = v end },
+  { group = "Calibrated", label = "yaw d/s/RPM", etype = "text", file = "cal",
+    get = function() return cfg.yawDrive.degPerSecPerRpm end,
+    set = function(v) cfg.yawDrive.degPerSecPerRpm = v end },
+  { group = "Calibrated", label = "pitch d/s/RPM", etype = "text", file = "cal",
+    get = function() return cfg.pitchDrive.degPerSecPerRpm end,
+    set = function(v) cfg.pitchDrive.degPerSecPerRpm = v end },
+  { group = "Calibrated", label = "yaw minRPM", etype = "num", file = "cal",
+    min = 0.1, max = 10, step = 0.5,
+    get = function() return cfg.yawDrive.minSpeed end,
+    set = function(v) cfg.yawDrive.minSpeed = v end },
+  { group = "Calibrated", label = "pitch minRPM", etype = "num", file = "cal",
+    min = 0.1, max = 10, step = 0.5,
+    get = function() return cfg.pitchDrive.minSpeed end,
+    set = function(v) cfg.pitchDrive.minSpeed = v end },
+}
+
+-- Items visible for the current kind (Build items gate on the gun type).
+local function visibleConfigItems()
+  local out = {}
+  for _, it in ipairs(CONFIG_ITEMS) do
+    if not it.show or it.show() then out[#out + 1] = it end
+  end
+  return out
+end
+
+local function cfgValueStr(it)
+  local v = it.get()
+  if type(v) == "number" then
+    if v == math.floor(v) then return ("%d"):format(v) end
+    -- Up to 3 decimals, trailing zeros trimmed; no sci notation (mount
+    -- coords can be large, where %g would print 1.5e+03).
+    return (("%.3f"):format(v):gsub("%.?0+$", ""))
+  end
+  return tostring(v)
+end
+
+-- Re-resolve the gun after a profile edit; revert via `restore` and flash if
+-- the new value won't render (steppers clamp, so this only bites a typo).
+local function applyProfileEdit(restore)
+  if pcall(refreshProfile) then return true end
+  restore()
+  pcall(refreshProfile)
+  state.flash = "bad value"
+  return false
+end
+
+-- Adjust a numeric item by dir*step (clamped) or cycle an enum by dir.
+local function cfgAdjust(it, dir)
+  local prev = it.get()
+  if it.etype == "num" then
+    local v = math.max(it.min, math.min(it.max, prev + dir * it.step))
+    it.set(math.floor(v * 1000 + 0.5) / 1000) -- shave float dust from 0.1 steps
+  elseif it.etype == "enum" then
+    local i = 1
+    for j, val in ipairs(it.values) do if val == prev then i = j; break end end
+    it.set(it.values[((i - 1 + dir) % #it.values) + 1])
+  else
+    return
+  end
+  if it.profile then applyProfileEdit(function() it.set(prev) end) end
+  if it.static then refreshStaticCannon() end
+end
+
+-- Parse a typed value: a "num"/"float" must be numeric (num clamps to
+-- min/max, float is unbounded -- offsets, limit degrees); "auto" and other
+-- keywords stay strings (peripheral names, degPerSecPerRpm="auto").
+local function parseCfgValue(it, text)
+  text = text:gsub("^%s+", ""):gsub("%s+$", "")
+  if it.etype == "num" or it.etype == "float" then
+    local n = tonumber(text)
+    if not n then return nil, "need a number" end
+    if it.etype == "float" then return n end
+    return math.max(it.min, math.min(it.max, n))
+  end
+  return tonumber(text) or text
+end
+
+-- Snapshot every item's value, for dirty-detection and CANCEL.
+local function cfgSnapshot()
+  local snap = {}
+  for i, it in ipairs(CONFIG_ITEMS) do snap[i] = it.get() end
+  ui.cfgBaseline = snap
+end
+
+local function cfgDirty()
+  if not ui.cfgBaseline then return false end
+  for i, it in ipairs(CONFIG_ITEMS) do
+    if it.get() ~= ui.cfgBaseline[i] then return true end
+  end
+  return false
+end
+
+local function cfgSave()
+  writeCfg(cfg)
+  writeCal(cfg)
+  pcall(refreshProfile)
+  cfgSnapshot()
+  state.flash = "SAVED"
+end
+
+local function cfgCancel()
+  if ui.cfgBaseline then
+    for i, it in ipairs(CONFIG_ITEMS) do it.set(ui.cfgBaseline[i]) end
+    pcall(refreshProfile)
+    refreshStaticCannon()
+  end
+  state.flash = "REVERTED"
+end
+
 -- ---------------------------------------------------------------- drawing --
+
+-- The CONFIG tab: grouped, scrollable, live-editable settings. The selected
+-- row shows steppers ([-]/[+] for numbers, </> for enums) and an [=] text
+-- entry; cal-file rows are orange. Edits apply live; SAVE/CANCEL persist or
+-- revert (button bar). Mirrors drawDebugScreen's skip/clamp scroll model.
+local function drawConfigScreen(w, h)
+  local items = visibleConfigItems()
+  if ui.cfgSel < 1 then ui.cfgSel = 1 end
+  if ui.cfgSel > #items then ui.cfgSel = #items end
+
+  -- Flatten into display rows (group headers + items) for uniform scrolling.
+  local rows, lastGroup, selRow = {}, nil, 1
+  for i, it in ipairs(items) do
+    if it.group ~= lastGroup then
+      rows[#rows + 1] = { header = it.group }
+      lastGroup = it.group
+    end
+    rows[#rows + 1] = { item = it, idx = i }
+    if i == ui.cfgSel then selRow = #rows end
+  end
+
+  local top, bot = 3, h - 1
+  local vis = bot - top + 1
+  -- Keep the selected row on screen, then clamp.
+  if selRow - 1 < ui.scroll then ui.scroll = selRow - 1 end
+  if selRow > ui.scroll + vis then ui.scroll = selRow - vis end
+  local maxScroll = math.max(0, #rows - vis)
+  ui.scroll = math.max(0, math.min(ui.scroll, maxScroll))
+
+  local LBL = 15
+  for r = 1, vis do
+    local row = top + r - 1
+    local entry = rows[r + ui.scroll]
+    term.setCursorPos(1, row)
+    term.setBackgroundColor(colors.black)
+    term.clearLine()
+    if entry and entry.header then
+      term.setTextColor(colors.lightBlue)
+      term.write("-- " .. entry.header)
+    elseif entry then
+      local it = entry.item
+      local selected = entry.idx == ui.cfgSel
+      term.setBackgroundColor(selected and colors.gray or colors.black)
+      term.clearLine()
+      term.setCursorPos(1, row)
+      term.setTextColor(selected and colors.white or colors.lightGray)
+      term.write(selected and ">" or " ")
+      term.setTextColor(it.file == "cal" and colors.orange or colors.lightGray)
+      term.write((" %-" .. (LBL - 2) .. "s"):format(it.label:sub(1, LBL - 2)))
+      local function btn(text, cmd, col)
+        term.setCursorPos(col, row)
+        term.setBackgroundColor(selected and colors.gray or colors.black)
+        term.setTextColor(colors.yellow)
+        term.write(text)
+        ui.cells[#ui.cells + 1] = { col1 = col, col2 = col + #text - 1,
+          row = row, cmd = cmd, idx = entry.idx }
+        return col + #text + 1
+      end
+      if selected then
+        local c = LBL + 1
+        if it.etype == "num" then c = btn("[-]", "cfg_dec", c)
+        elseif it.etype == "enum" then c = btn("<", "cfg_dec", c) end
+        term.setCursorPos(c, row)
+        term.setBackgroundColor(colors.gray)
+        term.setTextColor(colors.white)
+        local vstr = cfgValueStr(it):sub(1, w - c)
+        term.write(vstr)
+        c = c + #vstr + 1
+        if it.etype == "num" then c = btn("[+]", "cfg_inc", c)
+        elseif it.etype == "enum" then c = btn(">", "cfg_inc", c) end
+        if it.etype ~= "enum" then btn("[=]", "cfg_edit", c) end
+      else
+        term.setTextColor(colors.white)
+        term.write(cfgValueStr(it):sub(1, w - LBL))
+        ui.cells[#ui.cells + 1] = { col1 = 1, col2 = w, row = row,
+          cmd = "cfg_select", idx = entry.idx }
+      end
+    end
+  end
+end
 
 local function drawTabBar(w)
   term.setCursorPos(1, 1)
@@ -1168,7 +1984,7 @@ local function drawStatus()
   term.clearLine()
   if state.calibrating then
     term.setTextColor(colors.yellow)
-    term.write("CALIBRATING -- wiggling both axes...")
+    term.write("CALIBRATING + AUTO-TUNING -- ~1-2 min, barrel steps itself")
     return
   end
   if state.targetName then
@@ -1252,6 +2068,10 @@ local function drawStatus()
   if state.armed and not state.firing then
     term.setTextColor(colors.red)
     term.write("  ARMED")
+  end
+  if trace.on then
+    term.setTextColor(colors.red)
+    term.write("  *REC")
   end
   if state.flash then
     term.setTextColor(colors.orange)
@@ -1388,6 +2208,20 @@ local function drawDebugScreen(w, h)
   line("yawOffset", cfg.yawOffset)
   line("profile", ("%s %s %.0f b/s"):format(cfg.profile.kind,
     cfg.profile.projectile, muzzleSpeed))
+  -- Speed source: computed from material+barrels / charges, or overridden.
+  local src
+  if cfg.profile.kind == "bigcannon" then
+    src = ("%d charges"):format(cfg.profile.charges)
+  elseif type(cfg.profile.muzzleVelocityOverride) == "number"
+    and cfg.profile.muzzleVelocityOverride > 0 then
+    src = "override"
+  else
+    src = ("%s x%d barrels"):format(cfg.profile.material, cfg.profile.barrels)
+  end
+  line("speed from", src)
+  line("drive y/p RPM", ("%s / %s d/s/RPM, floor %s/%s"):format(
+    tostring(cfg.yawDrive.degPerSecPerRpm), tostring(cfg.pitchDrive.degPerSecPerRpm),
+    tostring(cfg.yawDrive.minSpeed), tostring(cfg.pitchDrive.minSpeed)))
   local m = state.mount
   line("CannonYaw", fmtDeg(m and m.CannonYaw))
   line("CannonPitch", fmtDeg(m and m.CannonPitch))
@@ -1443,6 +2277,18 @@ local function drawDebugScreen(w, h)
     end
     line("aim rate y/p", ("%+.1f / %+.1f deg/s"):format(
       track.yawRate, track.pitchRate))
+    -- Live control-loop period: the overshoot guard caps the approach speed
+    -- against this. Smaller is better (faster, snappier); >0.15 is slow.
+    line("loop period", ("%.0f ms (%.1f Hz)"):format(
+      track.loopT * 1000, track.loopT > 0 and 1 / track.loopT or 0),
+      track.loopT > 0.15 and colors.orange or colors.lime)
+    -- Error-closing rate feeds the D term; watch this go to ~0 as the
+    -- barrel settles. A big swing here right before lock is the overshoot
+    -- kd damps -- raise yaw/pitch kd until it stops oscillating.
+    if cfg.yawDrive.kd ~= 0 or cfg.pitchDrive.kd ~= 0 then
+      line("err rate y/p", ("%+.1f / %+.1f deg/s (kd %g/%g)"):format(
+        track.yawErrRate, track.pitchErrRate, cfg.yawDrive.kd, cfg.pitchDrive.kd))
+    end
     if state.targetKind == "ship" then
       local area, avoid = shipArea(state.targetName)
       line("hull miss", state.miss
@@ -1477,11 +2323,13 @@ local function drawButtonBar(w, h)
   term.setCursorPos(1, h)
   term.setBackgroundColor(colors.black)
   term.clearLine()
-  -- Modal XYZ entry takes over the bar: shared draw() so the track
-  -- loop's redraws keep the live text instead of fighting a read().
+  -- Modal line entry takes over the bar: shared draw() so the track loop's
+  -- redraws keep the live text instead of fighting a read(). The label is
+  -- "XYZ" for a coord target, or the field name for a CONFIG edit.
   if ui.prompt then
     term.setTextColor(colors.lightBlue)
-    term.write(("XYZ: %s_"):format(ui.prompt.text):sub(1, w))
+    local label = ui.prompt.label or "XYZ"
+    term.write(("%s: %s_"):format(label, ui.prompt.text):sub(1, w))
     if ui.prompt.err then
       term.setTextColor(colors.red)
       term.write((" [%s]"):format(ui.prompt.err))
@@ -1500,6 +2348,19 @@ local function drawButtonBar(w, h)
     end
     col = col + #label + 1
   end
+  -- The CONFIG tab swaps the fire controls for SAVE/CANCEL (only live when
+  -- there are unsaved edits) plus CAL to (re)run the calibration wiggle.
+  if ui.activeTab == "config" then
+    local dirty = cfgDirty()
+    button(" SAVE ", "cfg_save", colors.lime, dirty)
+    button(" CANCEL ", "cfg_cancel", colors.red, dirty)
+    button(" CAL ", "recal", colors.yellow, not state.calibrating)
+    term.setCursorPos(w - 24, h)
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.gray)
+    term.write(dirty and "unsaved -- SAVE/CANCEL" or "tap a row to edit")
+    return
+  end
   button(" FIRE ", "fire", state.locked and colors.lime or colors.red, true)
   button(state.armed and " DISARM " or " ARM ", "arm",
     state.armed and colors.red or colors.lime, true)
@@ -1508,7 +2369,7 @@ local function drawButtonBar(w, h)
   term.setCursorPos(w - 30, h)
   term.setBackgroundColor(colors.black)
   term.setTextColor(colors.gray)
-  term.write("F=fire A=arm C=xyz K=cal Q=quit")
+  term.write("F=fire A=arm C=xyz K=cal+tune L=log Q=quit")
 end
 
 local function draw()
@@ -1518,6 +2379,8 @@ local function draw()
   drawStatus()
   if ui.activeTab == "debug" then
     drawDebugScreen(w, h)
+  elseif ui.activeTab == "config" then
+    drawConfigScreen(w, h)
   else
     drawTargetsList(w, h)
   end
@@ -1536,6 +2399,7 @@ local function trackLoop()
   local rosterTicks = math.max(1, math.floor(1 / cfg.trackSeconds + 0.5))
   local shipIdleTicks = math.max(1, math.floor(0.5 / cfg.trackSeconds + 0.5))
   while running do
+    local loopStart = os.clock()
     -- Ship fix every tick while tracking (a climbing ship stair-steps the
     -- aim on anything slower), every 0.5s when idle; roster every 1s.
     if cfg.ship.enabled and (state.targetName or tick % shipIdleTicks == 0) then
@@ -1546,14 +2410,18 @@ local function trackLoop()
     -- Serviced here (not in the input loop) because calibration drives the
     -- motors and must not race the aim commands. pcall so a failed wiggle
     -- (axis didn't move) just flashes instead of killing the loop.
+    -- CAL (K): the full automatic drive setup -- wiggle + loop measure +
+    -- approach auto-tune (recalibrate). Owns the motors, so it's serviced here
+    -- rather than racing the aim commands. ~1-2 min; the barrel steps itself.
     if state.recalRequest then
       state.recalRequest = false
       state.calibrating = true
       stopMotors()
       draw()
-      local ok = pcall(recalibrate)
+      local ok, err = pcall(recalibrate)
       state.calibrating = false
-      state.flash = ok and "CALIBRATED" or "CAL FAILED"
+      if not ok then tuneLog("ERROR: " .. tostring(err)) end
+      state.flash = ok and "CALIBRATED + AUTO-TUNED" or "CAL/TUNE FAILED (see log)"
       term.setBackgroundColor(colors.black)
       term.clear()
     end
@@ -1710,11 +2578,26 @@ local function trackLoop()
             end
             state.bursting = burstGate(state.locked, withinWide)
               and not state.locked
-            updateAimRates(aimYaw, aimPitch)
-            yaw.setTargetSpeed(speedFor(state.yawErr, cfg.invertYaw,
-              cfg.yawDrive, track.yawRate))
-            pitch.setTargetSpeed(speedFor(state.pitchErr, cfg.invertPitch,
-              cfg.pitchDrive, track.pitchRate))
+            updateRates(aimYaw, aimPitch, state.yawErr, state.pitchErr)
+            -- Live control-loop period -- the overshoot guard caps the
+            -- approach speed against it, so it tracks the real (peripheral-
+            -- limited) rate instead of assuming cfg.trackSeconds.
+            local nowT = os.clock()
+            if track.driveT then
+              local dt = nowT - track.driveT
+              if dt > 0 and dt < 1 then
+                track.loopT = track.loopT + 0.3 * (dt - track.loopT)
+              end
+            end
+            track.driveT = nowT
+            local yawRpm = speedFor(state.yawErr, cfg.invertYaw,
+              cfg.yawDrive, track.yawRate, track.yawErrRate, track.loopT)
+            local pitchRpm = speedFor(state.pitchErr, cfg.invertPitch,
+              cfg.pitchDrive, track.pitchRate, track.pitchErrRate, track.loopT)
+            yaw.setTargetSpeed(yawRpm)
+            pitch.setTargetSpeed(pitchRpm)
+            traceRow(aimYaw, data.CannonYaw, yawRpm,
+              aimPitch, data.CannonPitch, pitchRpm)
           else
             -- No mount reading: don't keep reporting (or firing on) a lock
             -- computed from stale angles.
@@ -1760,7 +2643,11 @@ local function trackLoop()
         setFiring(gate)
       end
       draw()
-      sleep(cfg.trackSeconds)
+      -- Sleep only the remainder of the target period: the peripheral reads
+      -- and drive writes already burn game-time (they yield), so adding a
+      -- full trackSeconds on top is what stretched the real loop to ~0.25s.
+      -- Always yields at least one tick.
+      sleep(math.max(0.05, cfg.trackSeconds - (os.clock() - loopStart)))
     else
       stopMotors()
       -- Don't cut a fire pulse short or fight an in-flight reload cycle.
@@ -1777,6 +2664,13 @@ local function trackLoop()
   end
 end
 
+-- Open the modal line editor on a CONFIG field (idx into the visible list).
+local function openCfgEdit(idx)
+  local it = visibleConfigItems()[idx]
+  if not it then return end
+  ui.prompt = { kind = "cfg", idx = idx, text = cfgValueStr(it), label = it.label }
+end
+
 local function handleCommand(cell)
   if cell.cmd == "select" then
     setTarget(cell.kind, cell.name)
@@ -1785,14 +2679,32 @@ local function handleCommand(cell)
   elseif cell.cmd == "arm" then
     toggleArm()
   elseif cell.cmd == "coordprompt" then
-    ui.prompt = { text = "" }
+    ui.prompt = { kind = "coord", text = "" }
   elseif cell.cmd == "stop" then
     setTarget(state.targetKind, state.targetName) -- toggle off
   elseif cell.cmd == "recal" then
     state.recalRequest = true
+  elseif cell.cmd == "cfg_select" then
+    ui.cfgSel = cell.idx
+  elseif cell.cmd == "cfg_inc" then
+    ui.cfgSel = cell.idx
+    local it = visibleConfigItems()[cell.idx]
+    if it then cfgAdjust(it, 1) end
+  elseif cell.cmd == "cfg_dec" then
+    ui.cfgSel = cell.idx
+    local it = visibleConfigItems()[cell.idx]
+    if it then cfgAdjust(it, -1) end
+  elseif cell.cmd == "cfg_edit" then
+    ui.cfgSel = cell.idx
+    openCfgEdit(cell.idx)
+  elseif cell.cmd == "cfg_save" then
+    cfgSave()
+  elseif cell.cmd == "cfg_cancel" then
+    cfgCancel()
   elseif cell.cmd:sub(1, 4) == "tab_" then
     ui.activeTab = cell.cmd:sub(5)
     ui.scroll = 0 -- the tabs share the scroll offset; start each at the top
+    if ui.activeTab == "config" then ui.cfgSel = 1; cfgSnapshot() end
   end
 end
 
@@ -1810,9 +2722,36 @@ local function rednetLoop()
   end
 end
 
--- Modal line editor for the XYZ prompt. Returns true while it owns the
--- keyboard so inputLoop routes everything here. Enter parses "x y z" and
--- locks the point; a bad parse keeps the editor open with a hint;
+-- Commit the modal line editor: an XYZ coord target, or a CONFIG field.
+-- A bad parse keeps the editor open with a hint instead of closing.
+local function commitPrompt()
+  if ui.prompt.kind == "cfg" then
+    local it = visibleConfigItems()[ui.prompt.idx]
+    if it then
+      local v, why = parseCfgValue(it, ui.prompt.text)
+      if v == nil then
+        ui.prompt.text, ui.prompt.err = "", why
+        return
+      end
+      local prev = it.get()
+      it.set(v)
+      if it.profile then applyProfileEdit(function() it.set(prev) end) end
+      if it.static then refreshStaticCannon() end
+    end
+    ui.prompt = nil
+  else
+    local c, why = parseCoord(ui.prompt.text)
+    if c then
+      ui.prompt = nil
+      setCoordTarget(c)
+    else
+      ui.prompt.text, ui.prompt.err = "", why
+    end
+  end
+end
+
+-- Modal line editor (XYZ target or CONFIG field). Owns the keyboard while
+-- ui.prompt is set so inputLoop routes everything here; Enter commits,
 -- backspace edits, escape cancels.
 local function handlePromptEvent(event)
   -- Opening with the `C` key queues a stray "c" char right behind the key
@@ -1826,13 +2765,7 @@ local function handlePromptEvent(event)
   elseif event[1] == "key" then
     local k = event[2]
     if k == keys.enter then
-      local c, why = parseCoord(ui.prompt.text)
-      if c then
-        ui.prompt = nil
-        setCoordTarget(c)
-      else
-        ui.prompt.text, ui.prompt.err = "", why
-      end
+      commitPrompt()
     elseif k == keys.backspace then
       ui.prompt.text = ui.prompt.text:sub(1, -2)
     elseif k == keys.escape then
@@ -1841,22 +2774,49 @@ local function handlePromptEvent(event)
   end
 end
 
+-- Single-key actions shared by EVERY tab, so a key does the same thing no
+-- matter where you are (the CONFIG tab layers arrow-nav on top, then falls
+-- through to here). Returns true if it handled the key.
+local function handleGlobalKey(k)
+  if k == keys.f then fire()
+  elseif k == keys.a then toggleArm()
+  elseif k == keys.c then ui.prompt = { kind = "coord", text = "", swallow = true }
+  elseif k == keys.k then state.recalRequest = true -- calibrate + auto-tune
+  elseif k == keys.l then
+    if trace.on then traceStop() else traceStart() end
+  elseif k == keys.q then running = false
+  else return false end
+  return true
+end
+
 local function inputLoop()
   while running do
     local event = { os.pullEvent() }
     if ui.prompt then
       handlePromptEvent(event)
     elseif event[1] == "key" then
-      if event[2] == keys.f then
-        fire()
-      elseif event[2] == keys.a then
-        toggleArm()
-      elseif event[2] == keys.c then
-        ui.prompt = { text = "", swallow = true }
-      elseif event[2] == keys.k then
-        state.recalRequest = true
-      elseif event[2] == keys.q then
-        running = false
+      local k = event[2]
+      if ui.activeTab == "config" then
+        -- CONFIG tab keyboard nav first; anything else falls through to the
+        -- shared global keys so K/L/etc. work here too.
+        local items = visibleConfigItems()
+        if k == keys.up then
+          ui.cfgSel = math.max(1, ui.cfgSel - 1)
+        elseif k == keys.down then
+          ui.cfgSel = math.min(#items, ui.cfgSel + 1)
+        elseif k == keys.left and items[ui.cfgSel] then
+          cfgAdjust(items[ui.cfgSel], -1)
+        elseif k == keys.right and items[ui.cfgSel] then
+          cfgAdjust(items[ui.cfgSel], 1)
+        elseif k == keys.enter then
+          if items[ui.cfgSel] and items[ui.cfgSel].etype ~= "enum" then
+            openCfgEdit(ui.cfgSel)
+          end
+        else
+          handleGlobalKey(k)
+        end
+      else
+        handleGlobalKey(k)
       end
     elseif event[1] == "mouse_click" or event[1] == "monitor_touch" then
       local x, y = event[3], event[4]

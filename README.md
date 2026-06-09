@@ -26,12 +26,29 @@ flat:
 
 - `cannon.lua`
 - `ballistics.lua`
+- `autotune.lua`
 - `vendor/CCMinimap/computercraft/cfgutil.lua` → `cfgutil.lua`
 - `vendor/CCMinimap/computercraft/heading.lua` → `heading.lua`
 
-Run `cannon.lua`. First boot writes `cannon.cfg` with defaults — edit the
-peripheral names, cannon position, and `yawOffset` to match your build,
-then rerun.
+Run `cannon.lua`. First boot writes `cannon.cfg` (hand-authored intent)
+and `cannon.cal` (machine-measured), then calibrates. Setup is mostly
+hands-off now:
+
+- The two speed controllers no longer need naming: leave
+  `peripherals.yaw`/`pitch` at `"auto"` and the calibration wiggle nudges
+  each one and reads whether `CannonYaw` or `CannonPitch` moved to tell
+  them apart. The resolved names are saved to `cannon.cal`.
+- Muzzle speed is **computed**, never typed — set the gun's `material`
+  and `barrels` (autocannon) or `charges` (bigcannon) and the b/s is
+  derived from the CBC formula (see **Cannon profile**).
+- `yawOffset` defaults to `90` (most builds), `cannon` position is the
+  only thing you usually still set by hand (or `cannon.gps = true`).
+- Drive sign, slew rate (`degPerSecPerRpm`), and the `minSpeed` floor are
+  all measured by the wiggle and live in `cannon.cal`.
+
+Everything calibrated lands in `cannon.cal`, which is safe to delete — the
+**CAL** button (or `K`) rebuilds it. Edit any of it live on the **CONFIG**
+tab (below) instead of quitting to a text editor.
 
 Stationary builds can skip hardcoding the mount coords: set
 `cannon.gps = true` (wireless modem + GPS constellation required) and
@@ -53,8 +70,14 @@ means "cannon rest direction relative to ship-forward". Ship pitch/roll
 are assumed level for now. If GPS or the nav table stop answering, the
 turret holds and shows NO FIX rather than aiming on stale data.
 
+Three tabs along the top: **TARGETS** (the roster), **DEBUG** (live aim
+numbers), and **CONFIG** (live settings editor — see below).
+
 Keys: `F` fire (manual pulse), `A` arm/disarm, `C` enter an XYZ
-target, `K` recalibrate the drive, `Q` quit. The turret
+target, `K` calibrate + auto-tune the drive, `L` toggle a diagnostic
+trace, `Q` quit. On the CONFIG tab the arrow keys navigate (↑/↓ select a
+row, ←/→ adjust it) and Enter opens a text edit; the single-key actions
+(`F`/`A`/`C`/`K`/`L`/`Q`) work on every tab. The turret
 continuously tracks the selected player; `LOCKED` means both axes are
 within `tolerance`. While **armed** (ARM button or `A`; disarmed by
 default) the fire line is held high whenever the turret is locked on and
@@ -101,15 +124,20 @@ mode and the ballistics:
   mortar stone at −0.025, drag 0.99/tick for all (verified from CBC
   source; datapacks can override, so re-verify on a tuned server).
 - `charges` (bigcannon): powder charges loaded — muzzle speed is
-  2 b/t per charge. 5 charges = 200 b/s ≈ 693 blocks max range.
-- `muzzleVelocity` (autocannon, blocks/sec): set by the cannon, not
-  the round: `20 × (baseSpeed + perBarrel × min(barrels, cap))` —
-  cast iron `20×(5 + 2×b≤2)`, bronze `20×(3 + 1.5×b≤3)`, steel
-  `20×(3 + 1.5×b≤4)`; a full-length steel or cast-iron gun is 180.
-  Fine-tune on a strafing target: shots trailing behind = value too
-  high, leading in front = too low. Mind projectile lifetime: cast
-  iron rounds despawn after ~99 blocks, bronze ~187, steel ~540.
-  (Old configs: `lead.muzzleVelocity` migrates here automatically.)
+  2 b/t per charge. 5 charges = 200 b/s ≈ 686 blocks max range.
+- `material` + `barrels` (autocannon): muzzle speed is a closed form of
+  the build, **computed for you** — `20 × (base + perBarrel ×
+  min(barrels, cap))` with `base/perBarrel/cap` from the material: cast
+  iron `20×(5 + 2×min(b,2))`, bronze `20×(3 + 1.5×min(b,3))`, steel
+  `20×(3 + 1.5×min(b,4))`. A full-length steel or cast-iron gun is 180
+  b/s. So set `material` (`cast_iron`/`bronze`/`steel`) and the barrel
+  count, not a velocity. Mind projectile lifetime: cast iron rounds
+  despawn after ~99 blocks, bronze ~187, steel ~540.
+- `muzzleVelocityOverride` (autocannon): `> 0` forces the muzzle speed
+  in b/s instead of computing it — only for a **datapack-tuned server**
+  whose numbers differ from the published ones; `0` = compute. (Old
+  configs: a hand-tuned `muzzleVelocity` / `lead.muzzleVelocity`
+  migrates into this override automatically.)
 - `barrelBlocks`: mount pivot → muzzle tip, in blocks. CBC spawns the
   shell ~`barrelBlocks − 1.5` out along the barrel; on a long gun
   ignoring that shifts arcing shots by 15–25 blocks at range.
@@ -134,6 +162,35 @@ line goes high while the turret keeps converging on the head. The status line sh
 / vertical miss until lock. `trackSeconds` (default 0.1, minimum 0.05 —
 one game tick) sets the tracking loop period if you want faster aim
 updates for more peripheral traffic.
+
+## CONFIG tab and the cfg / cal split
+
+Config lives in two files. `cannon.cfg` is **hand-authored intent** — the
+gun profile, aim offsets, tolerances, travel limits, ship/reload wiring.
+`cannon.cal` is **machine-measured** — the resolved yaw/pitch controller
+names, the drive sign (`invertYaw`/`invertPitch`), the slew rate
+(`degPerSecPerRpm`), and the `minSpeed` floor. The wiggle writes only
+`cannon.cal`; it's safe to delete (the **CAL** button rebuilds it) and
+keeps the hand-edited config clean.
+
+The **CONFIG** tab edits all of it live, no quitting to a text editor.
+Rows are grouped (Build / Aim / Position / Arc limits / Drive /
+Calibrated; calibrated rows are orange). Tap a row to select it, then use
+its `[-]`/`[+]` steppers (numbers) or `<`/`>` (enums like `material`,
+`arc`, `kind`), or `[=]` to type a value; arrow keys work too. Some
+fields are **type-only** (just `[=]`, no steppers): the mount position /
+GPS `offset` floats and the arc travel limits, where you want to enter an
+exact value. Edits apply **immediately** — change `material` and the
+muzzle speed recomputes; toggle **Position → gps** and edit the `offset`
+and the mount position re-derives from the GPS fix, no reboot. **SAVE** writes
+the changes to disk (each field to its own file), **CANCEL** reverts to
+the values from when you opened the tab. Because measured values win over
+the hand-edited file, pin a calibrated value by editing it here (or in
+`cannon.cal`), not in `cannon.cfg`.
+
+Setting up a new turret is then: drop the files on the computer, set the
+gun's `material` + `barrels` (or `charges`) and the `cannon` position,
+and press **CAL** — the drives auto-detect and calibrate themselves.
 
 ## Reload cycle
 
@@ -240,8 +297,49 @@ fire gate closed against anything faster than a walk. Set
 re-gearing to re-measure — or just press the **CAL** button (or `K`),
 which re-runs the wiggle live and saves the result.
 
+On top of P + feedforward there's an optional **derivative term**
+(`yawDrive.kd` / `pitchDrive.kd`, a PD loop). It brakes the command in
+proportion to how fast the aim *error* is closing —
+`kd × d(err)/dt ÷ degPerSecPerRpm` — so the barrel eases onto the
+target instead of overshooting and hunting just before lock. It acts on
+the error, not the mount's velocity, so it stays out of the
+feedforward's way on a moving target (steady tracking has ~0 error
+rate), and it only shapes an already-active drive — it never pushes a
+parked barrel. `kd = 0` (the default) is the pure P+feedforward loop.
+If an axis oscillates around the target right before locking, raise
+`kd` in the **CONFIG** tab (Drive group) a little at a time — try
+0.2–0.5; too high makes convergence sluggish. The DEBUG tab's
+`err rate y/p` line (shown once `kd ≠ 0`) is the thing it's damping:
+watch it settle toward 0 without ringing.
+
 If an axis spins away from the target, flip `invertYaw` / `invertPitch`
 in the config instead of regearing.
+
+## Calibrate + auto-tune (the CAL button / `K`)
+
+**`K`** (or the **CAL** button) does the whole drive setup in one automatic
+pass — no hand-tuning, no pre-steps:
+
+1. Re-detects which speed controller is yaw vs pitch (if `"auto"`).
+2. Wiggles each axis to measure the drive sign, slew rate
+   (`degPerSecPerRpm`), and the `minSpeed` floor.
+3. Measures the real control-loop period (by timing its own peripheral
+   work — no target needed).
+4. Auto-tunes each axis's `approach` cap: it drives step responses on
+   **internal angle targets** (it just steps the mount in place — you do
+   **not** need to be tracking anything), raises `approach` until a step
+   *just* starts to overshoot, and keeps the largest value that stays
+   clean (re-verified to absorb sensor noise). It writes the tuned
+   `approach` + a matching `speedGain` to `cannon.cfg`, zeroes `kd` (the
+   cap supersedes the D term), and logs every probe to `cannon.tune.log`.
+
+The whole thing takes ~1–2 minutes and the barrel steps back and forth on
+its own — **disarm first** (`A`) and give it clearance. Boot only does the
+quick wiggle (steps 1–2) so it doesn't lengthen every startup; press `K`
+once after setup for the full auto-tune. The search and its convergence are
+validated offline against a mount model fitted to real in-game traces,
+across a range of gearing, inertia, loop rates, and sensor noise
+(`tests/autotune_sim.lua`).
 
 ## Settling and lock
 

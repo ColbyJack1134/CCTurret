@@ -4,19 +4,28 @@
 -- the dig notes. Datapacks CAN override munition_properties/*, so on
 -- a tuned server re-verify before trusting long shots.
 --
--- Flight model (per game tick): pos = pos + v, then v = q*v + g,
--- where q = 1 - drag (0.99 for every CBC round) and g is the per-tick
--- gravity. Both axes have closed forms:
---   x(n)  = vh*(1 - q^n)/(1 - q)      ->  n(d) = ln(1 - d(1-q)/vh)/ln(q)
---   vy(k) = q^k*(vy0 - vt) + vt           vt = g/(1 - q)   (terminal)
---   y(n)  = (vy0 - vt)*(1 - q^n)/(1 - q) + vt*n
---         = (vy0 - vt)*d/vh + vt*n        (substituting the n(d) form)
--- so "height when the shell crosses horizontal distance d" is O(1) --
--- the Malex21 calculator's ln(0.99) trick, extended to the vertical
--- axis. Only the pitch root-find iterates: a sweep across the pitch
--- limits brackets each sign change of (height - target height),
--- bisection polishes, and up to two solutions come back (shallow and
--- steep arc). No solution = ballistically unreachable.
+-- Flight model, taken VERBATIM from the CBC source (AbstractCannonProjectile
+-- .getForces / tick): each tick a = -drag*v + g, then
+--   pos = pos + v + 0.5*a   (NOT pos + v -- a half-acceleration term)
+--   v   = v + a  = q*v + g,  q = 1 - drag (0.99 for every CBC round)
+-- The position step is the trapezoidal rule: pos += 0.5*(v_k + v_{k+1}),
+-- since a = v_{k+1} - v_k exactly. (Drag is linear: getDragForce =
+-- formDrag*density*|v| applied along -v_hat, i.e. -formDrag*v; density = 1
+-- overworld, quadratic_drag = false.) That half-step matters at artillery
+-- range -- ignoring it (plain pos += v Euler) walks shots a few blocks low.
+--
+-- Closed forms. Velocity is unchanged from Euler, so vt and the q^n decay
+-- are the same; only the position SUM picks up the 0.5*(1+q) trapezoid
+-- weight, which collapses to a single constant K = 1/drag - 0.5:
+--   x(n)  = vh*K*(1 - q^n)            ->  n(d) = ln(1 - d/(vh*K))/ln(q)
+--   vy(k) = q^k*(vy0 - vt) + vt           vt = g/(1 - q) = g/drag (terminal)
+--   y(n)  = (vy0 - vt)*K*(1 - q^n) + vt*n
+--         = (vy0 - vt)*d/vh + vt*n        (since K*(1-q^n) = d/vh)
+-- so "height when the shell crosses horizontal distance d" is still O(1) and
+-- the vertical substitution is untouched -- only n(d) carries the K. Only the
+-- pitch root-find iterates: a sweep across the pitch limits brackets each
+-- sign change of (height - target height), bisection polishes, and up to two
+-- solutions come back (shallow and steep arc). No solution = unreachable.
 --
 -- API units: blocks and SECONDS, velocities in BLOCKS/SECOND.
 -- Internally blocks/tick (20 t/s), CBC-native.
@@ -43,11 +52,43 @@ B.PROJECTILES = {
   machine_gun_bullet = { gravity = -0.025, drag = 0.01 },
 }
 
+-- Autocannon muzzle speed is a CLOSED FORM of the build, not a measured
+-- number: blocks/sec = 20 * (base + perBarrel * min(barrels, cap)), with
+-- base/perBarrel/cap set by the cannon material. So the config carries
+-- material + barrel count and we compute the speed (the same way big
+-- cannons compute it from charges) -- nothing to calibrate. Constants
+-- from the CBC source / verified in-game (full steel or cast-iron = 180
+-- b/s); a datapack server CAN retune them, so profile.muzzleVelocityOverride
+-- is the escape hatch (see B.muzzleSpeed).
+B.AUTOCANNON_MATERIALS = {
+  cast_iron = { base = 5, perBarrel = 2,   cap = 2 },
+  bronze    = { base = 3, perBarrel = 1.5, cap = 3 },
+  steel     = { base = 3, perBarrel = 1.5, cap = 4 },
+}
+
+-- Autocannon muzzle speed in blocks/second from material + barrel count.
+-- Errors loudly on an unknown material rather than guessing a speed.
+function B.autocannonSpeed(material, barrels)
+  local m = B.AUTOCANNON_MATERIALS[material]
+  if not m then
+    local known = {}
+    for k in pairs(B.AUTOCANNON_MATERIALS) do known[#known + 1] = k end
+    table.sort(known)
+    error(('unknown autocannon material %q -- known: %s')
+      :format(tostring(material), table.concat(known, ", ")), 0)
+  end
+  if type(barrels) ~= "number" or barrels < 0 then
+    error("profile.barrels must be a barrel count >= 0", 0)
+  end
+  return TPS * (m.base + m.perBarrel * math.min(barrels, m.cap))
+end
+
 -- Muzzle speed in blocks/second for a cannon profile. Big cannons get
--- 2 b/t per powder charge (propellant strength 2; big cartridges
--- match); autocannon speed is set by the cannon material + barrel
--- count, so the profile carries it directly (material formula in the
--- README). Errors loudly on a malformed profile rather than guessing.
+-- 2 b/t per powder charge (propellant strength 2; big cartridges match);
+-- autocannon speed is computed from material + barrels by the formula
+-- above, unless muzzleVelocityOverride (> 0) forces a value -- for a
+-- datapack-tuned server whose numbers differ from the published ones.
+-- Errors loudly on a malformed profile rather than guessing.
 function B.muzzleSpeed(profile)
   if profile.kind == "bigcannon" then
     if type(profile.charges) ~= "number" or profile.charges < 1 then
@@ -55,11 +96,11 @@ function B.muzzleSpeed(profile)
     end
     return profile.charges * 2 * TPS
   elseif profile.kind == "autocannon" then
-    if type(profile.muzzleVelocity) ~= "number"
-      or profile.muzzleVelocity <= 0 then
-      error('profile.muzzleVelocity must be > 0 for kind "autocannon"', 0)
+    local override = profile.muzzleVelocityOverride
+    if type(override) == "number" and override > 0 then
+      return override
     end
-    return profile.muzzleVelocity
+    return B.autocannonSpeed(profile.material, profile.barrels)
   end
   error(('unknown profile.kind %q -- "autocannon" or "bigcannon"')
     :format(tostring(profile.kind)), 0)
@@ -85,6 +126,9 @@ function B.solve(opts)
   end
   local q = 1 - drag
   local vt = opts.gravity / drag -- terminal fall speed, b/t (negative)
+  -- Trapezoidal position factor (pos += 0.5*(v_k + v_{k+1})); plain Euler
+  -- would be 1/drag. The asymptotic horizontal range is vh*K.
+  local posK = 1 / drag - 0.5
   local muzzle = opts.muzzle or 0
   local lo, hi = opts.minPitch or -30, opts.maxPitch or 60
   local logq = math.log(q)
@@ -92,13 +136,13 @@ function B.solve(opts)
   -- Aim error at one pitch: shell height minus target height when the
   -- shell crosses the target's horizontal distance, plus flight ticks.
   -- nil = unreachable at this pitch (past the asymptotic horizontal
-  -- range vh/drag, or the muzzle pokes past the target).
+  -- range vh*K, or the muzzle pokes past the target).
   local function err(pitchDeg)
     local r = math.rad(pitchDeg)
     local vh = v0 * math.cos(r)
     local d = opts.dx - muzzle * math.cos(r)
     if d <= 0 or vh <= 0 then return nil end
-    local arg = 1 - d * drag / vh
+    local arg = 1 - d / (vh * posK)
     if arg <= 0 then return nil end
     local n = math.log(arg) / logq
     local vy0 = v0 * math.sin(r)
@@ -163,10 +207,13 @@ function B.impact(opts)
   local hAtTarget, range, tof
   for t = 1, 6000 do
     local px, py = x, y
-    x = x + vx
-    y = y + vy
-    vx = vx * q
-    vy = vy * q + opts.gravity
+    -- CBC tick: a = -drag*v + g; pos += v + 0.5*a; v += a. Equivalently
+    -- pos += 0.5*(v_old + v_new) -- the trapezoidal rule used in solve().
+    local nvx = vx * q
+    local nvy = vy * q + opts.gravity
+    x = x + 0.5 * (vx + nvx)
+    y = y + 0.5 * (vy + nvy)
+    vx, vy = nvx, nvy
     if dx and not hAtTarget and px <= dx and x >= dx then
       local f = (x == px) and 0 or (dx - px) / (x - px)
       hAtTarget = py + (y - py) * f
