@@ -153,13 +153,15 @@ barrel tracks line-of-sight as a ready posture and auto-fire stays
 gated until the target closes in. `pitchOffset` remains a plain aim
 bias on top of the solution.
 
-Player targets lock onto the head (`getPlayerPos` reports ~head level;
-`playerHitbox.aimOffset` shifts the setpoint if shots ride high or
-low). Fire opens early: as soon as the shot would pass through the
-body box anchored to the head — `playerHitbox.width` wide, `up` above
-to `down` below the reported Y (default 0.6 wide, +0.2/−1.8) — the
-line goes high while the turret keeps converging on the head. The status line shows the live horizontal
-/ vertical miss until lock. `trackSeconds` (default 0.1, minimum 0.05 —
+Player targets lock onto the centre of mass (`getPlayerPos` reports the
+FEET — the entity position — so the turret aims `playerHitbox.aimHeight`
+blocks above it; default 0.9, the middle of a standing player). Fire
+opens early: as soon as the shot would pass through the body box rising
+from the reported feet — `playerHitbox.width` wide and `playerHitbox.height`
+tall (default 0.6 × 1.8) — the line goes high while the turret keeps
+converging on centre mass. Raise `aimHeight` toward the head, or pad
+`width`/`height`, if the gate feels too strict. The status line shows the
+live horizontal / vertical miss until lock. `trackSeconds` (default 0.1, minimum 0.05 —
 one game tick) sets the tracking loop period if you want faster aim
 updates for more peripheral traffic.
 

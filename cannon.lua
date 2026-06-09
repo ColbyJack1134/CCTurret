@@ -104,27 +104,40 @@ local DEFAULTS = {
     reloadSeconds = 5,           -- bigcannon only, pause between auto shots
     arc = "shallow",
   },
-  -- Center of the cannon mount (use the mount block's coords + 0.5).
-  -- Only used while ship.enabled = false; aboard a ship the position is
-  -- derived live from GPS + ship.offset instead. For a stationary
-  -- build, gps = true locates the COMPUTER once at boot (wireless
-  -- modem + GPS constellation required -- the boot fails loudly
-  -- without a fix) and derives the mount as fix + offset in WORLD axes
-  -- (+x east, +y up, +z south; mount minus computer). x/y/z are
-  -- ignored while gps = true. Explicit flag, not modem auto-detect:
-  -- a wireless modem may be there for transponder targets only.
-  cannon = { x = 0.5, y = 64.5, z = 0.5, gps = false,
+  -- WHERE THE CANNON IS. Every field here points at the BASE of the cannon
+  -- MOUNT BLOCK (its plain block coords) -- never the muzzle or the pivot.
+  -- The launch pivot is derived automatically: CBC seats the gun's rotation
+  -- point at the CENTRE of the block 2 along the mount's vertical axis, i.e.
+  -- base + (0.5, +2.5, 0.5) for a normal cannon, or base + (0.5, -1.5, 0.5)
+  -- when upsideDown. The +0.5s are block-centre; the 2 is the trunnion step
+  -- (see pivotFromBase). So you only ever enter whole-block offsets.
+  --
+  --  * x/y/z      manual mount-block coords; used when gps = false and not
+  --               aboard a ship. A wireless modem may still be present for
+  --               transponder targets only -- gps is an explicit opt-in.
+  --  * gps = true locate the COMPUTER once at boot (needs a wireless modem +
+  --               GPS constellation; boot fails loudly without a fix) and
+  --               derive the mount as fix + offset. x/y/z are ignored.
+  --  * offset     blocks from the computer to the mount base. ONE value,
+  --               shared by the static-gps path AND ship mode, edited in the
+  --               CONFIG tab. Static: WORLD axes (x east, y up, z south).
+  --               Ship: HULL-local (x right, y up, z forward), rotated live
+  --               by heading + attitude. y is vertical in both, so the pivot
+  --               math is identical either way.
+  --  * upsideDown the gun hangs BELOW the mount (CBC VERTICAL_DIRECTION = UP);
+  --               flips the trunnion step from +2 to -2. Default false.
+  cannon = { x = 0, y = 64, z = 0, gps = false, upsideDown = false,
              offset = { x = 0, y = 0, z = 0 } },
   -- Airship mode: locate the COMPUTER via GPS (wireless modem required),
   -- read ship yaw from the navigation table (CCMinimap-style needle math),
-  -- and derive the cannon's world position by rotating `offset` -- the
-  -- ship-local vector from the computer to the cannon mount, in blocks
-  -- (left = negative right, down = negative up) -- by the live heading.
-  -- While enabled, yawOffset means "cannon rest direction relative to
-  -- ship-forward", so it stays correct at any heading.
+  -- and derive the cannon's world position by rotating the SHARED
+  -- cannon.offset (hull-local computer->mount-base vector, x right / y up /
+  -- z forward) by the live heading and gimbal attitude. While enabled,
+  -- yawOffset means "cannon rest direction relative to ship-forward", so it
+  -- stays correct at any heading. Position uses cannon.offset and
+  -- cannon.upsideDown -- there is no separate ship offset.
   ship = {
     enabled = false,
-    offset = { forward = 0, up = 0, right = 0 },
     headingOffset = 0,   -- nav-table needle correction, same as CCMinimap
     navTable = "auto",
     -- Aeronautics gimbal sensor (type "gimbal_sensor", getAngles() ->
@@ -174,16 +187,18 @@ local DEFAULTS = {
   -- target closes back in; manual F is not gated. Mind that rounds
   -- despawn anyway (cast iron ~99, bronze ~187, steel ~540 blocks).
   maxDistance = 50,
-  -- Player targets. getPlayerPos returns roughly HEAD level (observed
-  -- in-game; docs suggest feet). The turret locks onto the reported Y
-  -- plus aimOffset (0 = the head); the fire gate is a box anchored to
-  -- the reported Y covering the body below it: fire opens while the
-  -- shot would pass within width/2 horizontally and between `up` above
-  -- and `down` below the reported Y -- even before both axes settle
-  -- inside `tolerance` (which still locks on its own at long range,
-  -- where the box subtends less than the deadband). Pad the numbers if
+  -- Player targets. getPlayerPos reports the player's FEET (the entity
+  -- position -- its Y is the bottom of the bounding box; eyes are ~1.62
+  -- above). So the hitbox is FEET-RELATIVE: a box `width` wide rising
+  -- `height` blocks from the reported point (a standing player is ~1.8
+  -- tall, 0.6 wide), and the turret aims `aimHeight` blocks above the feet
+  -- -- 0.9 is centre of mass, the default. The fire gate opens while the
+  -- shot would pass within width/2 horizontally and anywhere in 0..height
+  -- vertically, even before both axes settle inside `tolerance` (which
+  -- still locks on its own at long range, where the box subtends less than
+  -- the deadband). Raise aimHeight toward the head, or pad width/height, if
   -- the gate feels too strict.
-  playerHitbox = { width = 0.6, up = 0.2, down = 1.8, aimOffset = 0 },
+  playerHitbox = { width = 0.6, height = 1.8, aimHeight = 0.9 },
   -- Predictive lead for player targets: aim where the target WILL be
   -- when the shell arrives -- pos + velocity * (flight time + latency).
   -- Flight time comes from the arc solver (profile + ballistics.lua).
@@ -281,8 +296,8 @@ local DEFAULTS = {
   -- the approach cap doing the overshoot control it is usually unnecessary
   -- (and a derivative is unreliable at a slow loop -- it lags the oscillation
   -- and can pump it). Leave it 0 unless the cap alone leaves a residual hunt.
-  yawDrive = { speedGain = 6, maxSpeed = 120, minSpeed = 1, degPerSecPerRpm = "auto", approach = 0.5, kd = 0 },
-  pitchDrive = { speedGain = 3, maxSpeed = 100, minSpeed = 1, degPerSecPerRpm = "auto", approach = 0.5, kd = 0 },
+  yawDrive = { speedGain = 6, maxSpeed = 256, minSpeed = 1, degPerSecPerRpm = "auto", approach = 0.5, kd = 0 },
+  pitchDrive = { speedGain = 3, maxSpeed = 256, minSpeed = 1, degPerSecPerRpm = "auto", approach = 0.5, kd = 0 },
   -- Names listed here are dimmed in the target list as a "friendly"
   -- reminder; they can still be clicked deliberately. Works for player
   -- names AND ship callsigns -- when the cannon's own ship runs CCMinimap,
@@ -427,6 +442,15 @@ local function loadConfig()
       :format(tostring(legacyVel)))
   end
 
+  -- Migration: the player hitbox is now feet-relative (height up from the
+  -- reported feet, aim at aimHeight) instead of head-relative up/down +
+  -- aimOffset. Drop the dead keys so they don't linger in cannon.cfg.
+  if type(cfg.playerHitbox) == "table" then
+    cfg.playerHitbox.up = nil
+    cfg.playerHitbox.down = nil
+    cfg.playerHitbox.aimOffset = nil
+  end
+
   writeCfg(cfg)
   writeCal(cfg)
   if migrated then print("Split calibration values into " .. CALFILE) end
@@ -569,12 +593,30 @@ if transponderModem then
   if not rednet.isOpen(modemName) then rednet.open(modemName) end
 end
 
+-- Mount BASE -> launch pivot. CBC rotates a mounted cannon about the CENTRE
+-- of the block 2 along the mount's vertical axis (the trunnion): the gun
+-- assembles at mountPos.relative(VERTICAL_DIRECTION, -2) and the entity's
+-- block-centre (+0.5 on every axis) is the fixed point of rotation. So from
+-- the mount-block base the pivot is +0.5 on the two horizontals and, on the
+-- vertical, the 2-block trunnion step plus the same +0.5 centre: +2.5 for a
+-- normal cannon, -1.5 when the gun hangs below the mount (VERTICAL_DIRECTION =
+-- UP). VERTICAL_DIRECTION is only ever up/down, so the step is always on y;
+-- in ship mode y is hull-up and the result is rotated to world by the caller.
+local function pivotFromBase(base, upsideDown)
+  return {
+    x = base.x + 0.5,
+    y = base.y + (upsideDown and -2 or 2) + 0.5,
+    z = base.z + 0.5,
+  }
+end
+
 -- Static-mode cannon position: configured directly, or derived ONCE at
 -- boot from a GPS fix of the computer plus a world-axis offset -- a
 -- stationary build doesn't move, so one fix is enough (rerun the
 -- program after relocating). Fails loudly rather than aiming from a
 -- guessed position.
 local staticCannon = nil
+local staticBase = nil -- mount-base position before pivotFromBase, for the DEBUG tab
 local gpsFix = nil -- cached computer GPS fix (static gps mode), reused on live edits
 if not cfg.ship.enabled then
   if cfg.cannon.gps then
@@ -588,12 +630,14 @@ if not cfg.ship.enabled then
     end
     gpsFix = { x = x, y = y, z = z }
     local o = cfg.cannon.offset
-    staticCannon = { x = x + o.x, y = y + o.y, z = z + o.z }
-    print(("GPS fix %.1f %.1f %.1f + offset -> cannon %.1f %.1f %.1f")
+    staticBase = { x = x + o.x, y = y + o.y, z = z + o.z }
+    staticCannon = pivotFromBase(staticBase, cfg.cannon.upsideDown)
+    print(("GPS fix %.1f %.1f %.1f + offset -> pivot %.1f %.1f %.1f")
       :format(x, y, z, staticCannon.x, staticCannon.y, staticCannon.z))
     sleep(1.5) -- long enough to read before the UI clears the terminal
   else
-    staticCannon = { x = cfg.cannon.x, y = cfg.cannon.y, z = cfg.cannon.z }
+    staticBase = { x = cfg.cannon.x, y = cfg.cannon.y, z = cfg.cannon.z }
+    staticCannon = pivotFromBase(staticBase, cfg.cannon.upsideDown)
   end
 end
 
@@ -601,7 +645,7 @@ end
 -- position. freshUntil guards against aiming on stale data when GPS or the
 -- nav table stop answering.
 local ship = {
-  pos = nil, heading = nil, cannon = nil, rel = nil,
+  pos = nil, heading = nil, cannon = nil, base = nil, rel = nil,
   gimbal = nil,           -- { x, z } raw gimbal-sensor degrees
   pitch = 0, roll = 0,    -- mapped attitude: +nose-up / +right-side-down
   basis = nil,            -- ship-frame unit vectors {f, u, r} in world coords
@@ -657,16 +701,23 @@ local function updateShip()
   local u2 = mix(u, f, math.cos(th), -math.sin(th))
   local r2 = mix(r, u2, math.cos(ph), -math.sin(ph))
   local u3 = mix(u2, r, math.cos(ph), math.sin(ph))
-  local off = cfg.ship.offset
+  -- Shared mount-base offset (hull-local: x right, y up, z forward) rotated to
+  -- world by the live basis. The mount base and the launch pivot differ only
+  -- by pivotFromBase IN THE HULL FRAME, so rotate each separately: base for
+  -- the DEBUG tab, pivot (base lifted by the trunnion + centre) for aiming.
+  local function toWorld(v) -- v = { x right, y up, z forward }, hull-local
+    return {
+      x = x + f2.x * v.z + u3.x * v.y + r2.x * v.x,
+      y = y + f2.y * v.z + u3.y * v.y + r2.y * v.x,
+      z = z + f2.z * v.z + u3.z * v.y + r2.z * v.x,
+    }
+  end
   ship.pos = { x = x, y = y, z = z }
   ship.heading = heading
   ship.pitch, ship.roll = pitchDeg, rollDeg
   ship.basis = { f = f2, u = u3, r = r2 }
-  ship.cannon = {
-    x = x + f2.x * off.forward + u3.x * off.up + r2.x * off.right,
-    y = y + f2.y * off.forward + u3.y * off.up + r2.y * off.right,
-    z = z + f2.z * off.forward + u3.z * off.up + r2.z * off.right,
-  }
+  ship.base = toWorld(cfg.cannon.offset)
+  ship.cannon = toWorld(pivotFromBase(cfg.cannon.offset, cfg.cannon.upsideDown))
   ship.freshUntil = os.clock() + 3
 end
 
@@ -705,6 +756,8 @@ local state = {
   missH = nil,       -- player target: signed horizontal / vertical miss
   missV = nil,       --   in blocks (drives the hitbox fire gate)
   lead = nil,        -- player lead debug: { speed, blocks, tof }
+  targetRaw = nil,   -- debug: raw detector/transponder point {x,y,z}
+  aim = nil,         -- debug: final solved aim point after avoid/lead/aimHeight
   roster = {},       -- { {kind, name, x, y, z, dist?}, ... } sorted by distance
   peerShips = {},    -- transponder ships by callsign: {x,y,z,heading,seenAt}
   mount = nil,       -- last block-reader NBT, for the debug tab
@@ -744,12 +797,14 @@ local function refreshStaticCannon()
     end
     if gpsFix then
       local o = cfg.cannon.offset
-      staticCannon = { x = gpsFix.x + o.x, y = gpsFix.y + o.y, z = gpsFix.z + o.z }
+      staticBase = { x = gpsFix.x + o.x, y = gpsFix.y + o.y, z = gpsFix.z + o.z }
+      staticCannon = pivotFromBase(staticBase, cfg.cannon.upsideDown)
     else
       state.flash = transponderModem and "NO GPS FIX" or "NO MODEM"
     end
   else
-    staticCannon = { x = cfg.cannon.x, y = cfg.cannon.y, z = cfg.cannon.z }
+    staticBase = { x = cfg.cannon.x, y = cfg.cannon.y, z = cfg.cannon.z }
+    staticCannon = pivotFromBase(staticBase, cfg.cannon.upsideDown)
   end
 end
 
@@ -1351,30 +1406,52 @@ end
 
 -- ----------------------------------------------------------- calibration --
 
--- Empirically determine the drive sign AND slew rate for one axis: nudge
--- the controller and watch which way (and how far) the mount's angle
--- moves. Tries both directions so it still works when the axis starts
--- resting against a clamp (pitch limits). Returns invert, degPerSecPerRpm.
-local function calibrateAxis(label, controller, nbtKey, wraps)
-  local NUDGE_RPM, NUDGE_SECONDS = 8, 0.6
-  for _, rpm in ipairs({ NUDGE_RPM, -NUDGE_RPM }) do
-    local data = blockReader.getBlockData()
-    local before = data and data[nbtKey]
-    if not before then
-      error(("calibration failed: block reader has no %s -- is it against the cannon mount?")
-        :format(nbtKey), 0)
-    end
-    controller.setTargetSpeed(rpm)
-    sleep(NUDGE_SECONDS)
-    controller.setTargetSpeed(0)
-    sleep(0.2) -- let the angle settle before re-reading
+-- Drive `controller` at `rpm` and POLL the mount angle until it has moved at
+-- least `targetMove` degrees (and for >= MIN_DRIVE seconds, so spin-up doesn't
+-- dominate the rate) or `maxSeconds` elapses. Polling -- rather than nudging a
+-- fixed window and comparing to a fixed absolute threshold -- is what makes
+-- calibration gear-ratio-agnostic: a heavily geared-down mount turns the
+-- reader angle slowly (e.g. 16x reduction = ~0.047 deg/s per RPM), so a fixed
+-- short nudge falls under the old 0.5/0.3 deg thresholds and the move is missed
+-- (calibration stalls and minSpeed over-reads). Returns the signed delta and
+-- the elapsed drive time, measured WHILE driving (before the stop/coast); the
+-- caller stops the motor. delta is 0-ish with elapsed=maxSeconds if it never
+-- moved. Errors only if the block reader can't see the angle at all.
+local MIN_DRIVE = 0.6
+local function driveUntilMove(controller, nbtKey, wraps, rpm, targetMove, maxSeconds)
+  local data = blockReader.getBlockData()
+  local before = data and data[nbtKey]
+  if not before then
+    error(("calibration failed: block reader has no %s -- is it against the cannon mount?")
+      :format(nbtKey), 0)
+  end
+  controller.setTargetSpeed(rpm)
+  local t0, delta, elapsed = os.clock(), 0, 0
+  repeat
+    sleep(0.1)
     local after = blockReader.getBlockData()[nbtKey]
-    local delta = wraps and angleDiff(after, before) or (after - before)
-    if math.abs(delta) >= 0.5 then
+    delta = wraps and angleDiff(after, before) or (after - before)
+    elapsed = os.clock() - t0
+  until (math.abs(delta) >= targetMove and elapsed >= MIN_DRIVE) or elapsed >= maxSeconds
+  controller.setTargetSpeed(0)
+  return delta, elapsed
+end
+
+-- Empirically determine the drive sign AND slew rate for one axis: drive the
+-- controller and watch which way (and how far) the mount's angle moves. Tries
+-- both directions so it still works when the axis starts resting against a
+-- clamp (pitch limits). Returns invert, degPerSecPerRpm.
+local function calibrateAxis(label, controller, nbtKey, wraps)
+  local NUDGE_RPM, MOVE_DEG, MAX_SECONDS = 8, 1.5, 12
+  for _, rpm in ipairs({ NUDGE_RPM, -NUDGE_RPM }) do
+    local delta, elapsed =
+      driveUntilMove(controller, nbtKey, wraps, rpm, MOVE_DEG, MAX_SECONDS)
+    sleep(0.2) -- let the angle settle
+    if math.abs(delta) >= MOVE_DEG then
       local invert = (delta > 0) ~= (rpm > 0)
-      local rate = math.abs(delta) / NUDGE_SECONDS / NUDGE_RPM
-      print(("calibrated %s: %+d RPM moved %+.1f deg -> invert = %s, %.3f deg/s/RPM")
-        :format(label, rpm, delta, tostring(invert), rate))
+      local rate = math.abs(delta) / elapsed / math.abs(rpm)
+      print(("calibrated %s: %+d RPM moved %+.1f deg in %.1fs -> invert = %s, %.3f deg/s/RPM")
+        :format(label, rpm, delta, elapsed, tostring(invert), rate))
       return invert, rate
     end
   end
@@ -1401,7 +1478,7 @@ end
 -- "CannonPitch"), or nil if neither did. Tries the other direction when the
 -- first nudge is blocked by a travel clamp.
 local function whichAxisMoves(controller)
-  local NUDGE_RPM, NUDGE_SECONDS = 8, 0.6
+  local NUDGE_RPM, MOVE_DEG, MAX_SECONDS = 8, 1.0, 12
   for _, rpm in ipairs({ NUDGE_RPM, -NUDGE_RPM }) do
     local before = blockReader.getBlockData()
     local by, bp = before and before.CannonYaw, before and before.CannonPitch
@@ -1410,13 +1487,17 @@ local function whichAxisMoves(controller)
         .. "is it against the cannon mount?", 0)
     end
     controller.setTargetSpeed(rpm)
-    sleep(NUDGE_SECONDS)
+    local t0, dyaw, dpitch, elapsed = os.clock(), 0, 0, 0
+    repeat
+      sleep(0.1)
+      local after = blockReader.getBlockData()
+      dyaw = math.abs(angleDiff(after.CannonYaw, by))
+      dpitch = math.abs(after.CannonPitch - bp)
+      elapsed = os.clock() - t0
+    until dyaw >= MOVE_DEG or dpitch >= MOVE_DEG or elapsed >= MAX_SECONDS
     controller.setTargetSpeed(0)
     sleep(0.2)
-    local after = blockReader.getBlockData()
-    local dyaw = math.abs(angleDiff(after.CannonYaw, by))
-    local dpitch = math.abs(after.CannonPitch - bp)
-    if dyaw >= 0.5 or dpitch >= 0.5 then
+    if dyaw >= MOVE_DEG or dpitch >= MOVE_DEG then
       return dyaw >= dpitch and "CannonYaw" or "CannonPitch"
     end
   end
@@ -1467,23 +1548,19 @@ end
 -- successive probes don't walk it into a limit. Returns the floor in RPM,
 -- or nil if even the top probe didn't move (caller falls back to 1).
 local function probeMinSpeed(label, controller, nbtKey, wraps)
-  local PROBE_SECONDS = 0.5
-  for _, rpm in ipairs({ 0.5, 1, 1.5, 2, 3 }) do
-    local before = blockReader.getBlockData()[nbtKey]
-    controller.setTargetSpeed(rpm)
-    sleep(PROBE_SECONDS)
-    controller.setTargetSpeed(0)
+  -- Integer candidates only: setTargetSpeed floors to a whole RPM, so 0.5/1.5
+  -- would just command 0/1. A small move threshold + generous timeout lets the
+  -- slow drift of a geared-down mount register, so a healthy mount reads its
+  -- true floor of 1 RPM instead of over-reporting when the window is too short.
+  local MOVE_DEG, MAX_SECONDS = 0.1, 6
+  for _, rpm in ipairs({ 1, 2, 3, 4, 5 }) do
+    local delta = driveUntilMove(controller, nbtKey, wraps, rpm, MOVE_DEG, MAX_SECONDS)
     sleep(0.2)
-    local after = blockReader.getBlockData()[nbtKey]
-    local delta = wraps and angleDiff(after, before) or (after - before)
-    if math.abs(delta) >= 0.3 then
-      print(("calibrated %s minSpeed: %.1f RPM moved %.1f deg")
-        :format(label, rpm, delta))
+    if math.abs(delta) >= MOVE_DEG then
+      print(("calibrated %s minSpeed: %d RPM moved %.2f deg"):format(label, rpm, delta))
       return rpm
     end
-    controller.setTargetSpeed(-rpm)   -- step back toward the start
-    sleep(PROBE_SECONDS)
-    controller.setTargetSpeed(0)
+    driveUntilMove(controller, nbtKey, wraps, -rpm, MOVE_DEG, MAX_SECONDS) -- step back
     sleep(0.2)
   end
   return nil
@@ -1703,6 +1780,7 @@ local function setTarget(kind, name)
   state.dist = nil
   state.tof, state.hasArc = nil, nil
   state.impact = nil
+  state.targetRaw, state.aim = nil, nil
   resetLead()
   resetBurst()
   setFiring(false) -- never carry a held fire line across a target change
@@ -1832,10 +1910,18 @@ local CONFIG_ITEMS = {
     show = function() return cfg.lead.enabled end,
     get = function() return cfg.lead.minSpeed end,
     set = function(v) cfg.lead.minSpeed = v end },
-  -- Position (land/static mode only). gps toggles between manual xyz and a
-  -- GPS-fix-plus-offset derivation; static = true re-derives the mount
-  -- position live (refreshStaticCannon) so no reboot is needed. Offsets are
-  -- typed floats (world axes: +x east, +y up, +z south).
+  -- Position. All coords point at the mount BASE block; the launch pivot is
+  -- derived (pivotFromBase). gps toggles manual xyz vs a GPS-fix-plus-offset
+  -- derivation; static = true re-derives the mount live (refreshStaticCannon)
+  -- so no reboot is needed (a no-op in ship mode, where updateShip reads these
+  -- every tick). upsideDown flips the trunnion step for a gun hung below its
+  -- mount. The offset is the SHARED value used by static-gps AND ship mode --
+  -- world axes (x east, y up, z south) static, hull-local (x right, y up,
+  -- z forward) aboard a ship. Typed floats; whole blocks (the 0.5s are added).
+  { group = "Position", label = "upsideDown", etype = "enum", file = "cfg", static = true,
+    values = { false, true },
+    get = function() return cfg.cannon.upsideDown end,
+    set = function(v) cfg.cannon.upsideDown = v end },
   { group = "Position", label = "gps", etype = "enum", file = "cfg", static = true,
     values = { false, true },
     show = function() return not cfg.ship.enabled end,
@@ -1854,15 +1940,15 @@ local CONFIG_ITEMS = {
     get = function() return cfg.cannon.z end,
     set = function(v) cfg.cannon.z = v end },
   { group = "Position", label = "offset x", etype = "float", file = "cfg", static = true,
-    show = function() return not cfg.ship.enabled and cfg.cannon.gps end,
+    show = function() return cfg.ship.enabled or cfg.cannon.gps end,
     get = function() return cfg.cannon.offset.x end,
     set = function(v) cfg.cannon.offset.x = v end },
   { group = "Position", label = "offset y", etype = "float", file = "cfg", static = true,
-    show = function() return not cfg.ship.enabled and cfg.cannon.gps end,
+    show = function() return cfg.ship.enabled or cfg.cannon.gps end,
     get = function() return cfg.cannon.offset.y end,
     set = function(v) cfg.cannon.offset.y = v end },
   { group = "Position", label = "offset z", etype = "float", file = "cfg", static = true,
-    show = function() return not cfg.ship.enabled and cfg.cannon.gps end,
+    show = function() return cfg.ship.enabled or cfg.cannon.gps end,
     get = function() return cfg.cannon.offset.z end,
     set = function(v) cfg.cannon.offset.z = v end },
   -- Arc travel limits (mount-frame degrees; read live by the solver and the
@@ -2301,7 +2387,7 @@ local function f3Facing(heading)
   return mcYaw, n[1], n[2]
 end
 
--- Live numbers for dialing in ship.offset / headingOffset / yawOffset:
+-- Live numbers for dialing in cannon.offset / headingOffset / yawOffset:
 -- everything the aim math sees, raw and derived.
 local function drawDebugScreen(w, h)
   local row = 3
@@ -2333,7 +2419,6 @@ local function drawDebugScreen(w, h)
     local fresh = os.clock() <= ship.freshUntil
     line("ship fix", fresh and "OK" or "STALE",
       fresh and colors.lime or colors.red)
-    line("gps (computer)", fmtPos(ship.pos))
     line("needle rel", fmtDeg(ship.rel))
     line("ship heading", fmtDeg(ship.heading), colors.yellow)
     if ship.heading then
@@ -2343,9 +2428,15 @@ local function drawDebugScreen(w, h)
       line("  as F3", ("%s (%s)  %+.1f"):format(name, axis, mcYaw),
         colors.yellow)
     end
-    line("cannon xyz", fmtPos(ship.cannon), colors.yellow)
-    line("offset f/u/r", ("%g / %g / %g"):format(cfg.ship.offset.forward,
-      cfg.ship.offset.up, cfg.ship.offset.right))
+    -- Position cluster: computer (GPS) -> mount base (computer + offset) ->
+    -- launch pivot (base + trunnion/centre). Walk these top-to-bottom to see
+    -- exactly where each step lands.
+    line("computer xyz", fmtPos(ship.pos))
+    line("mount base xyz", fmtPos(ship.base))
+    line("pivot xyz", fmtPos(ship.cannon), colors.yellow)
+    line("offset r/u/f", ("%g / %g / %g  %s"):format(cfg.cannon.offset.x,
+      cfg.cannon.offset.y, cfg.cannon.offset.z,
+      cfg.cannon.upsideDown and "(inv)" or ""))
     line("headingOffset", cfg.ship.headingOffset)
     if cfg.ship.gimbal ~= "none" then
       if not gimbal then
@@ -2365,7 +2456,16 @@ local function drawDebugScreen(w, h)
   else
     line("mode", cfg.cannon.gps and "static (land), GPS fix"
       or "static (land)")
-    line("cannon xyz", fmtPos(staticCannon), colors.yellow)
+    -- Position cluster: computer (GPS fix, or "manual" when xyz is typed) ->
+    -- mount base -> launch pivot (base + trunnion/centre).
+    line("computer xyz", cfg.cannon.gps and fmtPos(gpsFix) or "manual xyz")
+    line("mount base xyz", fmtPos(staticBase))
+    line("pivot xyz", fmtPos(staticCannon), colors.yellow)
+    if cfg.cannon.gps then
+      line("offset xyz", ("%g / %g / %g  %s"):format(cfg.cannon.offset.x,
+        cfg.cannon.offset.y, cfg.cannon.offset.z,
+        cfg.cannon.upsideDown and "(inv)" or ""))
+    end
   end
   line("yawOffset", cfg.yawOffset)
   line("profile", ("%s %s %.0f b/s"):format(cfg.profile.kind,
@@ -2396,6 +2496,11 @@ local function drawDebugScreen(w, h)
   end
   if state.targetName then
     line("target", state.targetName, colors.cyan)
+    -- Raw detector point vs the point actually solved for. A gap here is
+    -- hitbox aimHeight + lead (players) or the below-transponder drop
+    -- (ships) -- e.g. aim Y is the feet Y raised by aimHeight (centre mass).
+    line("target xyz", fmtPos(state.targetRaw))
+    line("aim xyz", fmtPos(state.aim), colors.cyan)
     line("yaw/pitch err",
       ("%+.1f / %+.1f"):format(state.yawErr, state.pitchErr))
     line("arc", state.outOfArc and "OUT (parked at limit)" or "in",
@@ -2459,8 +2564,8 @@ local function drawDebugScreen(w, h)
     else
       local hb = cfg.playerHitbox
       line("aim miss h/v", state.missH
-        and ("%+.2f / %+.2f (box %g +%g/-%g)"):format(
-          state.missH, state.missV, hb.width, hb.up, hb.down)
+        and ("%+.2f / %+.2f (box w%g h%g @%g)"):format(
+          state.missH, state.missV, hb.width, hb.height, hb.aimHeight)
         or "?", state.locked and colors.lime or colors.yellow)
       if cfg.lead.enabled and state.targetKind == "player" then
         line("lead", state.lead
@@ -2619,8 +2724,8 @@ local function trackLoop()
         state.lost = false
         -- Ship targets: aim below the transponder, never at it (the
         -- broadcast position is the block keeping the target on the air).
-        -- Players: lock the reported (head-level) Y plus aimOffset, led
-        -- to the intercept point when prediction is on.
+        -- Players: the reported point is the FEET, so raise the aim by
+        -- aimHeight (centre of mass) and led to the intercept when on.
         local area, avoid
         local ax, ay, az = pos.x, pos.y, pos.z
         if state.targetKind == "ship" then
@@ -2635,8 +2740,12 @@ local function trackLoop()
             state.lead = { speed = speed, blocks = speed * tof, tof = tof }
             ax, ay, az = p.x, p.y, p.z
           end
-          ay = ay + cfg.playerHitbox.aimOffset
+          ay = ay + cfg.playerHitbox.aimHeight
         end -- coord: aim at the exact point, no lead / no hitbox offset
+        -- DEBUG: the raw detector/transponder point and the final solved
+        -- aim point (after ship-avoid / lead / hitbox aimHeight).
+        state.targetRaw = { x = pos.x, y = pos.y, z = pos.z }
+        state.aim = { x = ax, y = ay, z = az }
         local relYaw, relPitch, dist, tof, hasArc = anglesFor(ax, ay, az)
         if not relYaw then
           -- Stale ship fix: hold rather than aim with old coords/heading.
@@ -2744,26 +2853,26 @@ local function trackLoop()
                 and math.abs(state.pitchErr) < cfg.tolerance * wd
             else
               -- Hitbox gate: fire while the shot would pass through the
-              -- body box hanging below the reported head Y, OR once both
-              -- axes settle inside tolerance (long range, where the box
-              -- subtends less than the deadband). Gate errors are vs the
-              -- TRUE aim solution, not the clamped one -- parked at an
-              -- arc edge, fire only if shots from there would still hit;
-              -- the tolerance lock is meaningless at a clamped setpoint.
-              -- missV is measured from the AIM point, so shift by
-              -- aimOffset back to the head.
+              -- body box rising from the reported feet, OR once both axes
+              -- settle inside tolerance (long range, where the box subtends
+              -- less than the deadband). Gate errors are vs the TRUE aim
+              -- solution, not the clamped one -- parked at an arc edge, fire
+              -- only if shots from there would still hit; the tolerance lock
+              -- is meaningless at a clamped setpoint. missV is measured from
+              -- the AIM point (feet + aimHeight), so the box spans the feet
+              -- (-aimHeight) up to the head (height - aimHeight) around it.
               local hb = cfg.playerHitbox
               state.missH, state.missV = missComponents(
                 angleDiff(relYaw, data.CannonYaw),
                 relPitch - data.CannonPitch, data.CannonPitch, dist)
-              local vHead = state.missV + hb.aimOffset
+              local vLo, vHi = -hb.aimHeight, hb.height - hb.aimHeight
               state.locked = (math.abs(state.missH) <= hb.width / 2
-                  and vHead <= hb.up and vHead >= -hb.down)
+                  and state.missV >= vLo and state.missV <= vHi)
                 or (not state.outOfArc
                   and axisSettled(state.yawErr, cfg.yawDrive, track.loopT)
                   and axisSettled(state.pitchErr, cfg.pitchDrive, track.loopT))
               withinWide = (math.abs(state.missH) <= hb.width / 2 * wd
-                  and vHead <= hb.up * wd and vHead >= -hb.down * wd)
+                  and state.missV >= vLo * wd and state.missV <= vHi * wd)
                 or (not state.outOfArc
                   and math.abs(state.yawErr) < cfg.tolerance * wd
                   and math.abs(state.pitchErr) < cfg.tolerance * wd)
