@@ -10,7 +10,8 @@
 -- heard on the CCMinimap transponder (rednet "airship-state" broadcasts);
 -- click a row to track it, click again or [ STOP ] to release.
 --
--- Keys: F = fire, A = arm/disarm, Q = quit. Mouse/touch for everything else.
+-- Keys: F = fire, A = arm/disarm, K = calibrate+tune, O = capture yawOffset
+-- from the rest pose, L = trace log, Q = quit. Mouse/touch for the rest.
 -- While armed, the fire line is held high whenever both axes are locked on
 -- (autocannon assumption) and dropped the moment lock is lost.
 --
@@ -57,6 +58,10 @@ local DEFAULTS = {
   -- shares the fire relay (fire/assembly/reload on three of its sides);
   -- name a second redstone relay to drive the assembly/reload lines from
   -- there instead. Sides take the usual relative names.
+  -- park = true slews the barrel back to its rest orientation (mount-frame
+  -- 0,0) BEFORE disassembling, holding there until both axes settle or
+  -- parkSeconds elapses -- for builds whose loader only clears at a fixed
+  -- pose. Off by default (tear down wherever the barrel happens to point).
   reload = {
     enabled = false,
     relay = "same",
@@ -64,6 +69,8 @@ local DEFAULTS = {
     reloadSide = "left",
     reloadPulseSeconds = 0.4,
     settleSeconds = 1.0,
+    park = false,
+    parkSeconds = 4.0,
   },
   -- What this cannon is: drives both the fire mode and the ballistics.
   -- kind "autocannon" holds the fire line while the gate is open;
@@ -137,7 +144,8 @@ local DEFAULTS = {
   },
   -- Subtracted from the world-space yaw so 0 matches the cannon's rest
   -- orientation. Most builds land on 90 (the original "facing south"
-  -- cannon), so that's the default; editable in the CONFIG tab.
+  -- cannon), so that's the default; editable in the CONFIG tab, or press
+  -- O / the YAW0 button (reload.enabled) to measure it from the rest pose.
   yawOffset = 90,
   -- Added to the computed pitch, in degrees: -1 aims 1 degree below the
   -- target, +1 above. Plain aim bias -- not a sign fix.
@@ -500,9 +508,18 @@ local relay = resolve(cfg.peripherals.relay, "redstone_relay", "redstone relay")
 -- needed when cfg.reload.enabled, but resolved loudly here at boot so a
 -- typo'd name fails before the first shot rather than mid-reload.
 local reloadRelay = relay
-if cfg.reload.enabled and cfg.reload.relay ~= "same" then
-  reloadRelay = need(cfg.reload.relay, "reload redstone relay")
+-- Re-resolve the assembly/reload relay against the live config. Called at
+-- boot and whenever the reload toggle is edited from the CONFIG tab, so
+-- enabling reload at runtime with a separate relay binds it (instead of
+-- silently driving the fire relay's sides). Errors loudly on a bad name.
+local function refreshReloadRelay()
+  if cfg.reload.enabled and cfg.reload.relay ~= "same" then
+    reloadRelay = need(cfg.reload.relay, "reload redstone relay")
+  else
+    reloadRelay = relay
+  end
 end
+refreshReloadRelay()
 
 -- Airship mode prerequisites: a wireless modem for gps.locate and a
 -- navigation table for heading. Checked loudly at boot, not at first use.
@@ -686,6 +703,7 @@ local state = {
                      -- ACTUAL barrel angle {x,y,z, off, vmiss, tof}
   flash = nil,       -- transient status message (e.g. "FIRED")
   recalRequest = false, -- UI asked for a calibrate+auto-tune; serviced in trackLoop
+  offsetCalRequest = false, -- UI asked for a yaw-offset capture; serviced there too
   calibrating = false,  -- calibrate + auto-tune in progress (status line)
 }
 
@@ -954,14 +972,18 @@ end
 -- target motion / lead / the own ship turning, zero while parked at a
 -- limit), and the AIM-ERROR rates (-> the D term, which damps overshoot).
 -- Error-derivative is primed on the first sample (no kick from a nil prev).
-local function updateRates(aimYaw, aimPitch, yawErr, pitchErr)
+local function updateRates(aimYaw, aimPitch, yawErr, pitchErr, yawWrap)
   local t = os.clock()
   if track.aimT then
     local dt = t - track.aimT
     if dt > 0 and dt < 0.5 then
       local a = dt / (0.15 + dt)
+      -- On a continuous ring the aim point wraps at +/-180; take the
+      -- shortest delta so the feedforward rate doesn't spike at the seam.
+      local yawDelta = yawWrap and angleDiff(aimYaw, track.aimYaw)
+        or (aimYaw - track.aimYaw)
       track.yawRate = track.yawRate
-        + a * ((aimYaw - track.aimYaw) / dt - track.yawRate)
+        + a * (yawDelta / dt - track.yawRate)
       track.pitchRate = track.pitchRate
         + a * ((aimPitch - track.aimPitch) / dt - track.pitchRate)
       if track.yawErrPrev then
@@ -1192,8 +1214,13 @@ local function tickReload(now)
   local p = reloadSeq.phase
   if p == "firing" then
     setFiring(false)        -- end the fire pulse
-    setAssembly(false)      -- disassemble to expose the breech
-    reloadSeq.phase, reloadSeq.at = "disassembled", now + cfg.reload.settleSeconds
+    if cfg.reload.park then
+      -- Slew home before tearing down; tickPark drives + advances out.
+      reloadSeq.phase, reloadSeq.at = "parking", now + cfg.reload.parkSeconds
+    else
+      setAssembly(false)    -- disassemble to expose the breech
+      reloadSeq.phase, reloadSeq.at = "disassembled", now + cfg.reload.settleSeconds
+    end
   elseif p == "disassembled" then
     setReloadLine(true)     -- pulse the loader
     reloadSeq.phase, reloadSeq.at = "pulsing", now + cfg.reload.reloadPulseSeconds
@@ -1208,15 +1235,81 @@ local function tickReload(now)
   end
 end
 
+-- Optional pre-reload park (cfg.reload.park): drive the gun to its rest
+-- pose instead of holding, and tear down only once both axes settle or the
+-- parkSeconds deadline (reloadSeq.at) passes. Yaw parks where the barrel
+-- aims at world-zero (mount-frame -yawOffset, same convention the solver
+-- uses) so it matches the gun's neutral facing rather than the block
+-- reader's raw zero; pitch parks at mount-frame 0 (level), no offset.
+-- Called from the track loop wherever the reload cycle would otherwise hold
+-- the motors, so its drive command is the last word for the tick (it
+-- overrides any aim the targeting block computed). No-op stop otherwise.
+local function tickPark(now)
+  if reloadSeq.phase ~= "parking" then stopMotors(); return end
+  local data = blockReader.getBlockData()
+  local settled = false
+  if data and data.CannonYaw and data.CannonPitch and yaw and pitch then
+    -- Shortest path home: angleDiff handles the continuous-ring +/-180 seam.
+    local yawErr = angleDiff(-cfg.yawOffset, data.CannonYaw)
+    local pitchErr = -data.CannonPitch
+    settled = axisSettled(yawErr, cfg.yawDrive)
+      and axisSettled(pitchErr, cfg.pitchDrive)
+    if settled then
+      stopMotors()
+    else
+      yaw.setTargetSpeed(
+        speedFor(yawErr, cfg.invertYaw, cfg.yawDrive, 0, 0, track.loopT))
+      pitch.setTargetSpeed(
+        speedFor(pitchErr, cfg.invertPitch, cfg.pitchDrive, 0, 0, track.loopT))
+    end
+  else
+    stopMotors()
+  end
+  if settled or now >= reloadSeq.at then
+    stopMotors()
+    setAssembly(false)      -- parked (or timed out): now disassemble
+    reloadSeq.phase, reloadSeq.at = "disassembled", now + cfg.reload.settleSeconds
+  end
+end
+
 -- Human-readable reload state for the status / debug lines.
 local RELOAD_LABEL = {
-  firing = "FIRING", disassembled = "DISASSEMBLING", pulsing = "LOADING",
-  loading = "LOADING", assembling = "ASSEMBLING",
+  firing = "FIRING", parking = "CENTERING", disassembled = "DISASSEMBLING",
+  pulsing = "LOADING", loading = "LOADING", assembling = "ASSEMBLING",
 }
 local function reloadStatus()
   local label = RELOAD_LABEL[reloadSeq.phase]
   if not label then return nil end
   return label, math.max(0, reloadSeq.at - os.clock())
+end
+
+-- Auto-calibrate yawOffset from the gun's rest pose. Disassembly always
+-- snaps a CBC cannon back to one fixed rest orientation regardless of where
+-- it was aiming, so a disassemble/reassemble cycle (motors idle) leaves the
+-- block reader reading that rest yaw -- e.g. 270. The rest IS world-zero, so
+-- worldYaw = CannonYaw + yawOffset = 0 there, giving yawOffset = -restYaw
+-- (normalized). Pitch is left alone (its rest is level / 0). Needs the
+-- assembly relay, so reload.enabled. Returns restYaw, newOffset.
+local function calibrateYawOffset()
+  if cfg.profile.kind ~= "bigcannon" or not cfg.reload.enabled then
+    error("yaw-offset cal needs a bigcannon with reload.enabled (assembly relay)", 0)
+  end
+  if not blockReader then error("no block reader to read the rest yaw", 0) end
+  stopMotors()
+  local settle = math.max(1.0, cfg.reload.settleSeconds) + 0.5
+  setAssembly(false)        -- disassemble: the gun snaps to its rest pose
+  sleep(settle)
+  setAssembly(true)         -- reassemble there so the reader reports rest yaw
+  sleep(settle)
+  local data = blockReader.getBlockData()
+  if not (data and data.CannonYaw) then
+    error("block reader returned no CannonYaw at rest", 0)
+  end
+  local rest = data.CannonYaw
+  cfg.yawOffset = angleDiff(0, rest)   -- = normalize(-rest); 270 -> 90
+  reloadSeq.phase, reloadSeq.at = "ready", 0  -- left assembled, cycle idle
+  writeCfg(cfg)
+  return rest, cfg.yawOffset
 end
 
 -- ----------------------------------------------------------- calibration --
@@ -1656,6 +1749,23 @@ local CONFIG_ITEMS = {
     show = function() return cfg.profile.kind == "bigcannon" end,
     get = function() return cfg.profile.reloadSeconds end,
     set = function(v) cfg.profile.reloadSeconds = v end },
+  { group = "Build", label = "reload enabled", etype = "enum", file = "cfg",
+    values = { true, false }, reloadDep = true,
+    show = function() return cfg.profile.kind == "bigcannon" end,
+    get = function() return cfg.reload.enabled end,
+    set = function(v) cfg.reload.enabled = v end },
+  { group = "Build", label = "reload park", etype = "enum", file = "cfg",
+    values = { true, false },
+    show = function() return cfg.profile.kind == "bigcannon"
+      and cfg.reload.enabled end,
+    get = function() return cfg.reload.park end,
+    set = function(v) cfg.reload.park = v end },
+  { group = "Build", label = "parkSecs", etype = "num", file = "cfg",
+    min = 0, max = 30, step = 0.5,
+    show = function() return cfg.profile.kind == "bigcannon"
+      and cfg.reload.enabled and cfg.reload.park end,
+    get = function() return cfg.reload.parkSeconds end,
+    set = function(v) cfg.reload.parkSeconds = v end },
   { group = "Aim", label = "yawOffset", etype = "num", file = "cfg",
     min = -180, max = 180, step = 5,
     get = function() return cfg.yawOffset end,
@@ -1831,6 +1941,12 @@ local function cfgAdjust(it, dir)
   end
   if it.profile then applyProfileEdit(function() it.set(prev) end) end
   if it.static then refreshStaticCannon() end
+  if it.reloadDep then
+    -- Bind/unbind the assembly relay for the new enabled state; a bad
+    -- separate-relay name reverts the toggle rather than half-applying.
+    local ok, err = pcall(refreshReloadRelay)
+    if not ok then it.set(prev); state.flash = "reload relay: " .. tostring(err) end
+  end
 end
 
 -- Parse a typed value: a "num"/"float" must be numeric (num clamps to
@@ -2355,6 +2471,9 @@ local function drawButtonBar(w, h)
     button(" SAVE ", "cfg_save", colors.lime, dirty)
     button(" CANCEL ", "cfg_cancel", colors.red, dirty)
     button(" CAL ", "recal", colors.yellow, not state.calibrating)
+    if cfg.profile.kind == "bigcannon" and cfg.reload.enabled then
+      button(" YAW0 ", "offsetcal", colors.orange, not state.calibrating)
+    end
     term.setCursorPos(w - 24, h)
     term.setBackgroundColor(colors.black)
     term.setTextColor(colors.gray)
@@ -2369,7 +2488,7 @@ local function drawButtonBar(w, h)
   term.setCursorPos(w - 30, h)
   term.setBackgroundColor(colors.black)
   term.setTextColor(colors.gray)
-  term.write("F=fire A=arm C=xyz K=cal+tune L=log Q=quit")
+  term.write("F=fire A=arm C=xyz K=cal+tune O=yaw0 L=log Q=quit")
 end
 
 local function draw()
@@ -2422,6 +2541,24 @@ local function trackLoop()
       state.calibrating = false
       if not ok then tuneLog("ERROR: " .. tostring(err)) end
       state.flash = ok and "CALIBRATED + AUTO-TUNED" or "CAL/TUNE FAILED (see log)"
+      term.setBackgroundColor(colors.black)
+      term.clear()
+    end
+    -- OFFSET CAL (O): disassemble/reassemble and read the rest yaw to set
+    -- yawOffset. Owns the motors and the assembly relay, so serviced here.
+    if state.offsetCalRequest then
+      state.offsetCalRequest = false
+      state.calibrating = true
+      stopMotors()
+      draw()
+      local ok, rest, off = pcall(calibrateYawOffset)
+      state.calibrating = false
+      if ok then
+        state.flash = ("yawOffset = %.0f (rest yaw %.0f)"):format(off, rest)
+      else
+        tuneLog("ERROR: " .. tostring(rest))
+        state.flash = "OFFSET CAL FAILED (see log)"
+      end
       term.setBackgroundColor(colors.black)
       term.clear()
     end
@@ -2517,15 +2654,24 @@ local function trackLoop()
             -- ~-180 and clamp to the WRONG edge, swinging the barrel all
             -- the way across the arc.
             local lim = cfg.limits
-            local yawMid = (lim.yaw.min + lim.yaw.max) / 2
-            local cy = yawMid + angleDiff(data.CannonYaw, yawMid)
-            local tgtYaw = yawMid + angleDiff(relYaw, yawMid)
-            local aimYaw = math.max(lim.yaw.min,
-              math.min(tgtYaw, lim.yaw.max))
+            -- A full-circle arc (span ~360) is a continuous slew ring with no
+            -- forbidden zone: skip the clamp and drive the SHORTEST path across
+            -- the +/-180 seam (angleDiff error) instead of the unwrapped long
+            -- way around. Bounded arcs keep the unwrapped error below.
+            local yawFull = (lim.yaw.max - lim.yaw.min) >= 359
+            local cy, tgtYaw, aimYaw
+            if yawFull then
+              cy, tgtYaw, aimYaw = data.CannonYaw, relYaw, relYaw
+            else
+              local yawMid = (lim.yaw.min + lim.yaw.max) / 2
+              cy = yawMid + angleDiff(data.CannonYaw, yawMid)
+              tgtYaw = yawMid + angleDiff(relYaw, yawMid)
+              aimYaw = math.max(lim.yaw.min, math.min(tgtYaw, lim.yaw.max))
+            end
             local aimPitch = math.max(lim.pitch.min,
               math.min(relPitch, lim.pitch.max))
             state.outOfArc = aimYaw ~= tgtYaw or aimPitch ~= relPitch
-            state.yawErr = aimYaw - cy
+            state.yawErr = yawFull and angleDiff(aimYaw, cy) or (aimYaw - cy)
             state.pitchErr = aimPitch - data.CannonPitch
             local withinWide -- widened gate, feeds the burst hysteresis
             local wd = cfg.burst.widen
@@ -2578,7 +2724,7 @@ local function trackLoop()
             end
             state.bursting = burstGate(state.locked, withinWide)
               and not state.locked
-            updateRates(aimYaw, aimPitch, state.yawErr, state.pitchErr)
+            updateRates(aimYaw, aimPitch, state.yawErr, state.pitchErr, yawFull)
             -- Live control-loop period -- the overshoot guard caps the
             -- approach speed against it, so it tracks the real (peripheral-
             -- limited) rate instead of assuming cfg.trackSeconds.
@@ -2594,8 +2740,17 @@ local function trackLoop()
               cfg.yawDrive, track.yawRate, track.yawErrRate, track.loopT)
             local pitchRpm = speedFor(state.pitchErr, cfg.invertPitch,
               cfg.pitchDrive, track.pitchRate, track.pitchErrRate, track.loopT)
-            yaw.setTargetSpeed(yawRpm)
-            pitch.setTargetSpeed(pitchRpm)
+            -- While a reload cycle runs the motors belong to tickReload /
+            -- tickPark (below). Driving the aim here would fight them -- the
+            -- barrel runs toward the target during tickPark's block-reader
+            -- yield before the park command corrects it, so it never settles
+            -- on 0,0. The aim math above still feeds the status/lock display.
+            if not reloadActive() then
+              yaw.setTargetSpeed(yawRpm)
+              pitch.setTargetSpeed(pitchRpm)
+            else
+              yawRpm, pitchRpm = 0, 0
+            end
             traceRow(aimYaw, data.CannonYaw, yawRpm,
               aimPitch, data.CannonPitch, pitchRpm)
           else
@@ -2622,10 +2777,12 @@ local function trackLoop()
           -- Physical reload: fire only from a fully assembled gun; while
           -- the cycle runs the contraption is gone, so hold the drive
           -- (tickReload at the loop top advances the relay sequence).
+          -- tickPark holds at a stop unless the optional pre-reload park is
+          -- mid-slew, in which case it drives the barrel home instead.
           if reloadSeq.phase == "ready" then
             if gate then startShot(os.clock()) end
           else
-            stopMotors()
+            tickPark(os.clock())
           end
         else
           -- Autoloader path: one firePulseSeconds pulse per shot, next
@@ -2649,7 +2806,9 @@ local function trackLoop()
       -- Always yields at least one tick.
       sleep(math.max(0.05, cfg.trackSeconds - (os.clock() - loopStart)))
     else
-      stopMotors()
+      -- A park started before the target dropped still slews home and
+      -- tears down; every other state just holds the motors stopped.
+      tickPark(os.clock())
       -- Don't cut a fire pulse short or fight an in-flight reload cycle.
       if not reloadActive() then setFiring(false) end
       -- Idle aim loop doesn't touch the mount; keep the debug tab live.
@@ -2684,6 +2843,8 @@ local function handleCommand(cell)
     setTarget(state.targetKind, state.targetName) -- toggle off
   elseif cell.cmd == "recal" then
     state.recalRequest = true
+  elseif cell.cmd == "offsetcal" then
+    state.offsetCalRequest = true
   elseif cell.cmd == "cfg_select" then
     ui.cfgSel = cell.idx
   elseif cell.cmd == "cfg_inc" then
@@ -2782,6 +2943,7 @@ local function handleGlobalKey(k)
   elseif k == keys.a then toggleArm()
   elseif k == keys.c then ui.prompt = { kind = "coord", text = "", swallow = true }
   elseif k == keys.k then state.recalRequest = true -- calibrate + auto-tune
+  elseif k == keys.o then state.offsetCalRequest = true -- capture yawOffset at rest
   elseif k == keys.l then
     if trace.on then traceStop() else traceStart() end
   elseif k == keys.q then running = false
