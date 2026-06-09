@@ -57,12 +57,17 @@ local STROKE_DELAY = 0.25    -- seconds between place/ram strokes so the
 
 -- Restock: the turtle faces the breech, so the side chests are reached by
 -- turning. Left chest = shells, right chest = charges (per your build). After
--- topping up it turns back, ending where it started. Targets are how full to
--- keep each slot; getItemSpace caps these so a non-stacking item never spills.
+-- topping up it turns back, ending where it started.
+--
+-- Targets are how full to keep each slot -- the turtle pulls the DIFFERENCE
+-- between the current count and the target, so it refills whatever the last
+-- shot used (it does NOT need to be empty; a +0 just means the slot is already
+-- at/above target). Defaults "fill the slot": getItemSpace caps the pull at the
+-- stack max, so a non-stacking shell never spills and a huge target is safe.
 local RESTOCK = {
   enabled = true,
-  shellTarget = 4,    -- keep slot 2 topped to this many shells
-  chargeTarget = 12,  -- keep slot 3 topped to this many charges (4 cycles)
+  shellTarget = 64,   -- keep slot 2 as full as the stack allows
+  chargeTarget = 64,  -- keep slot 3 as full as the stack allows
 }
 
 ---------------------------------------------------------------------------
@@ -168,8 +173,12 @@ local function restock()
   turtle.turnRight()
   local c = pullInto(SLOT.charge, RESTOCK.chargeTarget)
   turtle.turnLeft()
-  print(("Restocked: +%d shell(s), +%d charge(s) (slot2=%d, slot3=%d)."):format(
-    s, c, count(SLOT.shell), count(SLOT.charge)))
+  -- current/target makes a 0 self-explanatory: "16/64 (+0)" = already stocked,
+  -- whereas "0/64 (+0)" = nothing pulled despite an empty slot -> the barrel is
+  -- empty or isn't directly in front after the turn (check the side/height).
+  print(("Restocked: shells %d/%d (+%d), charges %d/%d (+%d)."):format(
+    count(SLOT.shell), RESTOCK.shellTarget, s,
+    count(SLOT.charge), RESTOCK.chargeTarget, c))
 end
 
 -- Run one load, then restock, each guarded so a failure in either still leaves
