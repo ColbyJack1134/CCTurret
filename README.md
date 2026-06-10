@@ -65,7 +65,15 @@ derived position.
 
 ## Airship mode
 
-Set `ship.enabled = true` in `cannon.cfg`. Requires a wireless modem
+Set `ship.enabled = true` — either in `cannon.cfg`, or live on the
+**CONFIG** tab's **Ship** group (toggling it there re-resolves the nav
+table and gimbal on the spot, and reverts with a flash if either is
+missing rather than half-applying). The Ship group also edits
+`headingOffset`, `navTable`, `gimbal`, and the gimbal axis map
+(pitch/roll axis, inverts, level rests); the mount lever arm is the
+Position group's `offset` rows (shown in ship mode). `headingOffset` and
+the gimbal map apply immediately — dial them against the DEBUG tab's
+heading / ship pitch / ship roll readouts. Requires a wireless modem
 (GPS) and a navigation table (heading, CCMinimap needle math with
 `ship.headingOffset` correction). The cannon's world position is derived
 each half-second from the computer's GPS fix plus `ship.offset` — the
@@ -187,8 +195,9 @@ ignored if found in `cannon.cfg`, copying a `cannon.cfg` to a new turret
 never carries the old one's home position — it's re-measured per mount.
 
 The **CONFIG** tab edits all of it live, no quitting to a text editor.
-Rows are grouped (Build / Aim / Position / Arc limits / Drive /
-Calibrated; calibrated rows are orange). Tap a row to select it, then use
+Rows are grouped (Build / Aim / Position / Ship / Arc limits / Drive /
+Calibrated; calibrated rows are orange). The Ship group (ship mode +
+heading/nav/gimbal) only shows its detail rows once ship mode is on. Tap a row to select it, then use
 its `[-]`/`[+]` steppers (numbers) or `<`/`>` (enums like `material`,
 `arc`, `kind`), or `[=]` to type a value; arrow keys work too. Some
 fields are **type-only** (just `[=]`, no steppers): the mount position /

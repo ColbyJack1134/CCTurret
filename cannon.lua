@@ -825,6 +825,44 @@ local function refreshStaticCannon()
   end
 end
 
+-- (Re)resolve the ship nav source + gimbal for the current cfg.ship settings,
+-- or tear them down and rebuild the static position when ship mode is off.
+-- The boot path above does the same resolution but fails loudly; this one
+-- SOFT-fails (returns ok, err) so the CONFIG tab can toggle ship mode live
+-- and revert a bad edit instead of leaving updateShip with a nil nav source
+-- (which it would then call every tick). Assigns navSource/gimbal atomically
+-- at the end so a mid-way failure leaves the previous binding intact.
+local function refreshShip()
+  if not cfg.ship.enabled then
+    navSource, gimbal = nil, nil
+    refreshStaticCannon()
+    return true
+  end
+  if not transponderModem then
+    return false, "ship mode needs a wireless modem (gps.locate)"
+  end
+  local ns = Heading.discover(
+    cfg.ship.navTable ~= "auto" and cfg.ship.navTable or nil)
+  if not ns then
+    return false, "no navigation table found (set navTable)"
+  end
+  local gm
+  if cfg.ship.gimbal == "none" then
+    gm = nil
+  elseif cfg.ship.gimbal ~= "auto" then
+    local ok, g = pcall(need, cfg.ship.gimbal, "gimbal sensor")
+    if not ok then
+      return false, "gimbal '" .. tostring(cfg.ship.gimbal) .. "' not found"
+    end
+    gm = g
+  else
+    gm = peripheral.find("gimbal_sensor") -- nil tolerated in auto mode
+  end
+  navSource, gimbal = ns, gm
+  ship.freshUntil = 0 -- force a fresh updateShip before the next aim
+  return true
+end
+
 -- ---------------------------------------------------------------- aiming --
 
 -- Smallest signed angle from `current` to `target`, in [-180, 180].
@@ -1989,6 +2027,59 @@ local CONFIG_ITEMS = {
     show = function() return cfg.ship.enabled or cfg.cannon.gps end,
     get = function() return cfg.cannon.offset.z end,
     set = function(v) cfg.cannon.offset.z = v end },
+  -- Airship mounting. `ship mode` toggles GPS+heading derivation live (shipDep
+  -- re-resolves the nav table + gimbal; reverts if they're missing). The mount
+  -- lever arm is the Position `offset` rows above (hull-local forward/up/right
+  -- when ship mode is on). headingOffset + the gimbal map are read every tick,
+  -- so those edits apply immediately; tune them against the DEBUG tab's heading
+  -- / ship pitch / ship roll readouts.
+  { group = "Ship", label = "ship mode", etype = "enum", file = "cfg", shipDep = true,
+    values = { false, true },
+    get = function() return cfg.ship.enabled end,
+    set = function(v) cfg.ship.enabled = v end },
+  { group = "Ship", label = "headingOffset", etype = "num", file = "cfg",
+    min = -180, max = 180, step = 1,
+    show = function() return cfg.ship.enabled end,
+    get = function() return cfg.ship.headingOffset end,
+    set = function(v) cfg.ship.headingOffset = v end },
+  { group = "Ship", label = "navTable", etype = "text", file = "cfg", shipDep = true,
+    show = function() return cfg.ship.enabled end,
+    get = function() return cfg.ship.navTable end,
+    set = function(v) cfg.ship.navTable = v end },
+  { group = "Ship", label = "gimbal", etype = "text", file = "cfg", shipDep = true,
+    show = function() return cfg.ship.enabled end,
+    get = function() return cfg.ship.gimbal end,
+    set = function(v) cfg.ship.gimbal = v end },
+  { group = "Ship", label = "gimbal pitch ax", etype = "enum", file = "cfg",
+    values = { "x", "z" },
+    show = function() return cfg.ship.enabled and cfg.ship.gimbal ~= "none" end,
+    get = function() return cfg.ship.gimbalMap.pitch end,
+    set = function(v) cfg.ship.gimbalMap.pitch = v end },
+  { group = "Ship", label = "gimbal roll ax", etype = "enum", file = "cfg",
+    values = { "x", "z" },
+    show = function() return cfg.ship.enabled and cfg.ship.gimbal ~= "none" end,
+    get = function() return cfg.ship.gimbalMap.roll end,
+    set = function(v) cfg.ship.gimbalMap.roll = v end },
+  { group = "Ship", label = "invert pitch", etype = "enum", file = "cfg",
+    values = { false, true },
+    show = function() return cfg.ship.enabled and cfg.ship.gimbal ~= "none" end,
+    get = function() return cfg.ship.gimbalMap.invertPitch end,
+    set = function(v) cfg.ship.gimbalMap.invertPitch = v end },
+  { group = "Ship", label = "invert roll", etype = "enum", file = "cfg",
+    values = { false, true },
+    show = function() return cfg.ship.enabled and cfg.ship.gimbal ~= "none" end,
+    get = function() return cfg.ship.gimbalMap.invertRoll end,
+    set = function(v) cfg.ship.gimbalMap.invertRoll = v end },
+  { group = "Ship", label = "pitch rest", etype = "num", file = "cfg",
+    min = -45, max = 45, step = 0.5,
+    show = function() return cfg.ship.enabled and cfg.ship.gimbal ~= "none" end,
+    get = function() return cfg.ship.gimbalMap.pitchRest end,
+    set = function(v) cfg.ship.gimbalMap.pitchRest = v end },
+  { group = "Ship", label = "roll rest", etype = "num", file = "cfg",
+    min = -45, max = 45, step = 0.5,
+    show = function() return cfg.ship.enabled and cfg.ship.gimbal ~= "none" end,
+    get = function() return cfg.ship.gimbalMap.rollRest end,
+    set = function(v) cfg.ship.gimbalMap.rollRest = v end },
   -- Arc travel limits (mount-frame degrees; read live by the solver and the
   -- slew clamps, so edits take effect immediately). Typed floats.
   { group = "Arc limits", label = "yaw min", etype = "float", file = "cfg",
@@ -2121,6 +2212,13 @@ local function cfgAdjust(it, dir)
     -- separate-relay name reverts the toggle rather than half-applying.
     local ok, err = pcall(refreshReloadRelay)
     if not ok then it.set(prev); state.flash = "reload relay: " .. tostring(err) end
+  end
+  if it.shipDep then
+    -- Re-resolve nav table + gimbal for the new ship setting; on failure
+    -- revert the edit AND re-refresh so the reverted state stays consistent
+    -- (never leave updateShip pointed at a nil nav source).
+    local ok, err = refreshShip()
+    if not ok then it.set(prev); refreshShip(); state.flash = "ship: " .. tostring(err) end
   end
 end
 
@@ -3109,6 +3207,10 @@ local function commitPrompt()
       it.set(v)
       if it.profile then applyProfileEdit(function() it.set(prev) end) end
       if it.static then refreshStaticCannon() end
+      if it.shipDep then
+        local ok, why2 = refreshShip()
+        if not ok then it.set(prev); refreshShip(); state.flash = "ship: " .. tostring(why2) end
+      end
     end
     ui.prompt = nil
   else
