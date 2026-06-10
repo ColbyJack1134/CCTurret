@@ -1858,12 +1858,19 @@ local function refreshRoster()
     local pos = entDet.getPlayerPos(name, 2)
     if pos and pos.x then
       item.x, item.y, item.z = pos.x, pos.y, pos.z
+      -- AP also reports facing (MC convention: yaw 0 = south, pitch + =
+      -- down); pass it through so the Spruce 3D view can orient the
+      -- player marker. Older AP builds just omit the fields.
+      item.yaw, item.pitch = tonumber(pos.yaw), tonumber(pos.pitch)
     end
     add(item)
   end
   for name, peer in pairs(state.peerShips) do
     if peerFresh(peer) then
-      add({ kind = "ship", name = name, x = peer.x, y = peer.y, z = peer.z })
+      -- heading comes from CCMinimap airship-state broadcasts (compass
+      -- degrees, 0 = north); the private transponder beacons have none.
+      add({ kind = "ship", name = name, x = peer.x, y = peer.y, z = peer.z,
+        heading = peer.heading })
     else
       state.peerShips[name] = nil
     end
