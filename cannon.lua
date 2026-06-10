@@ -3292,9 +3292,22 @@ local function buildSpruceStatus()
     mount = (mount and mount.CannonYaw and mount.CannonPitch)
       and { yaw = mount.CannonYaw, pitch = mount.CannonPitch } or nil,
     -- World facing of the mount's zero; "auto" until first calibration,
-    -- and the browser can't draw the arc wedge without a number.
-    rest = type(cfg.yawOffset) == "number"
-      and { yawOffset = cfg.yawOffset } or nil,
+    -- and the browser can't draw the arc wedge without a number. In ship
+    -- mode mount.yaw is DECK-relative, and on a flat deck the barrel's
+    -- world azimuth is shipHeading + CannonYaw + yawOffset (atan2(dz,dx)
+    -- frame) -- fold the live heading in here so the browser needs no
+    -- ship awareness and the arc wedge swings with the deck. Deck roll/
+    -- pitch are not unwound (the few degrees at hover shave accuracy of
+    -- the DISPLAY only; the solver handles them for real aiming).
+    rest = (function()
+      if type(cfg.yawOffset) ~= "number" then return nil end
+      local off = cfg.yawOffset
+      if cfg.ship.enabled then
+        if type(ship.heading) ~= "number" then return nil end -- no fix yet
+        off = off + ship.heading
+      end
+      return { yawOffset = off }
+    end)(),
     limits = cfg.limits,
     status = {
       armed = state.armed, locked = state.locked, lost = state.lost,
@@ -3302,6 +3315,7 @@ local function buildSpruceStatus()
       outOfRange = state.outOfRange, firing = state.firing,
       hasArc = state.hasArc, calibrating = state.calibrating,
       reloadPhase = reloadSeq.phase,
+      shipMode = cfg.ship.enabled,
     },
     gun = {
       kind = cfg.profile.kind, projectile = cfg.profile.projectile,
