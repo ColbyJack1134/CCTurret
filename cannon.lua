@@ -1424,6 +1424,12 @@ end
 -- pre-reload park and the idle/lost return-to-rest path.
 local function driveToRest()
   local data = blockReader.getBlockData()
+  -- Keep the reported mount pose live while homing/idle too. Before this,
+  -- state.mount was only written in the tracking branch (and the local
+  -- DEBUG tab), so Spruce saw a frozen/missing barrel pose the moment the
+  -- turret went idle. (When motors are stopped elsewhere -- e.g. target
+  -- lost -- the last value stays correct because nothing is moving.)
+  state.mount = data
   if not (data and data.CannonYaw and data.CannonPitch and yaw and pitch) then
     stopMotors()
     return false
