@@ -2015,15 +2015,21 @@ local CONFIG_ITEMS = {
     show = function() return not cfg.ship.enabled and not cfg.cannon.gps end,
     get = function() return cfg.cannon.z end,
     set = function(v) cfg.cannon.z = v end },
-  { group = "Position", label = "offset x", etype = "float", file = "cfg", static = true,
+  -- The offset's axes mean different things by mode, so the labels follow:
+  -- aboard a ship it's hull-local right/up/forward (left/back = negative);
+  -- in static-gps mode it's world x/y/z (x east, y up, z south). Same keys.
+  { group = "Position", static = true, etype = "float", file = "cfg",
+    label = function() return cfg.ship.enabled and "offset right" or "offset x" end,
     show = function() return cfg.ship.enabled or cfg.cannon.gps end,
     get = function() return cfg.cannon.offset.x end,
     set = function(v) cfg.cannon.offset.x = v end },
-  { group = "Position", label = "offset y", etype = "float", file = "cfg", static = true,
+  { group = "Position", static = true, etype = "float", file = "cfg",
+    label = function() return cfg.ship.enabled and "offset up" or "offset y" end,
     show = function() return cfg.ship.enabled or cfg.cannon.gps end,
     get = function() return cfg.cannon.offset.y end,
     set = function(v) cfg.cannon.offset.y = v end },
-  { group = "Position", label = "offset z", etype = "float", file = "cfg", static = true,
+  { group = "Position", static = true, etype = "float", file = "cfg",
+    label = function() return cfg.ship.enabled and "offset fwd" or "offset z" end,
     show = function() return cfg.ship.enabled or cfg.cannon.gps end,
     get = function() return cfg.cannon.offset.z end,
     set = function(v) cfg.cannon.offset.z = v end },
@@ -2182,6 +2188,12 @@ local function cfgValueStr(it)
   return tostring(v)
 end
 
+-- A row's label, allowing a function so a label can adapt to the mode (e.g.
+-- the mount offset reads as right/up/forward aboard a ship, x/y/z on land).
+local function cfgLabel(it)
+  return type(it.label) == "function" and it.label() or it.label
+end
+
 -- Re-resolve the gun after a profile edit; revert via `restore` and flash if
 -- the new value won't render (steppers clamp, so this only bites a typo).
 local function applyProfileEdit(restore)
@@ -2317,7 +2329,7 @@ local function drawConfigScreen(w, h)
       term.setTextColor(selected and colors.white or colors.lightGray)
       term.write(selected and ">" or " ")
       term.setTextColor(it.file == "cal" and colors.orange or colors.lightGray)
-      term.write((" %-" .. (LBL - 2) .. "s"):format(it.label:sub(1, LBL - 2)))
+      term.write((" %-" .. (LBL - 2) .. "s"):format(cfgLabel(it):sub(1, LBL - 2)))
       local function btn(text, cmd, col)
         term.setCursorPos(col, row)
         term.setBackgroundColor(selected and colors.gray or colors.black)
@@ -3132,7 +3144,7 @@ end
 local function openCfgEdit(idx)
   local it = visibleConfigItems()[idx]
   if not it then return end
-  ui.prompt = { kind = "cfg", idx = idx, text = cfgValueStr(it), label = it.label }
+  ui.prompt = { kind = "cfg", idx = idx, text = cfgValueStr(it), label = cfgLabel(it) }
 end
 
 local function handleCommand(cell)

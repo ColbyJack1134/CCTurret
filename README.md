@@ -71,7 +71,9 @@ table and gimbal on the spot, and reverts with a flash if either is
 missing rather than half-applying). The Ship group also edits
 `headingOffset`, `navTable`, `gimbal`, and the gimbal axis map
 (pitch/roll axis, inverts, level rests); the mount lever arm is the
-Position group's `offset` rows (shown in ship mode). `headingOffset` and
+Position group's offset rows, which relabel to `offset right` / `up` /
+`fwd` in ship mode (hull-local; left/back = negative) versus world
+`offset x` / `y` / `z` in static-GPS mode. `headingOffset` and
 the gimbal map apply immediately — dial them against the DEBUG tab's
 heading / ship pitch / ship roll readouts. Requires a wireless modem
 (GPS) and a navigation table (heading, CCMinimap needle math with
