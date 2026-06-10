@@ -1372,8 +1372,8 @@ local function recordShot()
     if type(ship.heading) ~= "number" then return end -- no heading, no world frame
     off = off + ship.heading
   end
-  local pos = cannonPos()
-  if not pos then return end
+  local p = cannonPos()
+  if not p then return end
   -- Autocannons hold the fire line for a continuous stream; cap the ring
   -- at ~3 records/s so the payload stays light (the browser animates a
   -- representative stream, not literally every round).
@@ -1385,7 +1385,11 @@ local function recordShot()
     id = spruceShotSeq,
     ts = os.epoch("utc"),
     clock = now, -- local TTL prune only (buildSpruceStatus)
-    pos = pos,
+    -- COPY the position: cannonPos() returns a shared table
+    -- (staticCannon / ship.cannon), and serialiseJSON refuses any table
+    -- that appears twice in one payload -- the status body also carries
+    -- cannonPos(), and every shot would otherwise share this reference.
+    pos = { x = p.x, y = p.y, z = p.z },
     yaw = mount.CannonYaw + off, -- world azimuth, atan2(dz,dx) frame
     pitch = mount.CannonPitch,
     v0 = muzzleSpeed,
@@ -1985,30 +1989,71 @@ local function setCoordTarget(c)
   setTarget("coord", ("%g, %g, %g"):format(c.x, c.y, c.z))
 end
 
+-- Can this turret actually put a shell on the contact RIGHT NOW: a real
+-- ballistic solution within the pitch limits (anglesFor/solveArc), the
+-- contact inside the auto-fire range gate, and the solved yaw/pitch
+-- inside the travel limits (same midpoint-re-centered clamp test the
+-- track loop uses, so off-center arcs like 0..180 judge the correct
+-- edge). Used to gate sentry acquisition -- a lock the fire gate could
+-- never open just swings the barrel at someone we can't hit.
+local function sentryCanHit(c)
+  if not (c.x and c.y and c.z) then return false end
+  local relYaw, relPitch, dist, _, hasArc = anglesFor(c.x, c.y, c.z)
+  if relYaw == nil then return false end -- no cannon fix
+  if not hasArc then return false end
+  if dist > cfg.maxDistance then return false end
+  local lim = cfg.limits
+  if (lim.yaw.max - lim.yaw.min) < 359 then
+    local yawMid = (lim.yaw.min + lim.yaw.max) / 2
+    local ty = yawMid + angleDiff(relYaw, yawMid)
+    if ty < lim.yaw.min or ty > lim.yaw.max then return false end
+  end
+  if relPitch < lim.pitch.min or relPitch > lim.pitch.max then return false end
+  return true
+end
+
 -- Local sentry acquisition. When Spruce flags this turret as a sentry (ctl
--- on the status response), grab the nearest non-friendly contact from our
+-- on the status response), grab the nearest HITTABLE non-friendly from our
 -- OWN roster the moment one appears: the ~1s roster tick beats the C2
 -- round-trip, so first lock doesn't wait on the server. The brain still
 -- coordinates -- a remote "target" command overrides our pick (e.g. to
--- distribute two hostiles across two turrets). Acquire-only with one
--- exception: we release a target WE picked once the roster loses it, so a
--- sentry stands back down on its own; operator/brain-set targets are never
--- touched.
+-- distribute two hostiles across two turrets). We only ever release a
+-- target WE picked: when the roster loses it, or when it stays
+-- unhittable (lost / out of arc / out of range / no solution) for a few
+-- seconds -- the grace keeps a target dancing on the range edge from
+-- flapping the barrel between lock and rest. Operator/brain-set targets
+-- are never touched.
+local SENTRY_DROP_SECONDS = 2.5
 local function sentryAcquire()
   if state.calibrating then return end
-  -- Stand down our own pick when the roster no longer carries it.
+  -- Stand down our own pick when the roster loses it or it stays
+  -- unhittable past the grace window.
   if state.sentryTarget then
     if state.sentryTarget ~= state.targetName then
       state.sentryTarget = nil -- operator/brain retargeted; theirs now
+      state.sentryBadSince = nil
     else
       local still = false
       for _, c in ipairs(state.roster or {}) do
         if c.name == state.targetName then still = true break end
       end
-      if not still then
+      local bad = not still or state.lost or state.outOfArc
+        or state.outOfRange or state.hasArc == false
+      if not bad then
+        state.sentryBadSince = nil
+      elseif not still then -- gone from the roster entirely: drop now
         state.sentryTarget = nil
+        state.sentryBadSince = nil
         setTarget(nil)
         state.flash = "SENTRY: contact lost"
+      else
+        state.sentryBadSince = state.sentryBadSince or os.clock()
+        if os.clock() - state.sentryBadSince > SENTRY_DROP_SECONDS then
+          state.sentryTarget = nil
+          state.sentryBadSince = nil
+          setTarget(nil)
+          state.flash = "SENTRY: target unreachable"
+        end
       end
     end
   end
@@ -2016,9 +2061,10 @@ local function sentryAcquire()
   local fr = state.spruceFriendlies or {}
   for _, c in ipairs(state.roster or {}) do -- sorted nearest-first
     if (c.kind == "player" or c.kind == "ship") and not fr[c.name]
-        and c.dist and c.dist <= cfg.maxDistance then
+        and sentryCanHit(c) then
       setTarget(c.kind, c.name)
       state.sentryTarget = c.name
+      state.sentryBadSince = nil
       state.flash = "SENTRY: engaging " .. c.name
       return
     end
@@ -3571,9 +3617,22 @@ local function spruceLoop()
 
   local down = false
   while running do
+    -- Build + serialise under pcall: a telemetry bug (e.g. a shared table
+    -- reference serialiseJSON refuses) must flash loudly on the turret
+    -- screen, NOT crash the parallel stack and take the gun down. The gun
+    -- keeps tracking and firing; C2 retries next tick.
+    local okBody, body = pcall(function()
+      return textutils.serialiseJSON(buildSpruceStatus())
+    end)
     -- One round-trip per tick: pending commands ride the status response.
-    local reply = rpc(urlStatus, textutils.serialiseJSON(buildSpruceStatus()))
-    if reply then
+    local reply = okBody and rpc(urlStatus, body)
+    if not okBody then
+      -- Not a link problem -- OUR payload is broken. Flash the real error
+      -- (don't fall into the LINK DOWN branch, which would mask it) and
+      -- keep ticking; tracking/firing are unaffected.
+      state.flash = "SPRUCE STATUS ERR: " .. tostring(body)
+      sleep(spruceCfg.statusSeconds)
+    elseif reply then
       -- Sentry control rides every status response: stance + the server's
       -- friendlies list, consumed by sentryAcquire() in trackLoop.
       local ctl = reply.ctl
