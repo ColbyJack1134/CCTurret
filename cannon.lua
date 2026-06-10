@@ -528,10 +528,11 @@ if fs.exists(TURRETCFG) then
     url = (t.url:gsub("/+$", "")),
     token = t.token,
     callsign = t.callsign,
-    -- Report cadence. Deliberately much slower than the ~0.25s control
-    -- loop so C2 never competes with tracking accuracy; commands ride the
-    -- status response, so this is also the command latency. Floor of 1s.
-    statusSeconds = math.max(1, tonumber(t.statusSeconds) or 2),
+    -- Report cadence. Deliberately slower than the ~0.25s control loop so
+    -- C2 never competes with tracking accuracy; commands ride the status
+    -- response, so this is also the command latency. Default 1s (sentry
+    -- acquisition is local now, so C2 only coordinates); floor of 1s.
+    statusSeconds = math.max(1, tonumber(t.statusSeconds) or 1),
   }
 end
 
@@ -797,6 +798,14 @@ local state = {
   bursting = false,  -- fire line held by burst hysteresis past a closed gate
   armed = false,     -- auto-fire master switch (ARM button / A key)
   firing = false,    -- fire line currently held high by auto-fire
+  -- Spruce sentry control, pushed down on every status response (ctl field)
+  -- so local acquisition never waits on a C2 round-trip. All default-off:
+  -- a turret with no Spruce link behaves exactly as before.
+  spruceSentry = false,    -- server says: auto-acquire hostiles locally
+  spruceFriendlies = {},   -- name -> true, server's do-not-engage list
+  sentryTarget = nil,      -- name WE acquired (vs operator/brain-set), so
+                           -- local release only ever drops our own pick
+  rebootRequest = false,   -- remote reboot, serviced after the ack POST
   yawErr = 0,
   pitchErr = 0,
   dist = nil,        -- distance to the aim point in blocks
@@ -1345,6 +1354,44 @@ local function stopAll()
   reloadSeq.phase, reloadSeq.at = "ready", 0
 end
 
+-- Phase 4 (Spruce bullets): ring of recent fire events riding the status
+-- payload. Each records the firing SOLUTION at trigger time -- world
+-- yaw/pitch, muzzle speed, launch pivot -- not a precomputed arc: the
+-- browser integrates the same CBC tick model it already draws aim arcs
+-- with, which also sidesteps state.impact being static-mode-only.
+local spruceShots = {}
+local spruceShotSeq = 0
+local lastShotRecord = -math.huge
+local function recordShot()
+  if not spruceCfg then return end -- standalone turret: no bookkeeping
+  local mount = state.mount
+  if not (mount and mount.CannonYaw and mount.CannonPitch) then return end
+  if type(cfg.yawOffset) ~= "number" then return end
+  local off = cfg.yawOffset
+  if cfg.ship.enabled then
+    if type(ship.heading) ~= "number" then return end -- no heading, no world frame
+    off = off + ship.heading
+  end
+  local pos = cannonPos()
+  if not pos then return end
+  -- Autocannons hold the fire line for a continuous stream; cap the ring
+  -- at ~3 records/s so the payload stays light (the browser animates a
+  -- representative stream, not literally every round).
+  local now = os.clock()
+  if now - lastShotRecord < 0.33 then return end
+  lastShotRecord = now
+  spruceShotSeq = spruceShotSeq + 1
+  spruceShots[#spruceShots + 1] = {
+    id = spruceShotSeq,
+    ts = os.epoch("utc"),
+    clock = now, -- local TTL prune only (buildSpruceStatus)
+    pos = pos,
+    yaw = mount.CannonYaw + off, -- world azimuth, atan2(dz,dx) frame
+    pitch = mount.CannonPitch,
+    v0 = muzzleSpeed,
+  }
+end
+
 -- Manual single pulse (F key / FIRE button).
 local function fire()
   if state.firing then return end -- auto-fire already holds the line high
@@ -1357,6 +1404,7 @@ local function fire()
     state.flash = "FIRED"
     return
   end
+  recordShot()
   relay.setOutput(cfg.fireSide, true)
   sleep(cfg.firePulseSeconds)
   relay.setOutput(cfg.fireSide, false)
@@ -1369,6 +1417,9 @@ end
 local function setFiring(on)
   if state.firing == on then return end
   state.firing = on
+  -- Rising edge = a shot leaves (autocannon stream start / each autoloader
+  -- or reload-cycle pulse); the held-line stream re-records from trackLoop.
+  if on then recordShot() end
   relay.setOutput(cfg.fireSide, on)
 end
 
@@ -1932,6 +1983,46 @@ end
 local function setCoordTarget(c)
   state.coordTarget = c
   setTarget("coord", ("%g, %g, %g"):format(c.x, c.y, c.z))
+end
+
+-- Local sentry acquisition. When Spruce flags this turret as a sentry (ctl
+-- on the status response), grab the nearest non-friendly contact from our
+-- OWN roster the moment one appears: the ~1s roster tick beats the C2
+-- round-trip, so first lock doesn't wait on the server. The brain still
+-- coordinates -- a remote "target" command overrides our pick (e.g. to
+-- distribute two hostiles across two turrets). Acquire-only with one
+-- exception: we release a target WE picked once the roster loses it, so a
+-- sentry stands back down on its own; operator/brain-set targets are never
+-- touched.
+local function sentryAcquire()
+  if state.calibrating then return end
+  -- Stand down our own pick when the roster no longer carries it.
+  if state.sentryTarget then
+    if state.sentryTarget ~= state.targetName then
+      state.sentryTarget = nil -- operator/brain retargeted; theirs now
+    else
+      local still = false
+      for _, c in ipairs(state.roster or {}) do
+        if c.name == state.targetName then still = true break end
+      end
+      if not still then
+        state.sentryTarget = nil
+        setTarget(nil)
+        state.flash = "SENTRY: contact lost"
+      end
+    end
+  end
+  if not state.spruceSentry or state.targetName then return end
+  local fr = state.spruceFriendlies or {}
+  for _, c in ipairs(state.roster or {}) do -- sorted nearest-first
+    if (c.kind == "player" or c.kind == "ship") and not fr[c.name]
+        and c.dist and c.dist <= cfg.maxDistance then
+      setTarget(c.kind, c.name)
+      state.sentryTarget = c.name
+      state.flash = "SENTRY: engaging " .. c.name
+      return
+    end
+  end
 end
 
 -- ------------------------------------------------------------- config tab --
@@ -2877,7 +2968,13 @@ local function trackLoop()
     if cfg.ship.enabled and (state.targetName or tick % shipIdleTicks == 0) then
       updateShip()
     end
-    if tick % rosterTicks == 0 then refreshRoster() end
+    if tick % rosterTicks == 0 then
+      refreshRoster()
+      sentryAcquire()
+    end
+    -- Held fire line (autocannon stream): keep the shot ring fed while
+    -- rounds are leaving. recordShot self-throttles to ~3/s.
+    if state.firing then recordShot() end
     tick = tick + 1
     -- Serviced here (not in the input loop) because calibration drives the
     -- motors and must not race the aim commands. pcall so a failed wiggle
@@ -3261,10 +3358,10 @@ end
 -- (one flash when the link first drops) -- a dead server must not take the
 -- local UI or tracking down with it.
 
--- Recent fire events for the browser's projectile animation. Pruned to the
--- last ~5s here; actual appends are wired where the fire line pulses
--- (phase 4), so the ring stays empty for now.
-local spruceShots = {}
+-- The recent-fire-events ring (spruceShots) is declared next to the fire
+-- path -- appends happen at the relay edges (fire/setFiring/trackLoop),
+-- which all run before this section; only the 5s prune lives here, in
+-- buildSpruceStatus.
 
 local function spruceCallsign()
   return (spruceCfg and spruceCfg.callsign)
@@ -3405,6 +3502,13 @@ local SPRUCE_COMMANDS = {
     state.recalRequest = true
     return true
   end,
+  reboot = function()
+    -- Deferred until after the ack POST (spruceLoop) so the operator log
+    -- shows the command landed; the self-updating startup then pulls the
+    -- current turret file set on the way back up.
+    state.rebootRequest = true
+    return true
+  end,
   target = function(params)
     if params.kind == "coord" then
       local x, y, z = tonumber(params.x), tonumber(params.y), tonumber(params.z)
@@ -3470,6 +3574,17 @@ local function spruceLoop()
     -- One round-trip per tick: pending commands ride the status response.
     local reply = rpc(urlStatus, textutils.serialiseJSON(buildSpruceStatus()))
     if reply then
+      -- Sentry control rides every status response: stance + the server's
+      -- friendlies list, consumed by sentryAcquire() in trackLoop.
+      local ctl = reply.ctl
+      if type(ctl) == "table" then
+        state.spruceSentry = ctl.sentry == true
+        local fr = {}
+        if type(ctl.friendlies) == "table" then
+          for _, n in ipairs(ctl.friendlies) do fr[n] = true end
+        end
+        state.spruceFriendlies = fr
+      end
       local items = reply.items
       if type(items) == "table" and #items > 0 then
         -- Every drained item gets an ack (ok or err) so the operator log
@@ -3480,6 +3595,7 @@ local function spruceLoop()
           acks[#acks + 1] = { id = item.id, cmd = item.cmd, ok = okCmd, err = err }
         end
         rpc(urlAck, textutils.serialiseJSON({ acks = acks }))
+        if state.rebootRequest then os.reboot() end
       end
       if down then down = false; state.flash = "SPRUCE LINK UP" end
       sleep(spruceCfg.statusSeconds)
