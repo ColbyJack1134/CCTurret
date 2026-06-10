@@ -528,6 +528,10 @@ if fs.exists(TURRETCFG) then
     url = (t.url:gsub("/+$", "")),
     token = t.token,
     callsign = t.callsign,
+    -- Report cadence. Deliberately much slower than the ~0.25s control
+    -- loop so C2 never competes with tracking accuracy; commands ride the
+    -- status response, so this is also the command latency. Floor of 1s.
+    statusSeconds = math.max(1, tonumber(t.statusSeconds) or 2),
   }
 end
 
@@ -3290,6 +3294,9 @@ local function buildSpruceStatus()
       kind = cfg.profile.kind, projectile = cfg.profile.projectile,
       arc = cfg.profile.arc, muzzleSpeed = muzzleSpeed,
       maxDistance = cfg.maxDistance,
+      -- Physics constants + muzzle offset so the browser can integrate
+      -- the same trajectory the solver uses (3D arc preview / phase 4).
+      gravity = proj.gravity, drag = proj.drag, muzzleLen = muzzleLen,
     },
     roster = jsonList(state.roster),
     shots = jsonList(spruceShots),
@@ -3306,28 +3313,150 @@ local function buildSpruceStatus()
   return payload
 end
 
+-- Phase 2: remote commands. The outbox drains each tick and dispatches
+-- through the same internals the local UI uses. Drive-touching work
+-- (calibrate) only sets the state.*Request flags trackLoop services --
+-- spruceLoop must never own the motors. fire() pulses the relay directly,
+-- exactly like the local F key does from inputLoop.
+
+local function findCfgItem(label)
+  local hit = nil
+  for _, it in ipairs(CONFIG_ITEMS) do
+    if cfgLabel(it) == label then
+      if hit then return nil, "ambiguous config label: " .. label end
+      hit = it
+    end
+  end
+  if not hit then return nil, "no config item labeled " .. tostring(label) end
+  return hit
+end
+
+-- Remote config edit: same parse/validate/side-effect path as the local
+-- CONFIG tab (commitPrompt/cfgAdjust), then an immediate save -- there is
+-- no remote CANCEL, so an applied edit must not sit unsaved.
+local function applySetcfg(params)
+  local it, err = findCfgItem(tostring(params.label or ""))
+  if not it then return false, err end
+  local v, why = parseCfgValue(it, tostring(params.value))
+  if v == nil then return false, why or "bad value" end
+  local prev = it.get()
+  it.set(v)
+  if it.profile and not applyProfileEdit(function() it.set(prev) end) then
+    return false, "value rejected by profile"
+  end
+  if it.static then refreshStaticCannon() end
+  if it.reloadDep then
+    local ok, e = pcall(refreshReloadRelay)
+    if not ok then it.set(prev); return false, "reload relay: " .. tostring(e) end
+  end
+  if it.shipDep then
+    local ok, e = refreshShip()
+    if not ok then it.set(prev); refreshShip(); return false, "ship: " .. tostring(e) end
+  end
+  cfgSave()
+  return true
+end
+
+local SPRUCE_COMMANDS = {
+  arm = function()
+    if not state.armed then toggleArm() end
+    return true
+  end,
+  disarm = function()
+    if state.armed then toggleArm() end
+    return true
+  end,
+  stop = function()
+    setTarget(nil)
+    return true
+  end,
+  fire = function()
+    fire()
+    return true
+  end,
+  calibrate = function()
+    state.recalRequest = true
+    return true
+  end,
+  target = function(params)
+    if params.kind == "coord" then
+      local x, y, z = tonumber(params.x), tonumber(params.y), tonumber(params.z)
+      if not (x and y and z) then return false, "coord target needs numeric x,y,z" end
+      setCoordTarget({ x = x, y = y, z = z })
+      return true
+    elseif params.kind == "player" or params.kind == "ship" then
+      local name = tostring(params.name or "")
+      if name == "" then return false, "target needs a name" end
+      -- setTarget toggles off when re-selecting the current target (local
+      -- click-again-to-release); a remote "target" means SET, so no-op
+      -- instead of toggling when it's already the target.
+      if not (state.targetKind == params.kind and state.targetName == name) then
+        setTarget(params.kind, name)
+      end
+      return true
+    end
+    return false, "unknown target kind: " .. tostring(params.kind)
+  end,
+  setcfg = applySetcfg,
+}
+
+local function dispatchSpruceCmd(item)
+  local fn = SPRUCE_COMMANDS[item.cmd]
+  if not fn then return false, "unknown cmd: " .. tostring(item.cmd) end
+  local ok, res, why = pcall(fn, item.params or {})
+  if not ok then return false, tostring(res) end
+  if res ~= true then return false, why or "rejected" end
+  return true
+end
+
 local function spruceLoop()
   if not spruceCfg then
     while running do sleep(1) end
     return
   end
-  local url = spruceCfg.url .. "/api/drone/turret/status"
   local headers = {
     ["Content-Type"] = "application/json",
     ["Authorization"] = "Bearer " .. spruceCfg.token,
   }
+  local urlStatus = spruceCfg.url .. "/api/drone/turret/status"
+  local urlAck = spruceCfg.url .. "/api/drone/turret/ack"
+
+  -- POST returning the decoded JSON table, or nil on any transport/HTTP
+  -- failure. http.post only hands back a handle on 2xx; non-2xx arrives
+  -- as the 4th value and both need closing or CC leaks the connection.
+  -- The http call yields while in flight, so trackLoop keeps running.
+  local function rpc(url, body)
+    local ok, res, _, errRes = pcall(http.post, url, body, headers)
+    if not ok or not res then
+      if ok and errRes then pcall(errRes.close) end
+      return nil
+    end
+    local raw = res.readAll()
+    pcall(res.close)
+    local okJson, parsed = pcall(textutils.unserialiseJSON, raw or "")
+    if okJson and type(parsed) == "table" then return parsed end
+    return {}
+  end
+
   local down = false
   while running do
-    local body = textutils.serialiseJSON(buildSpruceStatus())
-    -- http.post only hands back a handle on 2xx; non-2xx arrives as the
-    -- 4th value and both need closing or CC leaks the connection.
-    local ok, res, _, errRes = pcall(http.post, url, body, headers)
-    if ok and res then
-      pcall(res.close)
+    -- One round-trip per tick: pending commands ride the status response.
+    local reply = rpc(urlStatus, textutils.serialiseJSON(buildSpruceStatus()))
+    if reply then
+      local items = reply.items
+      if type(items) == "table" and #items > 0 then
+        -- Every drained item gets an ack (ok or err) so the operator log
+        -- shows what actually happened.
+        local acks = {}
+        for _, item in ipairs(items) do
+          local okCmd, err = dispatchSpruceCmd(item)
+          acks[#acks + 1] = { id = item.id, cmd = item.cmd, ok = okCmd, err = err }
+        end
+        rpc(urlAck, textutils.serialiseJSON({ acks = acks }))
+      end
       if down then down = false; state.flash = "SPRUCE LINK UP" end
-      sleep(1)
+      sleep(spruceCfg.statusSeconds)
     else
-      if ok and errRes then pcall(errRes.close) end
       if not down then down = true; state.flash = "SPRUCE LINK DOWN" end
       sleep(5)
     end
