@@ -41,10 +41,15 @@ hands-off now:
 - Muzzle speed is **computed**, never typed — set the gun's `material`
   and `barrels` (autocannon) or `charges` (bigcannon) and the b/s is
   derived from the CBC formula (see **Cannon profile**).
-- `yawOffset` defaults to `90` (most builds), `cannon` position is the
-  only thing you usually still set by hand (or `cannon.gps = true`).
-- Drive sign, slew rate (`degPerSecPerRpm`), and the `minSpeed` floor are
-  all measured by the wiggle and live in `cannon.cal`.
+- `yawOffset` (the home/rest facing) is **measured**, not typed: it
+  defaults to `"auto"`, and calibration reads the assembled rest yaw off
+  the block reader — the first thing it does, before any rotation, since
+  the gun reports its rest angle the moment it's assembled — and saves it
+  to `cannon.cal`. So `cannon` position is the only thing you usually
+  still set by hand (or `cannon.gps = true`), and a `cannon.cfg` copied
+  to a second turret won't drag the first one's home position along.
+- Drive sign, slew rate (`degPerSecPerRpm`), the `minSpeed` floor, and
+  `yawOffset` are all measured by calibration and live in `cannon.cal`.
 
 Everything calibrated lands in `cannon.cal`, which is safe to delete — the
 **CAL** button (or `K`) rebuilds it. Edit any of it live on the **CONFIG**
@@ -79,7 +84,10 @@ trace, `Q` quit. On the CONFIG tab the arrow keys navigate (↑/↓ select a
 row, ←/→ adjust it) and Enter opens a text edit; the single-key actions
 (`F`/`A`/`C`/`K`/`L`/`Q`) work on every tab. The turret
 continuously tracks the selected player; `LOCKED` means both axes are
-within `tolerance`. While **armed** (ARM button or `A`; disarmed by
+within `tolerance`. With no target (or once a target is LOST) the barrel
+returns to its neutral rest pose — yaw to its rest facing, pitch level —
+rather than freezing where it last aimed; clear a target with **STOP**.
+While **armed** (ARM button or `A`; disarmed by
 default) the fire line is held high whenever the turret is locked on and
 dropped the moment lock is lost — autocannon behavior; a pulse/reload
 mode for regular cannons is planned.
@@ -171,9 +179,12 @@ Config lives in two files. `cannon.cfg` is **hand-authored intent** — the
 gun profile, aim offsets, tolerances, travel limits, ship/reload wiring.
 `cannon.cal` is **machine-measured** — the resolved yaw/pitch controller
 names, the drive sign (`invertYaw`/`invertPitch`), the slew rate
-(`degPerSecPerRpm`), and the `minSpeed` floor. The wiggle writes only
+(`degPerSecPerRpm`), the `minSpeed` floor, and `yawOffset` (the home/rest
+facing, read from the assembled rest yaw). Calibration writes only
 `cannon.cal`; it's safe to delete (the **CAL** button rebuilds it) and
-keeps the hand-edited config clean.
+keeps the hand-edited config clean. Because `yawOffset` lives here and is
+ignored if found in `cannon.cfg`, copying a `cannon.cfg` to a new turret
+never carries the old one's home position — it's re-measured per mount.
 
 The **CONFIG** tab edits all of it live, no quitting to a text editor.
 Rows are grouped (Build / Aim / Position / Arc limits / Drive /
@@ -274,6 +285,26 @@ transponder but no closer than `avoidRadius`. Hull hits anywhere in
 that ring fire immediately while the barrel keeps converging on the
 center; the transponder block itself is never fired on. The status
 line shows the live miss distance while closing in.
+
+### Private beacon (`transponder.lua`)
+
+To put a ship on the turret's roster *without* it appearing on
+CCMinimap, run `transponder.lua` on a turtle (or computer) with a
+wireless modem and place it aboard. It GPS-locates itself and
+broadcasts its position every 0.5 s on a **private** rednet protocol
+(`cannon-transponder`) instead of CCMinimap's `airship-state` — the
+minimap only listens for the latter, so the beacon never shows up
+there, but the turret tracks it exactly like any other transponder
+ship (and Spruce's sniffer still sees it). Handy for marking a test
+target you want to shoot at without lighting it up on everyone's map.
+
+Run `transponder.lua [callsign]` — the optional callsign is the
+`#callsign` shown in the roster (defaults to the computer label, else
+`beacon-<id>`). It needs a GPS constellation in range (the same one
+CCMinimap uses); with none it prints `NO GPS FIX` and holds rather than
+broadcasting stale coords, so the turret honestly shows the target as
+lost. It carries position only (no heading — the ship-target aim
+doesn't need one).
 
 ## Travel limits
 

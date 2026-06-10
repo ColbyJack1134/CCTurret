@@ -157,10 +157,14 @@ local DEFAULTS = {
     },
   },
   -- Subtracted from the world-space yaw so 0 matches the cannon's rest
-  -- orientation. Most builds land on 90 (the original "facing south"
-  -- cannon), so that's the default; editable in the CONFIG tab, or press
-  -- O / the YAW0 button (reload.enabled) to measure it from the rest pose.
-  yawOffset = 90,
+  -- orientation -- i.e. it IS the home/rest facing. A CALIBRATED value
+  -- (cannon.cal): "auto" makes calibrate() measure it from the assembled
+  -- rest yaw before any rotation (the block reader reports it the moment
+  -- the gun is assembled, no wiggle needed), so each mount gets its own and
+  -- a copied cannon.cfg never carries another cannon's home. Editable in the
+  -- CONFIG tab (Calibrated group); set back to "auto" to re-measure, or
+  -- press O (reload.enabled) to capture it from a fresh disassemble cycle.
+  yawOffset = "auto",
   -- Added to the computed pitch, in degrees: -1 aims 1 degree below the
   -- target, +1 above. Plain aim bias -- not a sign fix.
   pitchOffset = 0,
@@ -314,6 +318,7 @@ local CAL_PATHS = {
   { "invertYaw" }, { "invertPitch" },
   { "yawDrive", "degPerSecPerRpm" }, { "yawDrive", "minSpeed" },
   { "pitchDrive", "degPerSecPerRpm" }, { "pitchDrive", "minSpeed" },
+  { "yawOffset" }, -- measured from the assembled rest yaw, per mount
 }
 
 local function readFile(p)
@@ -405,6 +410,13 @@ local function writeCal(c) writeFile(CALFILE, Cfg.jsonPretty(calView(c)) .. "\n"
 local function loadConfig()
   local cfgFile = readJSON(CONFIG) or {}
   local calFile = readJSON(CALFILE)
+
+  -- yawOffset is now a CALIBRATED value (the home/rest facing, auto-measured
+  -- into cannon.cal). Drop any copy lingering in cannon.cfg -- including the
+  -- old hand-authored default -- so a cannon.cfg copied from another turret
+  -- doesn't drag its home position along; it's re-measured for this mount
+  -- (and migration below won't lift the stale value into cal either).
+  cfgFile.yawOffset = nil
 
   -- Migration from the old single-file scheme: no cannon.cal yet but the
   -- cfg file carries measured values -> lift them out so a tuned
@@ -585,6 +597,11 @@ end
 -- doubles as the receiver; without one the roster just lists no ships
 -- (ship.enabled already requires a wireless modem anyway).
 local STATE_PROTOCOL = "airship-state"
+-- A private transponder protocol for our own lightweight beacons
+-- (transponder.lua on a turtle): the turret tracks these, but CCMinimap
+-- only listens on STATE_PROTOCOL, so a beacon on this protocol stays off
+-- the minimap roster while still showing up here and in Spruce's sniffer.
+local BEACON_PROTOCOL = "cannon-transponder"
 local PEER_TTL = 5  -- seconds without a broadcast before a ship is dropped
 local transponderModem = peripheral.find("modem",
   function(_, m) return m.isWireless() end)
@@ -1327,36 +1344,42 @@ local function tickReload(now)
   end
 end
 
+-- Drive both axes toward the neutral rest pose and report whether they've
+-- settled there (motors stopped once they have). Yaw parks where the barrel
+-- aims at world-zero (mount-frame -yawOffset, same convention the solver
+-- uses) so it matches the gun's neutral facing rather than the block reader's
+-- raw zero; pitch parks at mount-frame 0 (level), no offset. Shortest path
+-- home: angleDiff handles the continuous-ring +/-180 seam. Shared by the
+-- pre-reload park and the idle/lost return-to-rest path.
+local function driveToRest()
+  local data = blockReader.getBlockData()
+  if not (data and data.CannonYaw and data.CannonPitch and yaw and pitch) then
+    stopMotors()
+    return false
+  end
+  local yawErr = angleDiff(-cfg.yawOffset, data.CannonYaw)
+  local pitchErr = -data.CannonPitch
+  if axisSettled(yawErr, cfg.yawDrive, track.loopT)
+    and axisSettled(pitchErr, cfg.pitchDrive, track.loopT) then
+    stopMotors()
+    return true
+  end
+  yaw.setTargetSpeed(
+    speedFor(yawErr, cfg.invertYaw, cfg.yawDrive, 0, 0, track.loopT))
+  pitch.setTargetSpeed(
+    speedFor(pitchErr, cfg.invertPitch, cfg.pitchDrive, 0, 0, track.loopT))
+  return false
+end
+
 -- Optional pre-reload park (cfg.reload.park): drive the gun to its rest
 -- pose instead of holding, and tear down only once both axes settle or the
--- parkSeconds deadline (reloadSeq.at) passes. Yaw parks where the barrel
--- aims at world-zero (mount-frame -yawOffset, same convention the solver
--- uses) so it matches the gun's neutral facing rather than the block
--- reader's raw zero; pitch parks at mount-frame 0 (level), no offset.
--- Called from the track loop wherever the reload cycle would otherwise hold
--- the motors, so its drive command is the last word for the tick (it
--- overrides any aim the targeting block computed). No-op stop otherwise.
+-- parkSeconds deadline (reloadSeq.at) passes. Called from the track loop
+-- wherever the reload cycle would otherwise hold the motors, so its drive
+-- command is the last word for the tick (it overrides any aim the targeting
+-- block computed). No-op stop outside the parking phase.
 local function tickPark(now)
   if reloadSeq.phase ~= "parking" then stopMotors(); return end
-  local data = blockReader.getBlockData()
-  local settled = false
-  if data and data.CannonYaw and data.CannonPitch and yaw and pitch then
-    -- Shortest path home: angleDiff handles the continuous-ring +/-180 seam.
-    local yawErr = angleDiff(-cfg.yawOffset, data.CannonYaw)
-    local pitchErr = -data.CannonPitch
-    settled = axisSettled(yawErr, cfg.yawDrive, track.loopT)
-      and axisSettled(pitchErr, cfg.pitchDrive, track.loopT)
-    if settled then
-      stopMotors()
-    else
-      yaw.setTargetSpeed(
-        speedFor(yawErr, cfg.invertYaw, cfg.yawDrive, 0, 0, track.loopT))
-      pitch.setTargetSpeed(
-        speedFor(pitchErr, cfg.invertPitch, cfg.pitchDrive, 0, 0, track.loopT))
-    end
-  else
-    stopMotors()
-  end
+  local settled = driveToRest()
   if settled or now >= reloadSeq.at then
     stopMotors()
     setAssembly(false)      -- parked (or timed out): now disassemble
@@ -1400,7 +1423,7 @@ local function calibrateYawOffset()
   local rest = data.CannonYaw
   cfg.yawOffset = angleDiff(0, rest)   -- = normalize(-rest); 270 -> 90
   reloadSeq.phase, reloadSeq.at = "ready", 0  -- left assembled, cycle idle
-  writeCfg(cfg)
+  writeCal(cfg)                        -- yawOffset is a calibrated value
   return rest, cfg.yawOffset
 end
 
@@ -1572,7 +1595,24 @@ end
 -- (not cannon.cfg). An explicit (non-auto) invert flag is kept even when
 -- the rate triggers the nudge.
 local function calibrate()
-  local changed = resolveDrives()
+  -- Home/rest facing FIRST, before anything rotates the mount. A freshly
+  -- assembled cannon sits at its rest yaw and the block reader reports it
+  -- directly, so yawOffset = -restYaw (mount-frame 0 = the rest facing) needs
+  -- no wiggle -- which is why this runs ahead of resolveDrives / the axis
+  -- wiggle. Only when "auto" (unset, or reset to re-measure), so an already
+  -- calibrated mount isn't re-read off-rest on a later boot.
+  local changed = false
+  if cfg.yawOffset == "auto" then
+    if not blockReader then error("no block reader to read the rest yaw", 0) end
+    local data = blockReader.getBlockData()
+    if not (data and type(data.CannonYaw) == "number") then
+      error("can't read the rest yaw (no CannonYaw) -- is the cannon assembled?", 0)
+    end
+    cfg.yawOffset = angleDiff(0, data.CannonYaw) -- = normalize(-rest); 270 -> 90
+    print(("Rest yaw %.1f -> yawOffset %.1f"):format(data.CannonYaw, cfg.yawOffset))
+    changed = true
+  end
+  if resolveDrives() then changed = true end
   -- Names from cal are wrapped at load; this only fires on an edge case.
   if not yaw then yaw = need(cfg.peripherals.yaw, "yaw speed controller") end
   if not pitch then pitch = need(cfg.peripherals.pitch, "pitch speed controller") end
@@ -1683,6 +1723,8 @@ end
 local function recalibrate()
   cfg.invertYaw, cfg.yawDrive.degPerSecPerRpm = "auto", "auto"
   cfg.invertPitch, cfg.pitchDrive.degPerSecPerRpm = "auto", "auto"
+  -- Re-measure the home/rest facing too (barrel sits at rest while idle).
+  cfg.yawOffset = "auto"
   calibrate()
   track.loopT = measureLoopPeriod()
   runAutotune()
@@ -1881,10 +1923,6 @@ local CONFIG_ITEMS = {
       and cfg.reload.enabled and cfg.reload.park end,
     get = function() return cfg.reload.parkSeconds end,
     set = function(v) cfg.reload.parkSeconds = v end },
-  { group = "Aim", label = "yawOffset", etype = "num", file = "cfg",
-    min = -180, max = 180, step = 5,
-    get = function() return cfg.yawOffset end,
-    set = function(v) cfg.yawOffset = v end },
   { group = "Aim", label = "pitchOffset", etype = "num", file = "cfg",
     min = -45, max = 45, step = 1,
     get = function() return cfg.pitchOffset end,
@@ -2026,6 +2064,11 @@ local CONFIG_ITEMS = {
     min = 0.1, max = 10, step = 0.5,
     get = function() return cfg.pitchDrive.minSpeed end,
     set = function(v) cfg.pitchDrive.minSpeed = v end },
+  -- The home/rest facing, measured from the assembled rest yaw. A number
+  -- pins it; type "auto" to re-measure on the next CAL / boot.
+  { group = "Calibrated", label = "yawOffset", etype = "text", file = "cal",
+    get = function() return cfg.yawOffset end,
+    set = function(v) cfg.yawOffset = v end },
 }
 
 -- Items visible for the current kind (Build items gate on the gun type).
@@ -2921,7 +2964,9 @@ local function trackLoop()
         state.locked = false
         state.bursting = false
         resetBurst()
-        stopMotors()
+        -- Nothing to track: return to the neutral rest pose, unless a reload
+        -- cycle owns the motors (handled in the auto-fire block below).
+        if reloadActive() then stopMotors() else driveToRest() end
       end
       -- Auto-fire actuation. The gate additionally requires a real
       -- ballistic solution -- NO ARC means the barrel is only posing.
@@ -2961,18 +3006,25 @@ local function trackLoop()
       -- Always yields at least one tick.
       sleep(math.max(0.05, cfg.trackSeconds - (os.clock() - loopStart)))
     else
-      -- A park started before the target dropped still slews home and
-      -- tears down; every other state just holds the motors stopped.
-      tickPark(os.clock())
+      -- No target. A reload cycle (incl. a pre-reload park slewing home)
+      -- owns the motors; otherwise return the barrel to its neutral rest
+      -- pose instead of freezing wherever it last aimed.
+      local homing = false
+      if reloadActive() then
+        tickPark(os.clock())
+      else
+        homing = not driveToRest()
+      end
       -- Don't cut a fire pulse short or fight an in-flight reload cycle.
       if not reloadActive() then setFiring(false) end
-      -- Idle aim loop doesn't touch the mount; keep the debug tab live.
+      -- Keep the debug tab's mount line live.
       if ui.activeTab == "debug" then
         state.mount = blockReader.getBlockData()
       end
       draw()
-      -- Tick fast while a reload runs so its phase deadlines stay crisp.
-      sleep(reloadActive() and cfg.trackSeconds or 0.5)
+      -- Tick fast while a reload runs OR while slewing home so deadlines and
+      -- the rest-drive control loop stay crisp; otherwise idle slowly.
+      sleep((reloadActive() or homing) and cfg.trackSeconds or 0.5)
     end
     state.flash = nil
   end
@@ -3033,8 +3085,12 @@ local function rednetLoop()
     return
   end
   while running do
-    local _, msg = rednet.receive(STATE_PROTOCOL, 1.0)
-    if msg then handlePeerState(msg) end
+    -- Listen for any protocol, then accept CCMinimap ship state OR our own
+    -- private beacons; both feed the same peer-ship roster.
+    local _, msg, proto = rednet.receive(nil, 1.0)
+    if msg and (proto == STATE_PROTOCOL or proto == BEACON_PROTOCOL) then
+      handlePeerState(msg)
+    end
   end
 end
 

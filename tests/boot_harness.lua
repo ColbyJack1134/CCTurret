@@ -222,7 +222,8 @@ if cfg and cal then
   check("cfg has NO yawDrive.degPerSecPerRpm", cfg.yawDrive and cfg.yawDrive.degPerSecPerRpm == nil)
   check("cfg keeps yawDrive.speedGain", cfg.yawDrive and cfg.yawDrive.speedGain ~= nil)
   check("cfg keeps profile.material steel", cfg.profile and cfg.profile.material == "steel")
-  check("cfg keeps yawOffset = 90", cfg.yawOffset == 90)
+  check("cfg has NO yawOffset (cal key now)", cfg.yawOffset == nil)
+  check("cal yawOffset measured from rest yaw (number)", type(cal.yawOffset) == "number")
   check("cfg peripherals has NO yaw (cal key)", cfg.peripherals and cfg.peripherals.yaw == nil)
   check("cal invertYaw measured (boolean)", type(cal.invertYaw) == "boolean")
   check("cal degPerSecPerRpm ~ 0.75",
@@ -242,6 +243,7 @@ reset({
       reloadSeconds = 5, muzzleVelocityOverride = 0 } },
   ["cannon.cal"] = { peripherals = { yaw = "Create_RotationSpeedController_1",
       pitch = "Create_RotationSpeedController_0" }, invertYaw = true, invertPitch = false,
+      yawOffset = 45,
       yawDrive = { degPerSecPerRpm = 0.9, minSpeed = 2 },
       pitchDrive = { degPerSecPerRpm = 0.6, minSpeed = 1 } },
 })
@@ -255,6 +257,8 @@ if cal2 then
     cal2.yawDrive and cal2.yawDrive.degPerSecPerRpm == 0.9,
     tostring(cal2.yawDrive and cal2.yawDrive.degPerSecPerRpm))
   check("kept invertYaw = true", cal2.invertYaw == true)
+  check("kept saved yawOffset = 45 (not re-measured to rest 0)",
+    cal2.yawOffset == 45, tostring(cal2.yawOffset))
 end
 
 -- == Scenario 3: migration from an OLD single-file cannon.cfg ==
@@ -290,6 +294,9 @@ if cfg3 and cal3 then
   check("peripheral names lifted into cal",
     cal3.peripherals and cal3.peripherals.yaw == "Create_RotationSpeedController_1")
   check("invertYaw removed from cfg after migration", cfg3.invertYaw == nil)
+  check("legacy cfg yawOffset 90 NOT carried (re-measured from rest)",
+    cfg3.yawOffset == nil and cal3.yawOffset == 0,
+    ("cfg=%s cal=%s"):format(tostring(cfg3.yawOffset), tostring(cal3.yawOffset)))
 end
 
 print(fails == 0 and "ALL PASS" or (fails .. " FAILURES"))
