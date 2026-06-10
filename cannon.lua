@@ -42,6 +42,10 @@ local DEFAULTS = {
     playerDetector = "auto",
     relay = "auto",
   },
+  -- How this turret introduces itself to the Spruce C2 server (Turrets
+  -- tab). Empty = fall back to the computer label, then "turret-<id>".
+  -- The Spruce link itself is configured in turret.cfg (url + token).
+  callsign = "",
   -- Which side of the redstone relay the fire line is wired to.
   -- Relays only accept relative names: top/bottom/front/back/left/right.
   fireSide = "top",
@@ -501,6 +505,31 @@ local function refreshProfile()
   muzzleLen = math.max(0, cfg.profile.barrelBlocks - 1.5)
 end
 refreshProfile()
+
+-- Spruce C2 link (SPRUCE_PLAN.md): turret.cfg holds the server URL + bearer
+-- token (+ optional callsign override), provisioned by the operator next to
+-- cannon.cfg. No file = standalone, the spruceLoop just idles. A file that
+-- IS there but unusable is a config error, not a "run without C2" case --
+-- fail loudly at boot rather than silently never showing up on the map.
+local TURRETCFG = "turret.cfg"
+local spruceCfg = nil
+if fs.exists(TURRETCFG) then
+  local t = readJSON(TURRETCFG)
+  if not t or type(t.url) ~= "string" or t.url == ""
+    or type(t.token) ~= "string" or t.token == "" then
+    error(('%s exists but must be JSON with string "url" and "token" '
+      .. 'fields (optional "callsign")'):format(TURRETCFG), 0)
+  end
+  if not http then
+    error(TURRETCFG .. " is present but the http API is disabled"
+      .. " on this computer/server", 0)
+  end
+  spruceCfg = {
+    url = (t.url:gsub("/+$", "")),
+    token = t.token,
+    callsign = t.callsign,
+  }
+end
 
 local function need(name, what)
   local p = peripheral.wrap(name)
@@ -1903,6 +1932,9 @@ table.sort(PROJECTILE_NAMES)
 -- writes it to (cfg = intent, cal = measured). profile=true rebuilds the
 -- cached gun (muzzle speed etc.) on change. show gates visibility on kind.
 local CONFIG_ITEMS = {
+  { group = "Identity", label = "callsign", etype = "text", file = "cfg",
+    get = function() return cfg.callsign end,
+    set = function(v) cfg.callsign = v end },
   { group = "Build", label = "kind", etype = "enum", file = "cfg", profile = true,
     values = { "autocannon", "bigcannon" },
     get = function() return cfg.profile.kind end,
@@ -3204,6 +3236,104 @@ local function rednetLoop()
   end
 end
 
+-- ---- Spruce C2 reporting (SPRUCE_PLAN.md phase 1: visibility) -------------
+-- POST a status snapshot to the Spruce server every ~1s so this turret shows
+-- up on the operator map (position, facing, arc, roster, target). Read-only
+-- with respect to the gun: it only reads state the trackLoop already
+-- maintains and must never drive the motors. Comms failures are swallowed
+-- (one flash when the link first drops) -- a dead server must not take the
+-- local UI or tracking down with it.
+
+-- Recent fire events for the browser's projectile animation. Pruned to the
+-- last ~5s here; actual appends are wired where the fire line pulses
+-- (phase 4), so the ring stays empty for now.
+local spruceShots = {}
+
+local function spruceCallsign()
+  return (spruceCfg and spruceCfg.callsign)
+    or (cfg.callsign ~= "" and cfg.callsign)
+    or os.getComputerLabel()
+    or ("turret-" .. os.getComputerID())
+end
+
+-- serialiseJSON turns {} into an object; the API contract wants [].
+local function jsonList(t)
+  if next(t) == nil then return textutils.empty_json_array end
+  return t
+end
+
+local function buildSpruceStatus()
+  local now = os.clock()
+  for i = #spruceShots, 1, -1 do
+    if now - spruceShots[i].clock > 5 then table.remove(spruceShots, i) end
+  end
+  local mount = state.mount
+  local payload = {
+    callsign = spruceCallsign(),
+    ts = os.epoch("utc"),
+    pos = cannonPos(), -- nil (omitted) on a stale ship fix
+    mount = (mount and mount.CannonYaw and mount.CannonPitch)
+      and { yaw = mount.CannonYaw, pitch = mount.CannonPitch } or nil,
+    -- World facing of the mount's zero; "auto" until first calibration,
+    -- and the browser can't draw the arc wedge without a number.
+    rest = type(cfg.yawOffset) == "number"
+      and { yawOffset = cfg.yawOffset } or nil,
+    limits = cfg.limits,
+    status = {
+      armed = state.armed, locked = state.locked, lost = state.lost,
+      noFix = state.noFix, outOfArc = state.outOfArc,
+      outOfRange = state.outOfRange, firing = state.firing,
+      hasArc = state.hasArc, calibrating = state.calibrating,
+      reloadPhase = reloadSeq.phase,
+    },
+    gun = {
+      kind = cfg.profile.kind, projectile = cfg.profile.projectile,
+      arc = cfg.profile.arc, muzzleSpeed = muzzleSpeed,
+      maxDistance = cfg.maxDistance,
+    },
+    roster = jsonList(state.roster),
+    shots = jsonList(spruceShots),
+  }
+  if state.targetKind then
+    payload.target = {
+      kind = state.targetKind, name = state.targetName,
+      raw = state.targetRaw, aim = state.aim,
+      dist = state.dist, tof = state.tof,
+      missH = state.missH, missV = state.missV,
+      lead = state.lead,
+    }
+  end
+  return payload
+end
+
+local function spruceLoop()
+  if not spruceCfg then
+    while running do sleep(1) end
+    return
+  end
+  local url = spruceCfg.url .. "/api/drone/turret/status"
+  local headers = {
+    ["Content-Type"] = "application/json",
+    ["Authorization"] = "Bearer " .. spruceCfg.token,
+  }
+  local down = false
+  while running do
+    local body = textutils.serialiseJSON(buildSpruceStatus())
+    -- http.post only hands back a handle on 2xx; non-2xx arrives as the
+    -- 4th value and both need closing or CC leaks the connection.
+    local ok, res, _, errRes = pcall(http.post, url, body, headers)
+    if ok and res then
+      pcall(res.close)
+      if down then down = false; state.flash = "SPRUCE LINK UP" end
+      sleep(1)
+    else
+      if ok and errRes then pcall(errRes.close) end
+      if not down then down = true; state.flash = "SPRUCE LINK DOWN" end
+      sleep(5)
+    end
+  end
+end
+
 -- Commit the modal line editor: an XYZ coord target, or a CONFIG field.
 -- A bad parse keeps the editor open with a hint instead of closing.
 local function commitPrompt()
@@ -3335,7 +3465,8 @@ term.clear()
 if cfg.ship.enabled then updateShip() end
 refreshRoster()
 draw()
-local ok, err = pcall(parallel.waitForAny, trackLoop, inputLoop, rednetLoop)
+local ok, err = pcall(parallel.waitForAny, trackLoop, inputLoop, rednetLoop,
+  spruceLoop)
 stopAll()
 term.setBackgroundColor(colors.black)
 term.setTextColor(colors.white)
