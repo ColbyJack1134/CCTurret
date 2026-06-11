@@ -1412,7 +1412,10 @@ local function zonePathBlocked()
   if not c then return false end
   local minBottom = math.huge
   for i = 1, #zones do
-    local zb = (tonumber(zones[i].top) or c.y) - 80 -- columns reach ~80 down
+    -- Columns protect ALL the way down (a tower is solid to the ground);
+    -- 256 below the ceiling covers any build height while still letting
+    -- the integration stop once the shell is below every column.
+    local zb = (tonumber(zones[i].top) or c.y) - 256
     if zb < minBottom then minBottom = zb end
   end
   local yawR, pitchR = math.rad(wy), math.rad(wp)
@@ -3924,13 +3927,42 @@ local function spruceLoop()
   -- and acks mirror the HTTP shapes, so handleReply is shared. Returns
   -- when the socket dies; the caller drops to httpTick and retries later.
   local WS_MIN_SEND_GAP = 0.15 -- seconds; coalesces event bursts
+  -- Async connect with OUR OWN deadline. The blocking http.websocket()
+  -- can hang indefinitely against a half-up server -- which is exactly
+  -- what a mid-deploy container looks like, and exactly when we try to
+  -- reconnect -- freezing all of C2 until a manual reboot ("turrets never
+  -- came back after the update").
+  local function wsConnect()
+    local okA = pcall(http.websocketAsync, wsUrl, headers)
+    if not okA then return nil end
+    local deadline = os.startTimer(8)
+    while running do
+      local ev, a, b = os.pullEvent()
+      if ev == "websocket_success" and a == wsUrl then
+        os.cancelTimer(deadline)
+        return b
+      elseif ev == "websocket_failure" and a == wsUrl then
+        os.cancelTimer(deadline)
+        return nil
+      elseif ev == "timer" and a == deadline then
+        return nil -- a late success just hands us a live handle next try
+      end
+    end
+    return nil
+  end
+
   local function runWs()
-    local okWs, ws = pcall(http.websocket, wsUrl, headers)
-    if not okWs or not ws then return false end
+    local ws = wsConnect()
+    if not ws then return false end
     state.spruceWsUp = true
     down = false
     state.flash = "SPRUCE WS UP"
     local lastSend = -math.huge
+    -- Reply watchdog: the server answers EVERY status frame, so a link
+    -- that eats our sends without replying (container killed mid-TCP, no
+    -- clean close event) is dead even though ws.send still "works".
+    local lastReply = os.clock()
+    local replyDeadline = math.max(15, spruceCfg.statusSeconds * 5)
     local statusTimer = os.startTimer(0)
     local alive = true
     while running and alive do
@@ -3941,6 +3973,7 @@ local function spruceLoop()
       elseif ev == "websocket_message" and a == wsUrl then
         local okJ, msg = pcall(textutils.unserialiseJSON, b or "")
         if okJ and type(msg) == "table" and msg.t == "reply" then
+          lastReply = os.clock()
           local acks = handleReply(msg)
           if acks then
             if not pcall(ws.send, textutils.serialiseJSON({ t = "ack", acks = acks })) then
@@ -3952,6 +3985,9 @@ local function spruceLoop()
       elseif ev == "timer" and a == statusTimer then
         statusTimer = os.startTimer(spruceCfg.statusSeconds)
         sendNow = true
+        if os.clock() - lastReply > replyDeadline then
+          alive = false -- sends vanish into a dead link; fall back + retry
+        end
       elseif ev == "spruce_push" then
         sendNow = true
       end
