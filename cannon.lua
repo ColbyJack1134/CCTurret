@@ -49,7 +49,7 @@ local DEFAULTS = {
   -- Which side of the redstone relay the fire line is wired to.
   -- Relays only accept relative names: top/bottom/front/back/left/right.
   fireSide = "top",
-  firePulseSeconds = 0.4,
+  firePulseSeconds = 0.1,
   -- Physical reload cycle for a manually-loaded big cannon (no
   -- autoloader). Bigcannon only; ignored for autocannons. When enabled,
   -- assemblySide is held HIGH = assembled (the default state); after a
@@ -2279,6 +2279,13 @@ local CONFIG_ITEMS = {
       and cfg.reload.enabled and cfg.reload.park end,
     get = function() return cfg.reload.parkSeconds end,
     set = function(v) cfg.reload.parkSeconds = v end },
+  -- How long the fire line pulses per shot (manual fire, the bigcannon
+  -- autoloader, and the physical-reload trigger; autocannons HOLD the
+  -- line while auto-firing, so this only shapes their manual taps).
+  { group = "Build", label = "firePulseSeconds", etype = "num", file = "cfg",
+    min = 0.05, max = 2, step = 0.05,
+    get = function() return cfg.firePulseSeconds end,
+    set = function(v) cfg.firePulseSeconds = v end },
   { group = "Aim", label = "home yaw", etype = "num", file = "cfg",
     min = -180, max = 180, step = 5,
     get = function() return cfg.homeYaw end,
