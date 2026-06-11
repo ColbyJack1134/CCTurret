@@ -1696,6 +1696,41 @@ local function reloadStatus()
   return label, math.max(0, reloadSeq.at - os.clock())
 end
 
+-- Seconds until the gun can fire again, or nil when it can fire NOW.
+-- Physical reload: remaining time in the current phase plus the fixed
+-- durations of every phase still ahead (parking may settle early, so
+-- the ETA is a worst case that only shrinks). Autoloader: the pulse
+-- pacing clock. Feeds the Spruce status payload so the browser can
+-- float a live countdown over the turret.
+local function reloadEta(now)
+  if cfg.profile.kind ~= "bigcannon" then return nil end
+  if cfg.reload.enabled then
+    local p = reloadSeq.phase
+    if p == "ready" then return nil end
+    local r = cfg.reload
+    local rem = math.max(0, reloadSeq.at - now)
+    -- Durations of the phases that FOLLOW each phase (chain: firing ->
+    -- [parking] -> disassembled -> pulsing -> loading -> assembling).
+    local loadS = math.max(0, cfg.profile.reloadSeconds)
+    local tail = {
+      firing = (r.park and r.parkSeconds or 0) + r.settleSeconds
+        + r.reloadPulseSeconds + loadS + r.settleSeconds,
+      parking = r.settleSeconds + r.reloadPulseSeconds + loadS
+        + r.settleSeconds,
+      disassembled = r.reloadPulseSeconds + loadS + r.settleSeconds,
+      pulsing = loadS + r.settleSeconds,
+      loading = r.settleSeconds,
+      assembling = 0,
+    }
+    return rem + (tail[p] or 0)
+  end
+  -- Autoloader path: pulse.nextAt paces auto shots; the loader is busy
+  -- until then regardless of what the barrel is doing.
+  local wait = pulse.nextAt - now
+  if wait > 0 then return wait end
+  return nil
+end
+
 -- Auto-calibrate yawOffset from the gun's rest pose. Disassembly always
 -- snaps a CBC cannon back to one fixed rest orientation regardless of where
 -- it was aiming, so a disassemble/reassemble cycle (motors idle) leaves the
@@ -3877,6 +3912,14 @@ local function buildSpruceStatus()
       firing = state.firing,
       hasArc = state.hasArc, calibrating = state.calibrating,
       reloadPhase = reloadSeq.phase,
+      -- Absolute epoch ms when the gun expects to fire again (nil =
+      -- ready now). The browser maps it through the measured clock skew
+      -- (same as shot timestamps) and floats a 0.1s countdown over the
+      -- turret; phase ends that land early just pull the next status in.
+      reloadReadyAt = (function()
+        local eta = reloadEta(os.clock())
+        return eta and (os.epoch("utc") + math.floor(eta * 1000 + 0.5)) or nil
+      end)(),
       shipMode = cfg.ship.enabled,
       zoneBlocked = state.zoneBlocked,
     },
