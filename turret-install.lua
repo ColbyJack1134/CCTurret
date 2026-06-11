@@ -11,8 +11,14 @@
 -- override in turret.cfg survives, everything else is rewritten.
 local SERVER = "__SERVER_URL__"
 local TOKEN = "__TURRET_TOKEN__"
+-- The server bakes in the turret's registry name so a fresh install comes
+-- up named; cannon.lua's setcfg-editable callsign still outranks this seed.
+local CALLSIGN = "__TURRET_CALLSIGN__"
 
 local cfg = { url = SERVER, token = TOKEN }
+if CALLSIGN ~= "" and CALLSIGN:sub(1, 2) ~= "__" then
+  cfg.callsign = CALLSIGN
+end
 if fs.exists("turret.cfg") then
   local f = fs.open("turret.cfg", "r")
   local raw = f.readAll()

@@ -1460,7 +1460,17 @@ end
 local spruceShots = {}
 local spruceShotSeq = 0
 local lastShotRecord = -math.huge
-local function recordShot()
+-- CBC autocannons all cycle at 300 rpm with the fire line held (big
+-- cannons reload between shots, so edge records cover them). The held-line
+-- stream below emits one record per cycle so the browser shows every round.
+local AUTOCANNON_INTERVAL = 60 / 300
+local streamNextAt = nil -- os.clock() the next held-line round leaves; nil = line low
+
+-- Append one record stamped at `shotClock` (os.clock frame; nil = now).
+-- Streamed rounds arrive backdated to when they actually left -- the
+-- browser places each bullet by its ts, and the track loop (~0.25s) is
+-- slower than the 0.2s gun cycle, so some ticks record two.
+local function recordShotAt(shotClock)
   if not spruceCfg then return end -- standalone turret: no bookkeeping
   local mount = state.mount
   if not (mount and mount.CannonYaw and mount.CannonPitch) then return end
@@ -1469,17 +1479,14 @@ local function recordShot()
   if not wy then return end
   local p = cannonPos()
   if not p then return end
-  -- Autocannons hold the fire line for a continuous stream; cap the ring
-  -- at ~3 records/s so the payload stays light (the browser animates a
-  -- representative stream, not literally every round).
   local now = os.clock()
-  if now - lastShotRecord < 0.33 then return end
-  lastShotRecord = now
+  shotClock = shotClock or now
+  lastShotRecord = shotClock
   spruceShotSeq = spruceShotSeq + 1
   spruceShots[#spruceShots + 1] = {
     id = spruceShotSeq,
-    ts = os.epoch("utc"),
-    clock = now, -- local TTL prune only (buildSpruceStatus)
+    ts = os.epoch("utc") - math.floor((now - shotClock) * 1000 + 0.5),
+    clock = shotClock, -- local TTL prune only (buildSpruceStatus)
     -- COPY the position: cannonPos() returns a shared table
     -- (staticCannon / ship.cannon), and serialiseJSON refuses any table
     -- that appears twice in one payload -- the status body also carries
@@ -1492,6 +1499,26 @@ local function recordShot()
   -- Over the websocket the browser can show this bullet the moment it
   -- exists instead of on the next status tick.
   if state.spruceWsUp then os.queueEvent("spruce_push") end
+end
+
+-- Edge-triggered record (manual fire / line edges). The gun itself can't
+-- cycle faster than its rate, so collapse edge chatter to one record per
+-- cycle (0.95: float slack so a stream record at exactly +interval passes).
+local function recordShot()
+  if os.clock() - lastShotRecord < AUTOCANNON_INTERVAL * 0.95 then return end
+  recordShotAt()
+end
+
+-- Held-line autocannon stream: emit one record per gun cycle since the
+-- last, each backdated to the moment its round left. A missing pose skips
+-- the record but still advances the clock -- no catch-up burst later.
+local function recordShotStream()
+  if not streamNextAt or cfg.profile.kind ~= "autocannon" then return end
+  local now = os.clock()
+  while streamNextAt <= now do
+    recordShotAt(streamNextAt)
+    streamNextAt = streamNextAt + AUTOCANNON_INTERVAL
+  end
 end
 
 -- Manual single pulse (F key / FIRE button).
@@ -1524,8 +1551,14 @@ local function setFiring(on)
   if state.firing == on then return end
   state.firing = on
   -- Rising edge = a shot leaves (autocannon stream start / each autoloader
-  -- or reload-cycle pulse); the held-line stream re-records from trackLoop.
-  if on then recordShot() end
+  -- or reload-cycle pulse); trackLoop's recordShotStream covers the rest
+  -- of a held line at the gun's cycle rate.
+  if on then
+    recordShot()
+    streamNextAt = os.clock() + AUTOCANNON_INTERVAL
+  else
+    streamNextAt = nil
+  end
   relay.setOutput(cfg.fireSide, on)
 end
 
@@ -3249,9 +3282,9 @@ local function trackLoop()
       refreshRoster()
       sentryAcquire()
     end
-    -- Held fire line (autocannon stream): keep the shot ring fed while
-    -- rounds are leaving. recordShot self-throttles to ~3/s.
-    if state.firing then recordShot() end
+    -- Held fire line (autocannon stream): record every round that left
+    -- since last tick, backdated to its true 300rpm cycle time.
+    if state.firing then recordShotStream() end
     -- Pose stream: while tracking with a live websocket, nudge spruceLoop
     -- every track tick so the browser's barrel/lock state moves in near
     -- real time (the send side rate-limits, so this tops out ~4-6 Hz).
@@ -3672,9 +3705,12 @@ end
 -- which all run before this section; only the 5s prune lives here, in
 -- buildSpruceStatus.
 
+-- cfg.callsign (the setcfg-editable Identity item) outranks the turret.cfg
+-- callsign: the installer seeds turret.cfg from the server-side registry
+-- name, and a later rename (setcfg) must win over that seed.
 local function spruceCallsign()
-  return (spruceCfg and spruceCfg.callsign)
-    or (cfg.callsign ~= "" and cfg.callsign)
+  return (cfg.callsign ~= "" and cfg.callsign)
+    or (spruceCfg and spruceCfg.callsign)
     or os.getComputerLabel()
     or ("turret-" .. os.getComputerID())
 end
