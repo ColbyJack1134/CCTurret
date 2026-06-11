@@ -21,14 +21,21 @@ on CC:Tweaked, based on [pastebin tb4aiueb](https://pastebin.com/tb4aiueb)
 ## Usage
 
 Shared libraries come from the CCMinimap submodule (`git submodule update
---init`) so there is exactly one tracked copy of each. Copy to the computer,
-flat:
+--init`) so there is exactly one tracked copy of each; `cfgutil.lua` and
+`heading.lua` at the repo root are symlinks into it, so every file a
+turret needs sits flat in the root. Copy to the computer:
 
 - `cannon.lua`
 - `ballistics.lua`
 - `autotune.lua`
-- `vendor/CCMinimap/computercraft/cfgutil.lua` → `cfgutil.lua`
-- `vendor/CCMinimap/computercraft/heading.lua` → `heading.lua`
+- `cfgutil.lua` (symlink — copying materialises the real file)
+- `heading.lua` (symlink — ditto)
+
+The symlinks resolve only after the submodule is initialised; a clone
+without `--recursive` leaves them dangling until you run the command
+above. (They're proper git symlinks, so a native-Windows checkout
+without symlink support would write path stubs instead — clone in
+WSL/linux.)
 
 Run `cannon.lua`. First boot writes `cannon.cfg` (hand-authored intent)
 and `cannon.cal` (machine-measured), then calibrates. Setup is mostly
