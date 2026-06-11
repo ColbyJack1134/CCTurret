@@ -803,6 +803,7 @@ local state = {
   -- a turret with no Spruce link behaves exactly as before.
   spruceSentry = false,    -- server says: auto-acquire hostiles locally
   spruceFriendlies = {},   -- name -> true, server's do-not-engage list
+  spruceWsUp = false,      -- websocket link live (event pushes enabled)
   sentryTarget = nil,      -- name WE acquired (vs operator/brain-set), so
                            -- local release only ever drops our own pick
   rebootRequest = false,   -- remote reboot, serviced after the ack POST
@@ -1394,6 +1395,9 @@ local function recordShot()
     pitch = mount.CannonPitch,
     v0 = muzzleSpeed,
   }
+  -- Over the websocket the browser can show this bullet the moment it
+  -- exists instead of on the next status tick.
+  if state.spruceWsUp then os.queueEvent("spruce_push") end
 end
 
 -- Manual single pulse (F key / FIRE button).
@@ -1430,6 +1434,7 @@ end
 local function toggleArm()
   state.armed = not state.armed
   if not state.armed then setFiring(false) end
+  if state.spruceWsUp then os.queueEvent("spruce_push") end
 end
 
 -- Kick off a shot under the physical-reload model: pulse the fire line,
@@ -1966,6 +1971,7 @@ local function setTarget(kind, name)
   resetBurst()
   setFiring(false) -- never carry a held fire line across a target change
   if not name then stopMotors() end
+  if state.spruceWsUp then os.queueEvent("spruce_push") end
 end
 
 -- Parse free-form "x y z" (any mix of spaces/commas) into a world point,
@@ -2464,6 +2470,41 @@ local function cfgCancel()
     refreshStaticCannon()
   end
   state.flash = "REVERTED"
+end
+
+-- Spruce config mirror: the web UI renders THE SAME CONFIG_ITEMS table the
+-- in-game tab is generated from, so the two can never drift. The status
+-- payload always carries cfgRev (a cheap hash of the visible labels +
+-- values -- in-game edits, remote setcfg, and kind-driven visibility flips
+-- all change it); the full schema rides along only when the server's
+-- echoed rev (ctl.cfgRev) disagrees, which also re-seeds a restarted
+-- server. Validation stays turret-side: web edits arrive as plain setcfg.
+local spruceServerCfgRev = nil
+
+local function cfgSchemaRev()
+  local h = 0
+  for _, it in ipairs(visibleConfigItems()) do
+    local s = cfgLabel(it) .. "=" .. tostring(it.get())
+    for i = 1, #s do h = (h * 31 + s:byte(i)) % 2147483647 end
+  end
+  return h
+end
+
+local function buildCfgSchema()
+  local items = {}
+  for _, it in ipairs(visibleConfigItems()) do
+    local values = nil
+    if it.values then
+      values = {} -- copy: serialiseJSON refuses repeated table references
+      for i, v in ipairs(it.values) do values[i] = v end
+    end
+    items[#items + 1] = {
+      group = it.group, label = cfgLabel(it), etype = it.etype,
+      value = it.get(), min = it.min, max = it.max, step = it.step,
+      values = values, file = it.file,
+    }
+  end
+  return items
 end
 
 -- ---------------------------------------------------------------- drawing --
@@ -3021,6 +3062,10 @@ local function trackLoop()
     -- Held fire line (autocannon stream): keep the shot ring fed while
     -- rounds are leaving. recordShot self-throttles to ~3/s.
     if state.firing then recordShot() end
+    -- Pose stream: while tracking with a live websocket, nudge spruceLoop
+    -- every track tick so the browser's barrel/lock state moves in near
+    -- real time (the send side rate-limits, so this tops out ~4-6 Hz).
+    if state.spruceWsUp and state.targetName then os.queueEvent("spruce_push") end
     tick = tick + 1
     -- Serviced here (not in the input loop) because calibration drives the
     -- motors and must not race the aim commands. pcall so a failed wiggle
@@ -3470,7 +3515,14 @@ local function buildSpruceStatus()
     },
     roster = jsonList(state.roster),
     shots = jsonList(spruceShots),
+    cfgRev = cfgSchemaRev(),
   }
+  -- Full config schema only when the server's copy is stale (first
+  -- contact, server restart, or any local/remote edit) -- it's a few KB
+  -- and the normal tick stays light without it.
+  if payload.cfgRev ~= spruceServerCfgRev then
+    payload.config = buildCfgSchema()
+  end
   if state.targetKind then
     payload.target = {
       kind = state.targetKind, name = state.targetName,
@@ -3597,6 +3649,7 @@ local function spruceLoop()
   }
   local urlStatus = spruceCfg.url .. "/api/drone/turret/status"
   local urlAck = spruceCfg.url .. "/api/drone/turret/ack"
+  local wsUrl = spruceCfg.url:gsub("^http", "ws") .. "/api/drone/turret/ws"
 
   -- POST returning the decoded JSON table, or nil on any transport/HTTP
   -- failure. http.post only hands back a handle on 2xx; non-2xx arrives
@@ -3615,44 +3668,50 @@ local function spruceLoop()
     return {}
   end
 
+  -- Shared by HTTP responses and WS "reply" frames: consume ctl (sentry
+  -- stance + friendlies + the server's config rev), dispatch any commands,
+  -- and return the acks list (nil when there were none).
+  local function handleReply(reply)
+    local ctl = reply.ctl
+    if type(ctl) == "table" then
+      state.spruceSentry = ctl.sentry == true
+      local fr = {}
+      if type(ctl.friendlies) == "table" then
+        for _, n in ipairs(ctl.friendlies) do fr[n] = true end
+      end
+      state.spruceFriendlies = fr
+      spruceServerCfgRev = tonumber(ctl.cfgRev)
+    end
+    local items = reply.items
+    if type(items) ~= "table" or #items == 0 then return nil end
+    -- Every drained item gets an ack (ok or err) so the operator log
+    -- shows what actually happened.
+    local acks = {}
+    for _, item in ipairs(items) do
+      local okCmd, err = dispatchSpruceCmd(item)
+      acks[#acks + 1] = { id = item.id, cmd = item.cmd, ok = okCmd, err = err }
+    end
+    return acks
+  end
+
+  -- One status -> reply -> ack cycle over plain HTTP: the fallback
+  -- transport (and the original phase-1/2 path), with its own pacing.
+  -- Build + serialise under pcall: a telemetry bug must flash loudly on
+  -- the turret screen, NOT crash the parallel stack and take the gun down.
   local down = false
-  while running do
-    -- Build + serialise under pcall: a telemetry bug (e.g. a shared table
-    -- reference serialiseJSON refuses) must flash loudly on the turret
-    -- screen, NOT crash the parallel stack and take the gun down. The gun
-    -- keeps tracking and firing; C2 retries next tick.
+  local function httpTick()
     local okBody, body = pcall(function()
       return textutils.serialiseJSON(buildSpruceStatus())
     end)
-    -- One round-trip per tick: pending commands ride the status response.
     local reply = okBody and rpc(urlStatus, body)
     if not okBody then
       -- Not a link problem -- OUR payload is broken. Flash the real error
-      -- (don't fall into the LINK DOWN branch, which would mask it) and
-      -- keep ticking; tracking/firing are unaffected.
+      -- (don't fall into the LINK DOWN branch, which would mask it).
       state.flash = "SPRUCE STATUS ERR: " .. tostring(body)
       sleep(spruceCfg.statusSeconds)
     elseif reply then
-      -- Sentry control rides every status response: stance + the server's
-      -- friendlies list, consumed by sentryAcquire() in trackLoop.
-      local ctl = reply.ctl
-      if type(ctl) == "table" then
-        state.spruceSentry = ctl.sentry == true
-        local fr = {}
-        if type(ctl.friendlies) == "table" then
-          for _, n in ipairs(ctl.friendlies) do fr[n] = true end
-        end
-        state.spruceFriendlies = fr
-      end
-      local items = reply.items
-      if type(items) == "table" and #items > 0 then
-        -- Every drained item gets an ack (ok or err) so the operator log
-        -- shows what actually happened.
-        local acks = {}
-        for _, item in ipairs(items) do
-          local okCmd, err = dispatchSpruceCmd(item)
-          acks[#acks + 1] = { id = item.id, cmd = item.cmd, ok = okCmd, err = err }
-        end
+      local acks = handleReply(reply)
+      if acks then
         rpc(urlAck, textutils.serialiseJSON({ acks = acks }))
         if state.rebootRequest then os.reboot() end
       end
@@ -3662,6 +3721,75 @@ local function spruceLoop()
       if not down then down = true; state.flash = "SPRUCE LINK DOWN" end
       sleep(5)
     end
+  end
+
+  -- WebSocket session: the server pushes commands the instant the operator
+  -- clicks, and spruce_push events (shots, arm/target flips, the tracking
+  -- pose stream) push status up the moment things happen. Status frames
+  -- carry the exact HTTP payload inside {t="status", data=...}; replies
+  -- and acks mirror the HTTP shapes, so handleReply is shared. Returns
+  -- when the socket dies; the caller drops to httpTick and retries later.
+  local WS_MIN_SEND_GAP = 0.15 -- seconds; coalesces event bursts
+  local function runWs()
+    local okWs, ws = pcall(http.websocket, wsUrl, headers)
+    if not okWs or not ws then return false end
+    state.spruceWsUp = true
+    down = false
+    state.flash = "SPRUCE WS UP"
+    local lastSend = -math.huge
+    local statusTimer = os.startTimer(0)
+    local alive = true
+    while running and alive do
+      local sendNow = false
+      local ev, a, b = os.pullEvent()
+      if ev == "websocket_closed" and a == wsUrl then
+        alive = false
+      elseif ev == "websocket_message" and a == wsUrl then
+        local okJ, msg = pcall(textutils.unserialiseJSON, b or "")
+        if okJ and type(msg) == "table" and msg.t == "reply" then
+          local acks = handleReply(msg)
+          if acks then
+            if not pcall(ws.send, textutils.serialiseJSON({ t = "ack", acks = acks })) then
+              alive = false
+            end
+            if state.rebootRequest then pcall(ws.close); os.reboot() end
+          end
+        end
+      elseif ev == "timer" and a == statusTimer then
+        statusTimer = os.startTimer(spruceCfg.statusSeconds)
+        sendNow = true
+      elseif ev == "spruce_push" then
+        sendNow = true
+      end
+      if alive and sendNow and os.clock() - lastSend >= WS_MIN_SEND_GAP then
+        lastSend = os.clock()
+        local okBody, body = pcall(function()
+          return textutils.serialiseJSON({ t = "status", data = buildSpruceStatus() })
+        end)
+        if okBody then
+          if not pcall(ws.send, body) then alive = false end
+        else
+          state.flash = "SPRUCE STATUS ERR: " .. tostring(body)
+        end
+      end
+    end
+    state.spruceWsUp = false
+    pcall(ws.close)
+    return true
+  end
+
+  local WS_RETRY_SECONDS = 10
+  local lastWsTry = -math.huge
+  while running do
+    if os.clock() - lastWsTry >= WS_RETRY_SECONDS then
+      lastWsTry = os.clock()
+      if runWs() then
+        -- Had a live socket and lost it; HTTP keeps C2 alive meanwhile.
+        state.flash = "SPRUCE WS LOST -- HTTP fallback"
+        lastWsTry = os.clock()
+      end
+    end
+    if running then httpTick() end
   end
 end
 
