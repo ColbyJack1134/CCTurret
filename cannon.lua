@@ -169,6 +169,15 @@ local DEFAULTS = {
   -- CONFIG tab (Calibrated group); set back to "auto" to re-measure, or
   -- press O (reload.enabled) to capture it from a fresh disassemble cycle.
   yawOffset = "auto",
+  -- Idle park pose ("home"): the azimuth/pitch the barrel returns to when
+  -- nothing is targeted. World frame for static mounts, deck frame for
+  -- ships (both via mount = homeYaw - yawOffset). Press O with the barrel
+  -- where you want it to capture the current pose; also editable here.
+  -- This is deliberately SEPARATE from yawOffset: the frame calibration
+  -- anchored home implicitly, so re-anchoring the frame used to swing the
+  -- park direction.
+  homeYaw = 0,
+  homePitch = 0,
   -- Added to the computed pitch, in degrees: -1 aims 1 degree below the
   -- target, +1 above. Plain aim bias -- not a sign fix.
   pitchOffset = 0,
@@ -1579,8 +1588,8 @@ local function driveToRest()
     stopMotors()
     return false
   end
-  local yawErr = angleDiff(-cfg.yawOffset, data.CannonYaw)
-  local pitchErr = -data.CannonPitch
+  local yawErr = angleDiff(cfg.homeYaw - cfg.yawOffset, data.CannonYaw)
+  local pitchErr = cfg.homePitch - data.CannonPitch
   if axisSettled(yawErr, cfg.yawDrive, track.loopT)
     and axisSettled(pitchErr, cfg.pitchDrive, track.loopT) then
     stopMotors()
@@ -2257,6 +2266,14 @@ local CONFIG_ITEMS = {
       and cfg.reload.enabled and cfg.reload.park end,
     get = function() return cfg.reload.parkSeconds end,
     set = function(v) cfg.reload.parkSeconds = v end },
+  { group = "Aim", label = "home yaw", etype = "num", file = "cfg",
+    min = -180, max = 180, step = 5,
+    get = function() return cfg.homeYaw end,
+    set = function(v) cfg.homeYaw = v end },
+  { group = "Aim", label = "home pitch", etype = "num", file = "cfg",
+    min = -30, max = 60, step = 1,
+    get = function() return cfg.homePitch end,
+    set = function(v) cfg.homePitch = v end },
   { group = "Aim", label = "pitchOffset", etype = "num", file = "cfg",
     min = -45, max = 45, step = 1,
     get = function() return cfg.pitchOffset end,
@@ -3206,9 +3223,22 @@ local function trackLoop()
       if not cfg.ship.enabled then
         -- Static: nothing to measure -- CBC's CannonYaw is world-absolute
         -- and the MC->atan2 frame conversion is a constant (see calibrate).
+        -- The CURRENT barrel pose becomes home: aim it where it should
+        -- park, press O.
         cfg.yawOffset = 90
+        local m = state.mount
+        local captured = m and type(m.CannonYaw) == "number"
+          and type(m.CannonPitch) == "number"
+        if captured then
+          cfg.homeYaw = angleDiff(m.CannonYaw + cfg.yawOffset, 0)
+          cfg.homePitch = math.floor(m.CannonPitch * 10 + 0.5) / 10
+        end
+        writeCfg(cfg) -- homeYaw/homePitch are cfg keys
         writeCal(cfg)
-        state.flash = "yawOffset = 90 (static mounts are world-absolute)"
+        state.flash = captured
+          and ("yawOffset 90 -- home = az %.0f, pitch %.0f"):format(
+            cfg.homeYaw, cfg.homePitch)
+          or "yawOffset = 90 (no mount reading; home unchanged)"
       else
         state.calibrating = true
         stopMotors()
@@ -3216,6 +3246,10 @@ local function trackLoop()
         local ok, rest, off = pcall(calibrateYawOffset)
         state.calibrating = false
         if ok then
+          -- The disassemble cycle snapped the gun to its deck rest, so
+          -- the captured pose IS the rest: home = deck zero.
+          cfg.homeYaw, cfg.homePitch = 0, 0
+          writeCfg(cfg)
           state.flash = ("yawOffset = %.0f (deck rest yaw %.0f)"):format(off, rest)
         else
           tuneLog("ERROR: " .. tostring(rest))
