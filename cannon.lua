@@ -332,6 +332,7 @@ local CAL_PATHS = {
   { "yawDrive", "degPerSecPerRpm" }, { "yawDrive", "minSpeed" },
   { "pitchDrive", "degPerSecPerRpm" }, { "pitchDrive", "minSpeed" },
   { "yawOffset" }, -- measured from the assembled rest yaw, per mount
+  { "homeYaw" }, { "homePitch" }, -- captured at calibration, per mount
 }
 
 local function readFile(p)
@@ -2289,11 +2290,14 @@ local CONFIG_ITEMS = {
     min = 0.05, max = 2, step = 0.05,
     get = function() return cfg.firePulseSeconds end,
     set = function(v) cfg.firePulseSeconds = v end },
-  { group = "Aim", label = "home yaw", etype = "num", file = "cfg",
+  -- Captured at calibration (per physical mount), so cal-file: it travels
+  -- with yawOffset, a settings-only clone leaves it alone, and wiping
+  -- cannon.cal re-derives it from the barrel's rest pose on next boot.
+  { group = "Calibrated", label = "home yaw", etype = "num", file = "cal",
     min = -180, max = 180, step = 5,
     get = function() return cfg.homeYaw end,
     set = function(v) cfg.homeYaw = v end },
-  { group = "Aim", label = "home pitch", etype = "num", file = "cfg",
+  { group = "Calibrated", label = "home pitch", etype = "num", file = "cal",
     min = -30, max = 60, step = 1,
     get = function() return cfg.homePitch end,
     set = function(v) cfg.homePitch = v end },
