@@ -804,6 +804,8 @@ local state = {
   spruceSentry = false,    -- server says: auto-acquire hostiles locally
   spruceFriendlies = {},   -- name -> true, server's do-not-engage list
   spruceWsUp = false,      -- websocket link live (event pushes enabled)
+  spruceZones = {},        -- no-fire columns over sister turrets (ctl)
+  zoneBlocked = false,     -- current solution's path enters a zone: hold fire
   sentryTarget = nil,      -- name WE acquired (vs operator/brain-set), so
                            -- local release only ever drops our own pick
   rebootRequest = false,   -- remote reboot, serviced after the ack POST
@@ -1382,6 +1384,61 @@ local function mountWorldFacing(mount)
     math.deg(math.asin(math.max(-1, math.min(1, uy))))
 end
 
+-- Friendly-fire zones (Spruce ctl): protection columns over sister
+-- turrets -- {x, y, z, top, half} where top is the world-Y ceiling a few
+-- blocks above the sister's pivot and half is the horizontal half-size
+-- (12x12 -> 6). Blocked = the CURRENT barrel facing's shell path enters
+-- any column: fly the exact CBC tick path and test footprint + ceiling
+-- each tick. This gates PATHS, not bearings -- lobbing OVER a tower at a
+-- distant target stays legal, which is the whole point versus blocking
+-- a wedge of yaw travel.
+local function zonePathBlocked()
+  local zones = state.spruceZones
+  if not zones or #zones == 0 then return false end
+  local mount = state.mount
+  if not (mount and mount.CannonYaw and mount.CannonPitch) then return false end
+  local wy, wp = mountWorldFacing(mount)
+  if not wy then return false end
+  local c = cannonPos()
+  if not c then return false end
+  local minBottom = math.huge
+  for i = 1, #zones do
+    local zb = (tonumber(zones[i].top) or c.y) - 80 -- columns reach ~80 down
+    if zb < minBottom then minBottom = zb end
+  end
+  local yawR, pitchR = math.rad(wy), math.rad(wp)
+  local hx = math.cos(yawR) * math.cos(pitchR)
+  local hy = math.sin(pitchR)
+  local hz = math.sin(yawR) * math.cos(pitchR)
+  local px = c.x + hx * muzzleLen
+  local py = c.y + hy * muzzleLen
+  local pz = c.z + hz * muzzleLen
+  local v0 = muzzleSpeed / 20
+  local vx, vy, vz = hx * v0, hy * v0, hz * v0
+  local q = 1 - proj.drag
+  local maxd2 = (cfg.maxDistance + 16) ^ 2
+  for _ = 1, 600 do
+    local nvx, nvy, nvz = vx * q, vy * q + proj.gravity, vz * q
+    px = px + 0.5 * (vx + nvx)
+    py = py + 0.5 * (vy + nvy)
+    pz = pz + 0.5 * (vz + nvz)
+    vx, vy, vz = nvx, nvy, nvz
+    for i = 1, #zones do
+      local z = zones[i]
+      if py <= z.top and math.abs(px - z.x) <= z.half
+          and math.abs(pz - z.z) <= z.half then
+        return true
+      end
+    end
+    local ox, oz = px - c.x, pz - c.z
+    -- Past the auto-fire range gate nothing real lands; below every
+    -- column's reach the path can't matter either.
+    if ox * ox + oz * oz > maxd2 then break end
+    if vy < 0 and py < minBottom then break end
+  end
+  return false
+end
+
 -- Phase 4 (Spruce bullets): ring of recent fire events riding the status
 -- payload. Each records the firing SOLUTION at trigger time -- world
 -- yaw/pitch, muzzle speed, launch pivot -- not a precomputed arc: the
@@ -1427,6 +1484,10 @@ end
 -- Manual single pulse (F key / FIRE button).
 local function fire()
   if state.firing then return end -- auto-fire already holds the line high
+  if zonePathBlocked() then
+    state.flash = "ZONE HOLD -- shell path crosses a friendly column"
+    return
+  end
   -- Bigcannon with a physical reload: a manual shot empties the gun too,
   -- so route it through the same disassemble/load/assemble cycle (the
   -- track loop drives it). Ignore the trigger while a reload is running.
@@ -3350,9 +3411,12 @@ local function trackLoop()
         if reloadActive() then stopMotors() else driveToRest() end
       end
       -- Auto-fire actuation. The gate additionally requires a real
-      -- ballistic solution -- NO ARC means the barrel is only posing.
+      -- ballistic solution -- NO ARC means the barrel is only posing --
+      -- and a shell path clear of every friendly-fire column.
+      state.zoneBlocked = state.targetName ~= nil and zonePathBlocked()
       local gate = state.armed and (state.locked or state.bursting)
         and not state.outOfRange and state.hasArc == true
+        and not state.zoneBlocked
       if cfg.profile.kind == "bigcannon" then
         if cfg.reload.enabled then
           -- Physical reload: fire only from a fully assembled gun; while
@@ -3551,6 +3615,7 @@ local function buildSpruceStatus()
       hasArc = state.hasArc, calibrating = state.calibrating,
       reloadPhase = reloadSeq.phase,
       shipMode = cfg.ship.enabled,
+      zoneBlocked = state.zoneBlocked,
     },
     gun = {
       kind = cfg.profile.kind, projectile = cfg.profile.projectile,
@@ -3727,6 +3792,7 @@ local function spruceLoop()
         for _, n in ipairs(ctl.friendlies) do fr[n] = true end
       end
       state.spruceFriendlies = fr
+      state.spruceZones = type(ctl.zones) == "table" and ctl.zones or {}
       spruceServerCfgRev = tonumber(ctl.cfgRev)
     end
     local items = reply.items
