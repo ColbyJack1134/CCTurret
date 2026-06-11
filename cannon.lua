@@ -1355,6 +1355,33 @@ local function stopAll()
   reloadSeq.phase, reloadSeq.at = "ready", 0
 end
 
+-- True world facing of the barrel from the deck-relative mount angles:
+-- the exact INVERSE of anglesFor's ship-basis projection, so displays
+-- draw the barrel/arc along the line shells actually leave on a pitched
+-- or rolled deck. The flat-deck heading fold only corrected yaw; a ship
+-- hovering a degree nose-down sagged every rendered arc below the aim
+-- point while the solver (which aims through the full basis) kept
+-- hitting. Static mode reduces to the plain offset folds. Returns nil
+-- without a fresh ship fix.
+local function mountWorldFacing(mount)
+  if type(cfg.yawOffset) ~= "number" then return nil end -- "auto" pre-cal
+  local deckPitch = mount.CannonPitch - cfg.pitchOffset
+  if not cfg.ship.enabled then
+    return mount.CannonYaw + cfg.yawOffset, deckPitch
+  end
+  local b = ship.basis
+  if not b or os.clock() > ship.freshUntil then return nil end
+  local a = math.rad(mount.CannonYaw + cfg.yawOffset + 90)
+  local p = math.rad(deckPitch)
+  local ca, sa = math.cos(a), math.sin(a)
+  local cp, sp = math.cos(p), math.sin(p)
+  local ux = cp * (ca * b.f.x + sa * b.r.x) + sp * b.u.x
+  local uy = cp * (ca * b.f.y + sa * b.r.y) + sp * b.u.y
+  local uz = cp * (ca * b.f.z + sa * b.r.z) + sp * b.u.z
+  return math.deg(math.atan(uz, ux)),
+    math.deg(math.asin(math.max(-1, math.min(1, uy))))
+end
+
 -- Phase 4 (Spruce bullets): ring of recent fire events riding the status
 -- payload. Each records the firing SOLUTION at trigger time -- world
 -- yaw/pitch, muzzle speed, launch pivot -- not a precomputed arc: the
@@ -1368,11 +1395,8 @@ local function recordShot()
   local mount = state.mount
   if not (mount and mount.CannonYaw and mount.CannonPitch) then return end
   if type(cfg.yawOffset) ~= "number" then return end
-  local off = cfg.yawOffset
-  if cfg.ship.enabled then
-    if type(ship.heading) ~= "number" then return end -- no heading, no world frame
-    off = off + ship.heading
-  end
+  local wy, wp = mountWorldFacing(mount) -- exact world frame (ship basis)
+  if not wy then return end
   local p = cannonPos()
   if not p then return end
   -- Autocannons hold the fire line for a continuous stream; cap the ring
@@ -1391,8 +1415,8 @@ local function recordShot()
     -- that appears twice in one payload -- the status body also carries
     -- cannonPos(), and every shot would otherwise share this reference.
     pos = { x = p.x, y = p.y, z = p.z },
-    yaw = mount.CannonYaw + off, -- world azimuth, atan2(dz,dx) frame
-    pitch = mount.CannonPitch - cfg.pitchOffset, -- world frame, like the payload
+    yaw = wy,   -- world azimuth, atan2(dz,dx) frame, deck attitude unwound
+    pitch = wp, -- world pitch, ditto
     v0 = muzzleSpeed,
   }
   -- Over the websocket the browser can show this bullet the moment it
@@ -3487,15 +3511,21 @@ local function buildSpruceStatus()
     callsign = spruceCallsign(),
     ts = os.epoch("utc"),
     pos = cannonPos(), -- the LAUNCH PIVOT (pivotFromBase), not the mount base
-    -- pitch is reported in the WORLD frame (CannonPitch - pitchOffset,
-    -- same fold the impact diagnostic uses) so the browser draws the
-    -- barrel where the shell actually leaves; yaw stays mount-relative
-    -- with rest.yawOffset carrying the world correction. upsideDown lets
-    -- the renderer hang the base block on the correct side of the pivot.
-    mount = (mount and mount.CannonYaw and mount.CannonPitch)
-      and { yaw = mount.CannonYaw,
-            pitch = mount.CannonPitch - cfg.pitchOffset,
-            upsideDown = cfg.cannon.upsideDown or false } or nil,
+    -- worldYaw/worldPitch are the barrel's TRUE world facing via
+    -- mountWorldFacing (full ship-basis unwind on a deck, plain offset
+    -- folds when static) -- the browser prefers them for the barrel and
+    -- live arc. yaw/pitch stay as the flat-deck values for older
+    -- consumers and the popup. upsideDown lets the renderer hang the
+    -- base block on the correct side of the pivot.
+    mount = (function()
+      if not (mount and mount.CannonYaw and mount.CannonPitch) then return nil end
+      local m = { yaw = mount.CannonYaw,
+                  pitch = mount.CannonPitch - cfg.pitchOffset,
+                  upsideDown = cfg.cannon.upsideDown or false }
+      local wy, wp = mountWorldFacing(mount)
+      if wy then m.worldYaw, m.worldPitch = wy, wp end
+      return m
+    end)(),
     -- World facing of the mount's zero; "auto" until first calibration,
     -- and the browser can't draw the arc wedge without a number. In ship
     -- mode mount.yaw is DECK-relative, and on a flat deck the barrel's
