@@ -1392,7 +1392,7 @@ local function recordShot()
     -- cannonPos(), and every shot would otherwise share this reference.
     pos = { x = p.x, y = p.y, z = p.z },
     yaw = mount.CannonYaw + off, -- world azimuth, atan2(dz,dx) frame
-    pitch = mount.CannonPitch,
+    pitch = mount.CannonPitch - cfg.pitchOffset, -- world frame, like the payload
     v0 = muzzleSpeed,
   }
   -- Over the websocket the browser can show this bullet the moment it
@@ -3486,9 +3486,16 @@ local function buildSpruceStatus()
   local payload = {
     callsign = spruceCallsign(),
     ts = os.epoch("utc"),
-    pos = cannonPos(), -- nil (omitted) on a stale ship fix
+    pos = cannonPos(), -- the LAUNCH PIVOT (pivotFromBase), not the mount base
+    -- pitch is reported in the WORLD frame (CannonPitch - pitchOffset,
+    -- same fold the impact diagnostic uses) so the browser draws the
+    -- barrel where the shell actually leaves; yaw stays mount-relative
+    -- with rest.yawOffset carrying the world correction. upsideDown lets
+    -- the renderer hang the base block on the correct side of the pivot.
     mount = (mount and mount.CannonYaw and mount.CannonPitch)
-      and { yaw = mount.CannonYaw, pitch = mount.CannonPitch } or nil,
+      and { yaw = mount.CannonYaw,
+            pitch = mount.CannonPitch - cfg.pitchOffset,
+            upsideDown = cfg.cannon.upsideDown or false } or nil,
     -- World facing of the mount's zero; "auto" until first calibration,
     -- and the browser can't draw the arc wedge without a number. In ship
     -- mode mount.yaw is DECK-relative, and on a flat deck the barrel's
