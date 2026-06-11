@@ -180,7 +180,9 @@ _G.os = setmetatable({
 _G.sleep = function(t)
   t = t or 0
   for _, c in pairs(controllers) do
-    if c.rpm ~= 0 then mount[c.axis] = mount[c.axis] + c.rpm * t * RATE end
+    if not mount.frozen and c.rpm ~= 0 then
+      mount[c.axis] = mount[c.axis] + c.rpm * t * RATE
+    end
   end
   clock = clock + t
 end
@@ -299,6 +301,27 @@ if cfg3 and cal3 then
     cfg3.yawOffset == nil and cal3.yawOffset == 90,
     ("cfg=%s cal=%s"):format(tostring(cfg3.yawOffset), tostring(cal3.yawOffset)))
 end
+
+-- == Scenario 4: disassembled cannon (frozen mount) -- boot must SURVIVE ==
+-- A schematic bigcannon's first boot: the assembly line is unconfigured,
+-- the contraption can't move, the calibration wiggle stalls. The program
+-- must come up anyway (CONFIG tab reachable, cfg on disk for hand edits)
+-- with the targets tab showing the failure instead of dying.
+print("-- scenario 4: disassembled first boot (calibration stall) --")
+reset(nil)
+mount.frozen = true
+local screen = {}
+local realWrite = term.write
+rawset(_G.term, "write", function(s) screen[#screen + 1] = tostring(s) end)
+local ok4, err4 = boot()
+rawset(_G.term, "write", realWrite)
+mount.frozen = false
+check("frozen-mount boot survives (no hard error)", ok4, tostring(err4))
+check("cfg still written (hand-edit recovery possible)", FILES["cannon.cfg"] ~= nil)
+local drawn = table.concat(screen, "\n")
+check("targets tab shows CALIBRATION FAILED", drawn:find("CALIBRATION FAILED", 1, true) ~= nil)
+check("targets tab tells the fix (config + reboot)",
+  drawn:find("CONFIG tab, then reboot", 1, true) ~= nil)
 
 print(fails == 0 and "ALL PASS" or (fails .. " FAILURES"))
 if fails > 0 then os.exit(1) end

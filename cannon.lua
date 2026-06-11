@@ -839,6 +839,11 @@ local state = {
   recalRequest = false, -- UI asked for a calibrate+auto-tune; serviced in trackLoop
   offsetCalRequest = false, -- UI asked for a yaw-offset capture; serviced there too
   calibrating = false,  -- calibrate + auto-tune in progress (status line)
+  calError = nil,    -- boot calibration failed: the message. Targeting and
+                     -- all motor drive are disabled until a recal succeeds
+                     -- (typically: fix the CONFIG tab, reboot). Lets a
+                     -- schematic bigcannon whose assembly line isn't
+                     -- configured yet boot into the UI instead of dying.
 }
 
 local ui = {
@@ -1746,8 +1751,15 @@ local function calibrateAxis(label, controller, nbtKey, wraps)
       return invert, rate
     end
   end
-  error(("calibration failed: %s axis did not move in either direction -- check gearing")
-    :format(label), 0)
+  -- A reload bigcannon with its assembly line still unconfigured (or low)
+  -- is DISASSEMBLED -- nothing can move. Name that cause: it's every
+  -- schematic build's first boot, and "check gearing" sent people to the
+  -- wrong end of the machine.
+  local hint = (cfg.profile.kind == "bigcannon" and not cfg.reload.enabled)
+    and " (or: disassembled? a reload bigcannon needs reload enabled + its assembly sides set so the line goes high)"
+    or " -- check gearing"
+  error(("calibration failed: %s axis did not move in either direction%s")
+    :format(label, hint), 0)
 end
 
 -- Every attached rotational speed controller, by peripheral name. Create
@@ -2114,6 +2126,12 @@ local function refreshRoster()
 end
 
 local function setTarget(kind, name)
+  -- Uncalibrated turret: refuse every lock (clicks, CLI, Spruce, sentry
+  -- all route through here). Clearing (kind=nil) stays allowed.
+  if state.calError and kind then
+    state.flash = "NOT CALIBRATED -- fix config, then reboot"
+    return
+  end
   if state.targetKind == kind and state.targetName == name then
     kind, name = nil, nil -- click again to release
   end
@@ -2931,6 +2949,30 @@ local function drawStatus()
 end
 
 local function drawTargetsList(w, h)
+  -- Boot calibration failed: the gun can't aim, so the tab shows what
+  -- went wrong instead of a roster it would refuse to lock anyway. The
+  -- CONFIG tab stays fully usable -- the expected fix is to set the
+  -- build there (kind / reload assembly line) and reboot.
+  if state.calError then
+    term.setCursorPos(1, 3)
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.red)
+    term.write(("CALIBRATION FAILED -- targeting disabled"):sub(1, w))
+    local row = 5
+    term.setTextColor(colors.lightGray)
+    for chunk in tostring(state.calError):gmatch("%S[^\n]*") do
+      while #chunk > 0 and row <= h - 3 do
+        term.setCursorPos(1, row)
+        term.write(chunk:sub(1, w))
+        chunk = chunk:sub(w + 1)
+        row = row + 1
+      end
+    end
+    term.setCursorPos(1, h - 1)
+    term.setTextColor(colors.yellow)
+    term.write(("Set the build on the CONFIG tab, then reboot."):sub(1, w))
+    return
+  end
   -- Row 3 is a standing button: open the XYZ-coordinate prompt. A fixed
   -- aim point (mainly for range/falloff testing); the active coord shows
   -- on the status line, and STOP clears it like any other target.
@@ -3304,6 +3346,7 @@ local function trackLoop()
       local ok, err = pcall(recalibrate)
       state.calibrating = false
       if not ok then tuneLog("ERROR: " .. tostring(err)) end
+      if ok then state.calError = nil end -- boot-cal failure cured in place
       state.flash = ok and "CALIBRATED + AUTO-TUNED" or "CAL/TUNE FAILED (see log)"
       term.setBackgroundColor(colors.black)
       term.clear()
@@ -3608,7 +3651,11 @@ local function trackLoop()
       -- owns the motors; otherwise return the barrel to its neutral rest
       -- pose instead of freezing wherever it last aimed.
       local homing = false
-      if reloadActive() then
+      if state.calError then
+        -- Uncalibrated: never drive. The cal values (inversions, rates)
+        -- and even the drive peripherals may be nil after a failed boot
+        -- wiggle, and driveToRest would crash the loop on them.
+      elseif reloadActive() then
         tickPark(os.clock())
       else
         homing = not driveToRest()
@@ -4220,7 +4267,20 @@ local function inputLoop()
 end
 
 stopAll()
-calibrate()
+do
+  -- A failed boot calibration must not kill the program: a schematic
+  -- bigcannon arrives with its assembly line unconfigured (cfg defaults),
+  -- so the contraption is disassembled and the wiggle can't move it --
+  -- the old hard error left no way to reach the CONFIG tab and fix that.
+  -- Boot into the UI instead with targeting + motor drive disabled
+  -- (state.calError gates them); the TARGETS tab shows the error and the
+  -- fix is config + reboot (or a successful K recal, which clears it).
+  local ok, err = pcall(calibrate)
+  if not ok then
+    stopMotors()
+    state.calError = tostring(err)
+  end
+end
 term.setBackgroundColor(colors.black)
 term.clear()
 if cfg.ship.enabled then updateShip() end
