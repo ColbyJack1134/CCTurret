@@ -2292,6 +2292,16 @@ local CONFIG_ITEMS = {
   { group = "Arc limits", label = "pitch max", etype = "float", file = "cfg",
     get = function() return cfg.limits.pitch.max end,
     set = function(v) cfg.limits.pitch.max = v end },
+  -- Loop pacing target. The body's peripheral calls set the real floor
+  -- (~0.15-0.2s), so values below ~0.1 buy little; 0.05 is CC's minimum
+  -- yield. Exposed mainly because old saves carry the 0.25 default from
+  -- before the pacing fix and there was no way to see or lower it.
+  -- Roster/ship-idle cadences derive from this at BOOT (reboot after big
+  -- changes so they re-derive).
+  { group = "Drive", label = "trackSeconds", etype = "num", file = "cfg",
+    min = 0.05, max = 0.5, step = 0.05,
+    get = function() return cfg.trackSeconds end,
+    set = function(v) cfg.trackSeconds = v end },
   { group = "Drive", label = "yaw gain", etype = "num", file = "cfg",
     min = 0.5, max = 40, step = 0.5,
     get = function() return cfg.yawDrive.speedGain end,
