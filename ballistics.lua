@@ -60,10 +60,19 @@ B.PROJECTILES = {
 -- from the CBC source / verified in-game (full steel or cast-iron = 180
 -- b/s); a datapack server CAN retune them, so profile.muzzleVelocityOverride
 -- is the escape hatch (see B.muzzleSpeed).
+--
+-- `lifetime` is the round's flight TIME cap in ticks (CBC
+-- AbstractAutocannonProjectile.ageRemaining, seeded per CANNON MATERIAL by
+-- MountedAutocannonContraption -- machine gun bullets included; barrels
+-- change speed, never lifetime). The round moves its full tick, THEN the
+-- counter hits 0 and it silently despawns mid-air -- so it reaches a
+-- target iff flight ticks <= lifetime. Big-cannon shells and mortar
+-- stones have NO such cap (they fly until impact). Datapack-tunable, so
+-- profile.lifetimeOverride mirrors the speed escape hatch.
 B.AUTOCANNON_MATERIALS = {
-  cast_iron = { base = 5, perBarrel = 2,   cap = 2 },
-  bronze    = { base = 3, perBarrel = 1.5, cap = 3 },
-  steel     = { base = 3, perBarrel = 1.5, cap = 4 },
+  cast_iron = { base = 5, perBarrel = 2,   cap = 2, lifetime = 11 },
+  bronze    = { base = 3, perBarrel = 1.5, cap = 3, lifetime = 25 },
+  steel     = { base = 3, perBarrel = 1.5, cap = 4, lifetime = 60 },
 }
 
 -- Autocannon muzzle speed in blocks/second from material + barrel count.
@@ -81,6 +90,32 @@ function B.autocannonSpeed(material, barrels)
     error("profile.barrels must be a barrel count >= 0", 0)
   end
   return TPS * (m.base + m.perBarrel * math.min(barrels, m.cap))
+end
+
+-- Projectile lifetime in TICKS for a cannon profile, or nil when the
+-- round has no in-flight cap (big cannons). Autocannon rounds despawn
+-- when their material lifetime runs out; profile.lifetimeOverride (> 0)
+-- forces a value for datapack-tuned servers. Errors loudly on a malformed
+-- profile rather than guessing.
+function B.lifetimeTicks(profile)
+  if profile.kind == "bigcannon" then return nil end
+  if profile.kind == "autocannon" then
+    local override = profile.lifetimeOverride
+    if type(override) == "number" and override > 0 then
+      return override
+    end
+    local m = B.AUTOCANNON_MATERIALS[profile.material]
+    if not m then
+      local known = {}
+      for k in pairs(B.AUTOCANNON_MATERIALS) do known[#known + 1] = k end
+      table.sort(known)
+      error(('unknown autocannon material %q -- known: %s')
+        :format(tostring(profile.material), table.concat(known, ", ")), 0)
+    end
+    return m.lifetime
+  end
+  error(('unknown profile.kind %q -- "autocannon" or "bigcannon"')
+    :format(tostring(profile.kind)), 0)
 end
 
 -- Muzzle speed in blocks/second for a cannon profile. Big cannons get

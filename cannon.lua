@@ -93,6 +93,12 @@ local DEFAULTS = {
   --    forces a speed instead (only for a datapack-tuned server whose
   --    numbers differ from the published ones); 0 = compute.
   --
+  -- Autocannon rounds also DESPAWN mid-air when their material's
+  -- lifetime runs out (cast_iron 11 / bronze 25 / steel 60 ticks --
+  -- ~94 / ~166 / ~405 blocks flat at full barrels); the fire gate
+  -- refuses shots whose flight time exceeds it (WON'T REACH).
+  -- lifetimeOverride > 0 forces the tick count for tuned servers.
+  --
   -- barrelBlocks = mount pivot -> muzzle tip in blocks: CBC spawns the
   -- shell ~barrelBlocks-1.5 along the barrel, which matters for arcing
   -- big-cannon shots. arc picks the "shallow" (flat, fast) or "steep"
@@ -103,6 +109,7 @@ local DEFAULTS = {
     material = "steel",          -- autocannon: cast_iron / bronze / steel
     barrels = 6,                 -- autocannon: barrel count (cap applies)
     muzzleVelocityOverride = 0,  -- autocannon: >0 forces b/s, 0 = compute
+    lifetimeOverride = 0,        -- autocannon: >0 forces despawn ticks, 0 = material
     charges = 1,                 -- bigcannon only, powder charges loaded
     barrelBlocks = 2,
     reloadSeconds = 5,           -- bigcannon only, pause between auto shots
@@ -201,8 +208,10 @@ local DEFAULTS = {
   -- Auto-fire range gate: while armed, the fire line holds (status shows
   -- OUT OF RANGE) whenever the aim point is farther than this many
   -- blocks. The turret keeps tracking so fire resumes the moment the
-  -- target closes back in; manual F is not gated. Mind that rounds
-  -- despawn anyway (cast iron ~99, bronze ~187, steel ~540 blocks).
+  -- target closes back in; manual F is not gated. This is an INTENT
+  -- limit -- the physical despawn limit (autocannon rounds expire after
+  -- their material lifetime: cast iron ~94, bronze ~166, steel ~405
+  -- blocks flat) is gated separately and automatically (WON'T REACH).
   maxDistance = 50,
   -- Player targets. getPlayerPos reports the player's FEET (the entity
   -- position -- its Y is the bottom of the bounding box; eyes are ~1.62
@@ -490,7 +499,7 @@ local cfg = loadConfig()
 -- Recomputed by refreshProfile() so live CONFIG-tab edits to the gun take
 -- effect without a restart. Boot calls it loudly -- a typo'd projectile or
 -- bad barrel length must not become a silent default.
-local proj, muzzleSpeed, muzzleLen
+local proj, muzzleSpeed, muzzleLen, lifeTicks
 local function refreshProfile()
   local p = Ballistics.PROJECTILES[cfg.profile.projectile]
   if not p then
@@ -511,6 +520,8 @@ local function refreshProfile()
   end
   proj = p
   muzzleSpeed = Ballistics.muzzleSpeed(cfg.profile) -- blocks/sec
+  -- Autocannon despawn clock (ticks); nil = no in-flight cap (bigcannon).
+  lifeTicks = Ballistics.lifetimeTicks(cfg.profile)
   -- CBC spawns the shell ~1.5 blocks short of one-past-the-tip.
   muzzleLen = math.max(0, cfg.profile.barrelBlocks - 1.5)
 end
@@ -804,6 +815,7 @@ local state = {
   noFix = false,     -- ship mode and GPS/nav stopped answering
   outOfArc = false,  -- aim solution clamped to a travel limit
   outOfRange = false,-- aim point beyond cfg.maxDistance (auto-fire held)
+  outOfReach = false,-- round would despawn before arriving (auto-fire held)
   locked = false,    -- both axes within tolerance
   bursting = false,  -- fire line held by burst hysteresis past a closed gate
   armed = false,     -- auto-fire master switch (ARM button / A key)
@@ -1034,8 +1046,12 @@ local function solveArc(dh, dy)
 end
 
 -- World-space target position -> desired mount yaw/pitch in degrees,
--- the distance in blocks, the shell's flight time in seconds, and
--- whether a ballistic solution exists. Yaw is geometric; pitch comes
+-- the distance in blocks, the shell's flight time in seconds, whether
+-- a ballistic solution exists, and whether the round SURVIVES the
+-- flight (autocannon rounds despawn after lifeTicks; a solution whose
+-- flight time outruns the clock arrives as nothing -- canReach=false
+-- keeps the fire gate shut while the barrel still tracks). canReach is
+-- nil when there is no solution at all. Yaw is geometric; pitch comes
 -- from the arc solver in the world vertical plane (gravity is world-
 -- down), and the resulting aim DIRECTION is projected through the ship
 -- basis -- a rolled deck couples world pitch into both mount axes, so
@@ -1050,9 +1066,13 @@ local function anglesFor(tx, ty, tz)
   local distance = math.sqrt(dx ^ 2 + dy ^ 2 + dz ^ 2)
   local dh = math.sqrt(dx * dx + dz * dz)
   local sol = dh > 1e-6 and solveArc(dh, dy) or nil
-  local worldPitch, tof, hasArc
+  local worldPitch, tof, hasArc, canReach
   if sol then
     worldPitch, tof, hasArc = sol.pitch, sol.tof, true
+    -- CBC decrements the despawn clock AFTER the move, so a round
+    -- arriving exactly on its last tick still lands: reach = tof ticks
+    -- <= lifetime (+0.5 tick slack for the solver's fractional tick).
+    canReach = lifeTicks == nil or tof * 20 <= lifeTicks + 0.5
   else
     worldPitch = math.deg(math.asin(dy / distance))
     tof = distance / muzzleSpeed
@@ -1079,11 +1099,12 @@ local function anglesFor(tx, ty, tz)
     -- yaw-only formula measured from ship-right; keeps the tuned
     -- yawOffset meaning what it always meant.
     local relYaw = angleDiff(math.deg(math.atan(dr, df)) - 90 - cfg.yawOffset, 0)
-    return relYaw, relPitch, distance, tof, hasArc
+    return relYaw, relPitch, distance, tof, hasArc, canReach
   end
   local relPitch = worldPitch + cfg.pitchOffset
   local worldYaw = math.deg(math.atan(dz, dx))
-  return angleDiff(worldYaw - cfg.yawOffset, 0), relPitch, distance, tof, hasArc
+  return angleDiff(worldYaw - cfg.yawOffset, 0), relPitch, distance, tof,
+    hasArc, canReach
 end
 
 -- areaRadius/avoidRadius for a ship target, per-callsign override first.
@@ -1219,7 +1240,8 @@ local function traceStart()
   if trace.on then return end
   trace.rows = { "t,dt,target,aimYaw,mountYaw,yawErr,yawErrRate,yawRpm,"
     .. "aimPitch,mountPitch,pitchErr,pitchErrRate,pitchRpm,"
-    .. "locked,bursting,hasArc,outOfRange,outOfArc,missH,missV,dist,phase" }
+    .. "locked,bursting,hasArc,outOfRange,outOfReach,outOfArc,"
+    .. "missH,missV,dist,phase" }
   trace.t0 = os.clock()
   trace.lastT = nil
   trace.on = true
@@ -1243,12 +1265,13 @@ local function traceRow(aimYaw, mountYaw, yawRpm, aimPitch, mountPitch, pitchRpm
   local function n(v, fmt) return v and (fmt):format(v) or "" end
   trace.rows[#trace.rows + 1] =
     ("%.3f,%.3f,%s,%.3f,%.3f,%.3f,%.3f,%.2f,%.3f,%.3f,%.3f,%.3f,%.2f,"
-      .. "%s,%s,%s,%s,%s,%s,%s,%s,%s")
+      .. "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s")
       :format(t, dt, tostring(state.targetName), aimYaw, mountYaw, state.yawErr,
         track.yawErrRate, yawRpm, aimPitch, mountPitch, state.pitchErr,
         track.pitchErrRate, pitchRpm,
         tostring(state.locked), tostring(state.bursting), tostring(state.hasArc),
-        tostring(state.outOfRange), tostring(state.outOfArc),
+        tostring(state.outOfRange), tostring(state.outOfReach),
+        tostring(state.outOfArc),
         n(state.missH, "%.2f"), n(state.missV, "%.2f"), n(state.dist, "%.0f"),
         phase or "")
 end
@@ -1435,7 +1458,9 @@ local function zonePathBlocked()
   local vx, vy, vz = hx * v0, hy * v0, hz * v0
   local q = 1 - proj.drag
   local maxd2 = (cfg.maxDistance + 16) ^ 2
-  for _ = 1, 600 do
+  -- A round that despawns mid-air can't hit a column past its lifetime,
+  -- so don't integrate (or hold fire) beyond the despawn clock.
+  for _ = 1, math.min(lifeTicks or 600, 600) do
     local nvx, nvy, nvz = vx * q, vy * q + proj.gravity, vz * q
     px = px + 0.5 * (vx + nvx)
     py = py + 0.5 * (vy + nvy)
@@ -2142,6 +2167,7 @@ local function setTarget(kind, name)
   state.bursting = false
   state.outOfArc = false
   state.outOfRange = false
+  state.outOfReach = false
   state.miss, state.missH, state.missV = nil, nil, nil
   state.lead = nil
   state.dist = nil
@@ -2185,9 +2211,10 @@ end
 -- never open just swings the barrel at someone we can't hit.
 local function sentryCanHit(c)
   if not (c.x and c.y and c.z) then return false end
-  local relYaw, relPitch, dist, _, hasArc = anglesFor(c.x, c.y, c.z)
+  local relYaw, relPitch, dist, _, hasArc, canReach = anglesFor(c.x, c.y, c.z)
   if relYaw == nil then return false end -- no cannon fix
   if not hasArc then return false end
+  if canReach == false then return false end -- despawns before arriving
   if dist > cfg.maxDistance then return false end
   local lim = cfg.limits
   if (lim.yaw.max - lim.yaw.min) < 359 then
@@ -2225,7 +2252,7 @@ local function sentryAcquire()
         if c.name == state.targetName then still = true break end
       end
       local bad = not still or state.lost or state.outOfArc
-        or state.outOfRange or state.hasArc == false
+        or state.outOfRange or state.outOfReach or state.hasArc == false
       if not bad then
         state.sentryBadSince = nil
       elseif not still then -- gone from the roster entirely: drop now
@@ -2299,6 +2326,11 @@ local CONFIG_ITEMS = {
     show = function() return cfg.profile.kind == "autocannon" end,
     get = function() return cfg.profile.muzzleVelocityOverride end,
     set = function(v) cfg.profile.muzzleVelocityOverride = v end },
+  { group = "Build", label = "lifeOverride", etype = "num", file = "cfg", profile = true,
+    min = 0, max = 1200, step = 5,
+    show = function() return cfg.profile.kind == "autocannon" end,
+    get = function() return cfg.profile.lifetimeOverride end,
+    set = function(v) cfg.profile.lifetimeOverride = v end },
   { group = "Build", label = "charges", etype = "num", file = "cfg", profile = true,
     min = 1, max = 10, step = 1,
     show = function() return cfg.profile.kind == "bigcannon" end,
@@ -2889,6 +2921,10 @@ local function drawStatus()
       elseif state.outOfRange then
         term.setTextColor(colors.orange)
         term.write(" OUT OF RANGE")
+      elseif state.outOfReach then
+        -- Round would despawn mid-flight (autocannon lifetime clock).
+        term.setTextColor(colors.orange)
+        term.write(" WON'T REACH")
       end
     elseif state.outOfArc then
       term.setTextColor(colors.orange)
@@ -2910,6 +2946,9 @@ local function drawStatus()
       elseif state.outOfRange then
         term.setTextColor(colors.orange)
         term.write(" RANGE") -- short: this line already carries the errors
+      elseif state.outOfReach then
+        term.setTextColor(colors.orange)
+        term.write(" DESPAWN") -- short: round expires before arriving
       end
     end
   elseif cfg.ship.enabled then
@@ -3126,6 +3165,15 @@ local function drawDebugScreen(w, h)
     src = ("%s x%d barrels"):format(cfg.profile.material, cfg.profile.barrels)
   end
   line("speed from", src)
+  -- Despawn clock + the flat-fire distance it allows (trapezoidal closed
+  -- form, K = 1/drag - 0.5): rounds vanish mid-air past this many blocks.
+  if lifeTicks then
+    local k = 1 / proj.drag - 0.5
+    local reach = (muzzleSpeed / 20) * k * (1 - (1 - proj.drag) ^ lifeTicks)
+    line("despawn", ("%d ticks (~%.0f blk flat%s)"):format(lifeTicks, reach,
+      (type(cfg.profile.lifetimeOverride) == "number"
+        and cfg.profile.lifetimeOverride > 0) and ", override" or ""))
+  end
   line("drive y/p RPM", ("%s / %s d/s/RPM, floor %s/%s"):format(
     tostring(cfg.yawDrive.degPerSecPerRpm), tostring(cfg.pitchDrive.degPerSecPerRpm),
     tostring(cfg.yawDrive.minSpeed), tostring(cfg.pitchDrive.minSpeed)))
@@ -3157,6 +3205,13 @@ local function drawDebugScreen(w, h)
       or (state.tof and ("%s arc, tof %.2fs"):format(
         cfg.profile.arc, state.tof) or "?"),
       state.hasArc == false and colors.red or nil)
+    -- Autocannon despawn clock: flight ticks vs the material lifetime.
+    -- Red WON'T REACH = the round expires mid-air short of the target.
+    if lifeTicks and state.tof and state.hasArc then
+      line("despawn", ("%.0f / %d ticks%s"):format(state.tof * 20,
+        lifeTicks, state.outOfReach and "  WON'T REACH" or ""),
+        state.outOfReach and colors.red or colors.lime)
+    end
     -- Predicted shot from the ACTUAL barrel angle (static mode): a spot to
     -- go watch, plus how high/low it crosses the target's range right now.
     if state.impact then
@@ -3427,7 +3482,8 @@ local function trackLoop()
         -- aim point (after ship-avoid / lead / hitbox aimHeight).
         state.targetRaw = { x = pos.x, y = pos.y, z = pos.z }
         state.aim = { x = ax, y = ay, z = az }
-        local relYaw, relPitch, dist, tof, hasArc = anglesFor(ax, ay, az)
+        local relYaw, relPitch, dist, tof, hasArc, canReach =
+          anglesFor(ax, ay, az)
         if not relYaw then
           -- Stale ship fix: hold rather than aim with old coords/heading.
           state.noFix = true
@@ -3441,6 +3497,7 @@ local function trackLoop()
           state.tof = tof
           state.hasArc = hasArc
           state.outOfRange = dist > cfg.maxDistance
+          state.outOfReach = canReach == false
           local data = blockReader.getBlockData()
           state.mount = data
           if data and data.CannonYaw and data.CannonPitch then
@@ -3608,10 +3665,12 @@ local function trackLoop()
       end
       -- Auto-fire actuation. The gate additionally requires a real
       -- ballistic solution -- NO ARC means the barrel is only posing --
+      -- a round that survives the flight (autocannon despawn clock),
       -- and a shell path clear of every friendly-fire column.
       state.zoneBlocked = state.targetName ~= nil and zonePathBlocked()
       local gate = state.armed and (state.locked or state.bursting)
-        and not state.outOfRange and state.hasArc == true
+        and not state.outOfRange and not state.outOfReach
+        and state.hasArc == true
         and not state.zoneBlocked
       if cfg.profile.kind == "bigcannon" then
         if cfg.reload.enabled then
@@ -3814,7 +3873,8 @@ local function buildSpruceStatus()
     status = {
       armed = state.armed, locked = state.locked, lost = state.lost,
       noFix = state.noFix, outOfArc = state.outOfArc,
-      outOfRange = state.outOfRange, firing = state.firing,
+      outOfRange = state.outOfRange, outOfReach = state.outOfReach,
+      firing = state.firing,
       hasArc = state.hasArc, calibrating = state.calibrating,
       reloadPhase = reloadSeq.phase,
       shipMode = cfg.ship.enabled,
@@ -3827,6 +3887,10 @@ local function buildSpruceStatus()
       -- Physics constants + muzzle offset so the browser can integrate
       -- the same trajectory the solver uses (3D arc preview / phase 4).
       gravity = proj.gravity, drag = proj.drag, muzzleLen = muzzleLen,
+      -- Autocannon despawn clock; absent = no in-flight cap (bigcannon).
+      -- The browser truncates tracers/arcs/envelope at this tick; the
+      -- brain caps its reachability band the same way.
+      lifetimeTicks = lifeTicks,
     },
     roster = jsonList(state.roster),
     shots = jsonList(spruceShots),

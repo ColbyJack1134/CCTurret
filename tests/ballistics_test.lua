@@ -203,5 +203,55 @@ check("autocannon unknown material errors",
 check("unknown kind errors",
   not pcall(B.muzzleSpeed, { kind = "railgun" }))
 
+-- Profile -> despawn clock (CBC AbstractAutocannonProjectile.ageRemaining,
+-- seeded per cannon material): autocannon rounds vanish mid-air when it
+-- runs out; big-cannon shells fly uncapped.
+check("lifetime cast_iron = 11 ticks",
+  B.lifetimeTicks{ kind = "autocannon", material = "cast_iron" } == 11)
+check("lifetime bronze = 25 ticks",
+  B.lifetimeTicks{ kind = "autocannon", material = "bronze" } == 25)
+check("lifetime steel = 60 ticks",
+  B.lifetimeTicks{ kind = "autocannon", material = "steel" } == 60)
+check("bigcannon has no lifetime cap",
+  B.lifetimeTicks{ kind = "bigcannon" } == nil)
+check("lifetimeOverride forces the clock",
+  B.lifetimeTicks{ kind = "autocannon", material = "steel",
+    lifetimeOverride = 100 } == 100)
+check("lifetimeOverride 0 falls back to the material",
+  B.lifetimeTicks{ kind = "autocannon", material = "steel",
+    lifetimeOverride = 0 } == 60)
+check("lifetime unknown material errors",
+  not pcall(B.lifetimeTicks, { kind = "autocannon", material = "titanium" }))
+check("lifetime unknown kind errors",
+  not pcall(B.lifetimeTicks, { kind = "railgun" }))
+
+-- Despawn boundary: full steel (180 b/s, 60 ticks) reaches ~405 blocks
+-- flat -- x(n) = vh*K*(1-q^n) gives 405.5 at n=60. The solver's tof and
+-- the independent per-tick sim must agree on which side of the clock a
+-- shot falls (the WON'T REACH fire gate is tof*20 <= life + 0.5).
+do
+  local life = B.lifetimeTicks{ kind = "autocannon", material = "steel" }
+  for _, d in ipairs({
+    { dx = 400, reach = true },   -- ~58.8 flight ticks
+    { dx = 415, reach = false },  -- ~61.9 flight ticks
+  }) do
+    local sols = B.solve{ v0 = 180, gravity = AC.gravity, drag = AC.drag,
+      dx = d.dx, dy = 0, muzzle = 0.5 }
+    check(("despawn %d solvable"):format(d.dx), #sols >= 1, "no solutions")
+    if #sols >= 1 then
+      local _, tof = simulate(180, AC.gravity, AC.drag, 0.5,
+        sols[1].pitch, d.dx)
+      local solverReach = sols[1].tof * 20 <= life + 0.5
+      check(("despawn %d solver reach = %s"):format(d.dx, tostring(d.reach)),
+        solverReach == d.reach,
+        ("solver %.1f ticks vs life %d"):format(sols[1].tof * 20, life))
+      local simReach = tof ~= nil and tof * 20 <= life + 0.5
+      check(("despawn %d sim agrees"):format(d.dx), simReach == d.reach,
+        tof and ("sim %.1f ticks vs life %d"):format(tof * 20, life)
+          or "no impact")
+    end
+  end
+end
+
 print(fails == 0 and "ALL PASS" or (fails .. " FAILURES"))
 if fails > 0 then os.exit(1) end

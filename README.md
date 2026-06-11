@@ -111,8 +111,11 @@ mode for regular cannons is planned.
 
 Auto-fire is range-gated: beyond `maxDistance` blocks (default 50) the
 line holds and the status shows OUT OF RANGE, while tracking continues
-so fire resumes the moment the target closes back in. Manual `F` is not
-gated. In the other direction, **burst hysteresis** (`burst` in the
+so fire resumes the moment the target closes back in. Autocannons are
+also **despawn-gated**: when the solved flight time outruns the round's
+material lifetime (see `material` below) the status shows WON'T REACH
+and the line holds — the round would vanish mid-air short of the
+target. Manual `F` is not gated. In the other direction, **burst hysteresis** (`burst` in the
 config, on by default) keeps an opened gate from chattering: once
 firing, the line stays high while the miss is still within
 `burst.widen`× the normal gate (hitbox / hull ring / tolerance), and
@@ -156,13 +159,20 @@ mode and the ballistics:
   iron `20×(5 + 2×min(b,2))`, bronze `20×(3 + 1.5×min(b,3))`, steel
   `20×(3 + 1.5×min(b,4))`. A full-length steel or cast-iron gun is 180
   b/s. So set `material` (`cast_iron`/`bronze`/`steel`) and the barrel
-  count, not a velocity. Mind projectile lifetime: cast iron rounds
-  despawn after ~99 blocks, bronze ~187, steel ~540.
+  count, not a velocity. Autocannon rounds (machine-gun included) also
+  carry a **despawn clock from the material** — cast iron 11 ticks,
+  bronze 25, steel 60 — and vanish mid-air when it runs out: ~94 / ~166
+  / ~405 blocks flat at full barrels (drag-accurate; high arcs cover
+  less). The turret solves flight time against this clock and holds
+  auto-fire with **WON'T REACH** when the round would expire short of
+  the target. Big-cannon shells have no in-flight cap.
 - `muzzleVelocityOverride` (autocannon): `> 0` forces the muzzle speed
   in b/s instead of computing it — only for a **datapack-tuned server**
   whose numbers differ from the published ones; `0` = compute. (Old
   configs: a hand-tuned `muzzleVelocity` / `lead.muzzleVelocity`
   migrates into this override automatically.)
+- `lifetimeOverride` (autocannon): `> 0` forces the despawn clock in
+  ticks (same datapack escape hatch as the speed); `0` = material.
 - `barrelBlocks`: mount pivot → muzzle tip, in blocks. CBC spawns the
   shell ~`barrelBlocks − 1.5` out along the barrel; on a long gun
   ignoring that shifts arcing shots by 15–25 blocks at range.
