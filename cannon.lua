@@ -1825,13 +1825,32 @@ local function calibrate()
   -- calibrated mount isn't re-read off-rest on a later boot.
   local changed = false
   if cfg.yawOffset == "auto" then
-    if not blockReader then error("no block reader to read the rest yaw", 0) end
-    local data = blockReader.getBlockData()
-    if not (data and type(data.CannonYaw) == "number") then
-      error("can't read the rest yaw (no CannonYaw) -- is the cannon assembled?", 0)
+    if not cfg.ship.enabled then
+      -- STATIC mounts need no measurement at all: CBC's CannonYaw NBT is
+      -- an ABSOLUTE world yaw (MC convention -- initialized from
+      -- getContraptionDirection():toYRot() and world-framed thereafter;
+      -- verified against the CBC source). Converting MC yaw (south=0) to
+      -- our atan2(dz,dx) frame (east=0) is a fixed +90 for EVERY static
+      -- mount regardless of build facing. The brief "measure the rest
+      -- yaw" approach silently assumed east-facing builds and was 90/180
+      -- deg wrong on any other orientation.
+      cfg.yawOffset = 90
+      print("Static mount: yawOffset = 90 (CBC CannonYaw is world-absolute)")
+    else
+      -- SHIP mounts: CannonYaw is absolute in the SHIP GRID frame, and
+      -- the deck offset depends on how the grid axes line up with
+      -- heading.lua's forward convention -- genuinely per-build, so it
+      -- stays measured. A freshly assembled cannon sits at its rest yaw
+      -- and the block reader reports it directly.
+      if not blockReader then error("no block reader to read the rest yaw", 0) end
+      local data = blockReader.getBlockData()
+      if not (data and type(data.CannonYaw) == "number") then
+        error("can't read the rest yaw (no CannonYaw) -- is the cannon assembled?", 0)
+      end
+      cfg.yawOffset = angleDiff(0, data.CannonYaw) -- = normalize(-rest); 270 -> 90
+      print(("Rest yaw %.1f -> yawOffset %.1f (deck frame)"):format(
+        data.CannonYaw, cfg.yawOffset))
     end
-    cfg.yawOffset = angleDiff(0, data.CannonYaw) -- = normalize(-rest); 270 -> 90
-    print(("Rest yaw %.1f -> yawOffset %.1f"):format(data.CannonYaw, cfg.yawOffset))
     changed = true
   end
   if resolveDrives() then changed = true end
@@ -3184,19 +3203,27 @@ local function trackLoop()
     -- yawOffset. Owns the motors and the assembly relay, so serviced here.
     if state.offsetCalRequest then
       state.offsetCalRequest = false
-      state.calibrating = true
-      stopMotors()
-      draw()
-      local ok, rest, off = pcall(calibrateYawOffset)
-      state.calibrating = false
-      if ok then
-        state.flash = ("yawOffset = %.0f (rest yaw %.0f)"):format(off, rest)
+      if not cfg.ship.enabled then
+        -- Static: nothing to measure -- CBC's CannonYaw is world-absolute
+        -- and the MC->atan2 frame conversion is a constant (see calibrate).
+        cfg.yawOffset = 90
+        writeCal(cfg)
+        state.flash = "yawOffset = 90 (static mounts are world-absolute)"
       else
-        tuneLog("ERROR: " .. tostring(rest))
-        state.flash = "OFFSET CAL FAILED (see log)"
+        state.calibrating = true
+        stopMotors()
+        draw()
+        local ok, rest, off = pcall(calibrateYawOffset)
+        state.calibrating = false
+        if ok then
+          state.flash = ("yawOffset = %.0f (deck rest yaw %.0f)"):format(off, rest)
+        else
+          tuneLog("ERROR: " .. tostring(rest))
+          state.flash = "OFFSET CAL FAILED (see log)"
+        end
+        term.setBackgroundColor(colors.black)
+        term.clear()
       end
-      term.setBackgroundColor(colors.black)
-      term.clear()
     end
     -- Advance the physical reload cycle every frame, target or not, so a
     -- shot fired just before the target dropped still rebuilds the gun.

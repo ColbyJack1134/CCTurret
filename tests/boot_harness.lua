@@ -223,7 +223,8 @@ if cfg and cal then
   check("cfg keeps yawDrive.speedGain", cfg.yawDrive and cfg.yawDrive.speedGain ~= nil)
   check("cfg keeps profile.material steel", cfg.profile and cfg.profile.material == "steel")
   check("cfg has NO yawOffset (cal key now)", cfg.yawOffset == nil)
-  check("cal yawOffset measured from rest yaw (number)", type(cal.yawOffset) == "number")
+  check("cal yawOffset = 90 (static constant, CBC yaw is world-absolute)",
+    cal.yawOffset == 90, tostring(cal.yawOffset))
   check("cfg peripherals has NO yaw (cal key)", cfg.peripherals and cfg.peripherals.yaw == nil)
   check("cal invertYaw measured (boolean)", type(cal.invertYaw) == "boolean")
   check("cal degPerSecPerRpm ~ 0.75",
@@ -294,8 +295,8 @@ if cfg3 and cal3 then
   check("peripheral names lifted into cal",
     cal3.peripherals and cal3.peripherals.yaw == "Create_RotationSpeedController_1")
   check("invertYaw removed from cfg after migration", cfg3.invertYaw == nil)
-  check("legacy cfg yawOffset 90 NOT carried (re-measured from rest)",
-    cfg3.yawOffset == nil and cal3.yawOffset == 0,
+  check("legacy cfg yawOffset moves to cal as the static constant 90",
+    cfg3.yawOffset == nil and cal3.yawOffset == 90,
     ("cfg=%s cal=%s"):format(tostring(cfg3.yawOffset), tostring(cal3.yawOffset)))
 end
 
