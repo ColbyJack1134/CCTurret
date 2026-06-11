@@ -2514,6 +2514,25 @@ local CONFIG_ITEMS = {
     set = function(v) cfg.yawOffset = v end },
 }
 
+-- Heal enum values that were stored as STRINGS: the old setcfg text parse
+-- saved "false"/"true" (truthy!) for boolean enums into cannon.cfg, so a
+-- cloned turret could BEHAVE upside-down while displaying false. If the
+-- saved value is a string naming one of the item's real (non-string)
+-- values, swap the real one back in. Persists on the next normal save.
+for _, it in ipairs(CONFIG_ITEMS) do
+  if it.etype == "enum" and it.values then
+    local cur = it.get()
+    if type(cur) == "string" then
+      for _, v in ipairs(it.values) do
+        if type(v) ~= "string" and tostring(v) == cur then
+          it.set(v)
+          break
+        end
+      end
+    end
+  end
+end
+
 -- Items visible for the current kind (Build items gate on the gun type).
 local function visibleConfigItems()
   local out = {}
@@ -2590,6 +2609,19 @@ local function parseCfgValue(it, text)
     if not n then return nil, "need a number" end
     if it.etype == "float" then return n end
     return math.max(it.min, math.min(it.max, n))
+  end
+  if it.etype == "enum" and it.values then
+    -- Match against the REAL value list and return the typed value. Enum
+    -- values can be booleans (upsideDown, gps, ...) and the old raw-text
+    -- fallthrough stored the STRING "false" from web setcfg/clone --
+    -- which is truthy in Lua, so a turret behaved upside-down while its
+    -- config printed false.
+    for _, v in ipairs(it.values) do
+      if tostring(v) == text then return v end
+    end
+    local names = {}
+    for _, v in ipairs(it.values) do names[#names + 1] = tostring(v) end
+    return nil, "must be one of: " .. table.concat(names, ", ")
   end
   return tonumber(text) or text
 end
