@@ -1844,7 +1844,20 @@ local function calibrate()
       -- yaw" approach silently assumed east-facing builds and was 90/180
       -- deg wrong on any other orientation.
       cfg.yawOffset = 90
-      print("Static mount: yawOffset = 90 (CBC CannonYaw is world-absolute)")
+      -- Fresh calibration also captures HOME from wherever the barrel
+      -- sits right now -- on a fresh build that's its built rest
+      -- direction, so a new turret parks the way it was built without
+      -- any setup. Re-home any time: aim the barrel and press O.
+      if blockReader then
+        local data = blockReader.getBlockData()
+        if data and type(data.CannonYaw) == "number" then
+          cfg.homeYaw = angleDiff(data.CannonYaw + cfg.yawOffset, 0)
+          cfg.homePitch = type(data.CannonPitch) == "number"
+            and math.floor(data.CannonPitch * 10 + 0.5) / 10 or 0
+        end
+      end
+      print(("Static mount: yawOffset = 90 (world-absolute); home az %s")
+        :format(tostring(cfg.homeYaw)))
     else
       -- SHIP mounts: CannonYaw is absolute in the SHIP GRID frame, and
       -- the deck offset depends on how the grid axes line up with
