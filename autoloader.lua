@@ -54,6 +54,10 @@ local SEQUENCE = {
 local TRIGGER_SIDE = "bottom"  -- redstone rising edge here starts a cycle
 local STROKE_DELAY = 0.25    -- seconds between place/ram strokes so the
                              -- server registers each block move before the next
+local BREECH_DELAY = 0.2     -- seconds between the trigger and the FIRST
+                             -- place: the reload pulse can arrive while the
+                             -- sliding breech is still opening, and placing
+                             -- against a closed breech jams the load
 
 -- Restock: the turtle faces the breech, so the side chests are reached by
 -- turning. Left chest = shells, right chest = charges (per your build). After
@@ -135,6 +139,7 @@ end
 local function loadCycle()
   checkSupplies()
   print("Loading...")
+  sleep(BREECH_DELAY) -- let the breech finish sliding open
   for _, step in ipairs(SEQUENCE) do
     print(("Placing %s, ramming %d."):format(step.name, step.rams))
     placeMunition(step)
