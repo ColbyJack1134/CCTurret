@@ -79,4 +79,16 @@ syncFile("heading.lua")
 -- program; keep it fresh only where an operator already installed it.
 if fs.exists("transponder.lua") then syncFile("transponder.lua") end
 
-shell.run("cannon")
+-- Crash supervisor. A clean stop (Q key / Ctrl+T) returns true and the
+-- computer stays at the shell; a crash returns false (cannon.lua re-raises
+-- after appending cannon.crash.log) and previously left the turret dead at
+-- a shell prompt until someone walked over -- "computer on, offline in
+-- Spruce forever". Reboot instead of re-running: the boot sync pulls fresh
+-- code (a fix deployed server-side heals a crash-looping turret) and a
+-- reboot drops any leaked http/websocket handles. The delay keeps a hard
+-- crash loop slow enough to read and gives Ctrl+T a window to abort.
+if not shell.run("cannon") then
+  print("cannon crashed (see cannon.crash.log); reboot in 10s, Ctrl+T aborts")
+  sleep(10)
+  os.reboot()
+end

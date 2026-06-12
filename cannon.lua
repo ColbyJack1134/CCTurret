@@ -75,7 +75,7 @@ local DEFAULTS = {
     reloadPulseSeconds = 0.4,
     settleSeconds = 1.0,
     park = false,
-    parkSeconds = 4.0,
+    parkSeconds = 10.0,
   },
   -- What this cannon is: drives both the fire mode and the ballistics.
   -- kind "autocannon" holds the fire line while the gate is open;
@@ -212,7 +212,7 @@ local DEFAULTS = {
   -- limit -- the physical despawn limit (autocannon rounds expire after
   -- their material lifetime: cast iron ~94, bronze ~166, steel ~405
   -- blocks flat) is gated separately and automatically (WON'T REACH).
-  maxDistance = 50,
+  maxDistance = 1000,
   -- Player targets. getPlayerPos reports the player's FEET (the entity
   -- position -- its Y is the bottom of the bounding box; eyes are ~1.62
   -- above). So the hitbox is FEET-RELATIVE: a box `width` wide rising
@@ -826,6 +826,8 @@ local state = {
   spruceSentry = false,    -- server says: auto-acquire hostiles locally
   spruceFriendlies = {},   -- name -> true, server's do-not-engage list
   spruceWsUp = false,      -- websocket link live (event pushes enabled)
+  spruceWsUrl = nil,       -- ws endpoint, set once by spruceLoop (janitor key)
+  spruceWsExpect = false,  -- a wsConnect is mid-handshake: hands off, janitor
   spruceZones = {},        -- no-fire columns over sister turrets (ctl)
   zoneBlocked = false,     -- current solution's path enters a zone: hold fire
   sentryTarget = nil,      -- name WE acquired (vs operator/brain-set), so
@@ -3403,7 +3405,14 @@ local function trackLoop()
   -- hold steady as cfg.trackSeconds changes the tracking rate.
   local rosterTicks = math.max(1, math.floor(1 / cfg.trackSeconds + 0.5))
   local shipIdleTicks = math.max(1, math.floor(0.5 / cfg.trackSeconds + 0.5))
-  while running do
+  -- One full tracking tick, including its pacing sleep. Runs under pcall
+  -- in the loop below: the detector/reader/motor peripherals can detach
+  -- for a tick (chunk reload, contraption work, server hiccup) and every
+  -- call on a detached wrapper THROWS -- an unhandled throw here takes
+  -- down the whole parallel stack, spruceLoop included, which is how a
+  -- turret that still shoots fine drops off Spruce until a manual reboot.
+  -- Fail loud (flash), stop the motors, keep the program alive.
+  local function trackTick()
     local loopStart = os.clock()
     -- Ship fix every tick while tracking (a climbing ship stair-steps the
     -- aim on anything slower), every 0.5s when idle; roster every 1s.
@@ -3767,6 +3776,19 @@ local function trackLoop()
     end
     state.flash = nil
   end
+
+  while running do
+    local ok, err = pcall(trackTick)
+    if not ok then
+      -- Ctrl+T must still stop the program, not flash as an error.
+      if tostring(err) == "Terminated" then error(err, 0) end
+      pcall(stopMotors)
+      state.locked, state.bursting = false, false
+      state.flash = "TRACK ERR: " .. tostring(err)
+      pcall(draw)
+      sleep(1) -- the failed tick may have died before its pacing sleep
+    end
+  end
 end
 
 -- Open the modal line editor on a CONFIG field (idx into the visible list).
@@ -4072,13 +4094,22 @@ local function spruceLoop()
   local urlStatus = spruceCfg.url .. "/api/drone/turret/status"
   local urlAck = spruceCfg.url .. "/api/drone/turret/ack"
   local wsUrl = spruceCfg.url:gsub("^http", "ws") .. "/api/drone/turret/ws"
+  state.spruceWsUrl = wsUrl -- inputLoop's stray-socket janitor keys on this
 
   -- POST returning the decoded JSON table, or nil on any transport/HTTP
   -- failure. http.post only hands back a handle on 2xx; non-2xx arrives
   -- as the 4th value and both need closing or CC leaks the connection.
   -- The http call yields while in flight, so trackLoop keeps running.
+  -- timeout: the same half-up server that hangs a blocking ws connect
+  -- (see wsConnect) hangs a blocking POST -- TCP accepted, response never
+  -- comes, no RST -- and a wedged rpc freezes ALL of C2 (status posts AND
+  -- the ws retry live in this coroutine). The request-table timeout turns
+  -- that into an ordinary LINK DOWN -> 5s-retry failure. (CC:T >= 1.105;
+  -- older runtimes ignore the field and keep today's behavior.)
+  local HTTP_TIMEOUT = 10
   local function rpc(url, body)
-    local ok, res, _, errRes = pcall(http.post, url, body, headers)
+    local ok, res, _, errRes = pcall(http.post, {
+      url = url, body = body, headers = headers, timeout = HTTP_TIMEOUT })
     if not ok or not res then
       if ok and errRes then pcall(errRes.close) end
       return nil
@@ -4161,19 +4192,33 @@ local function spruceLoop()
   local function wsConnect()
     local okA = pcall(http.websocketAsync, wsUrl, headers)
     if not okA then return nil end
+    -- While we're waiting here, the success is OURS: the janitor in
+    -- inputLoop (which sees every event too) must keep its hands off.
+    state.spruceWsExpect = true
     local deadline = os.startTimer(8)
     while running do
       local ev, a, b = os.pullEvent()
       if ev == "websocket_success" and a == wsUrl then
         os.cancelTimer(deadline)
+        state.spruceWsExpect = false
         return b
       elseif ev == "websocket_failure" and a == wsUrl then
         os.cancelTimer(deadline)
+        state.spruceWsExpect = false
         return nil
       elseif ev == "timer" and a == deadline then
-        return nil -- a late success just hands us a live handle next try
+        -- Give up, but the async connect is still in flight. A LATE
+        -- success would leak an open socket nobody reads -- the server
+        -- registers it and pushes commands into the void (popped from
+        -- the outbox, never acked, silently lost). This coroutine can't
+        -- catch it (httpTick's blocking post filters events away), so
+        -- inputLoop closes any success that lands while spruceWsExpect
+        -- is off and no live session is up.
+        state.spruceWsExpect = false
+        return nil
       end
     end
+    state.spruceWsExpect = false
     return nil
   end
 
@@ -4196,6 +4241,12 @@ local function spruceLoop()
       local ev, a, b = os.pullEvent()
       if ev == "websocket_closed" and a == wsUrl then
         alive = false
+      elseif ev == "websocket_success" and a == wsUrl then
+        -- A stale connect attempt resolved while we already hold a live
+        -- socket (events are keyed by URL, not handle). Close the dup or
+        -- the server adopts it as this turret's socket and pushed
+        -- commands vanish.
+        pcall(b.close)
       elseif ev == "websocket_message" and a == wsUrl then
         local okJ, msg = pcall(textutils.unserialiseJSON, b or "")
         if okJ and type(msg) == "table" and msg.t == "reply" then
@@ -4322,8 +4373,11 @@ local function handleGlobalKey(k)
 end
 
 local function inputLoop()
-  while running do
-    local event = { os.pullEvent() }
+  -- Dispatch one input event. pcall'd in the loop below for the same
+  -- reason as trackTick: F/A/clicks land in fire()/toggleArm()/motor and
+  -- relay calls, and a peripheral detaching mid-keystroke must flash,
+  -- not take down the parallel stack (and Spruce with it).
+  local function dispatchInput(event)
     if ui.prompt then
       handlePromptEvent(event)
     elseif event[1] == "key" then
@@ -4371,6 +4425,27 @@ local function inputLoop()
     end
     draw()
   end
+
+  while running do
+    local event = { os.pullEvent() }
+    -- Stray Spruce websocket janitor. A connect attempt that outlived
+    -- wsConnect's deadline can still succeed later -- but spruceLoop is
+    -- blocked inside httpTick's POST by then (filtered yield, the event
+    -- never reaches it). This loop sees every event, so it closes any
+    -- success nobody is waiting for (spruceWsExpect = wsConnect owns it,
+    -- spruceWsUp = runWs owns its dups). Unowned + open = the server-side
+    -- zombie that silently eats pushed commands.
+    if event[1] == "websocket_success" and event[2] == state.spruceWsUrl
+        and not state.spruceWsExpect and not state.spruceWsUp then
+      pcall(event[3].close)
+    end
+    local ok, err = pcall(dispatchInput, event)
+    if not ok then
+      if tostring(err) == "Terminated" then error(err, 0) end
+      state.flash = "INPUT ERR: " .. tostring(err)
+      pcall(draw)
+    end
+  end
 end
 
 stopAll()
@@ -4400,5 +4475,17 @@ term.setBackgroundColor(colors.black)
 term.setTextColor(colors.white)
 term.clear()
 term.setCursorPos(1, 1)
-if not ok then error(err, 0) end
+if not ok and tostring(err) ~= "Terminated" then
+  -- Crash: persist a postmortem (the startup supervisor reboots in
+  -- seconds, taking the on-screen error with it), then re-raise so
+  -- shell.run returns false and the supervisor knows to reboot.
+  local f = fs.open("cannon.crash.log", "a")
+  if f then
+    f.write(("[day %d %s] %s\n"):format(
+      os.day(), textutils.formatTime(os.time(), true), tostring(err)))
+    f.close()
+  end
+  error(err, 0)
+end
+-- Clean exit: Q key or Ctrl+T. The supervisor leaves these alone.
 print("CCBigCannon stopped.")
