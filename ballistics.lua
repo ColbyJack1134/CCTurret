@@ -141,6 +141,66 @@ function B.muzzleSpeed(profile)
     :format(tostring(profile.kind)), 0)
 end
 
+-- Ship-frame basis from a compass heading (CCMinimap convention:
+-- degrees, 0 = north = -Z, 90 = east = +X): the horizontal forward
+-- unit vector and its horizontal perpendicular ("right").
+function B.shipFrame(headingDeg)
+  local r = math.rad(headingDeg)
+  return math.sin(r), -math.cos(r), -- forward x, z
+    math.cos(r), math.sin(r)        -- right   x, z
+end
+
+-- Hull shapes for ship targets: a world-frame offset from the hull
+-- centre (the transponder) is INSIDE the hull when hullNorm <= 1.
+-- shape = { r = sphere radius, l/w/t = ellipsoid SEMI-axes (along
+-- heading / across / vertical), avoid = keep-off radius around the
+-- transponder block }. With a heading the oriented ellipsoid is used;
+-- headingless beacons get the sphere.
+function B.hullNorm(dx, dy, dz, shape, heading)
+  if heading and shape.l then
+    local fx, fz, rx, rz = B.shipFrame(heading)
+    local a = (dx * fx + dz * fz) / shape.l
+    local c = (dx * rx + dz * rz) / shape.w
+    local u = dy / shape.t
+    return math.sqrt(a * a + c * c + u * u)
+  end
+  return math.sqrt(dx * dx + dy * dy + dz * dz) / shape.r
+end
+
+-- Random aim point inside the hull shape: a world-frame offset from the
+-- hull centre, uniform over the volume, never within shape.avoid of the
+-- transponder. Rejection-samples the unit ball then stretches it onto
+-- the shape (uniformity survives an affine map). rand is injectable for
+-- deterministic tests; production passes nothing (math.random).
+function B.sampleHullAim(shape, heading, rand)
+  rand = rand or math.random
+  local oriented = heading ~= nil and shape.l ~= nil
+  local sl, sw, st
+  if oriented then sl, sw, st = shape.l, shape.w, shape.t
+  else sl, sw, st = shape.r, shape.r, shape.r end
+  for _ = 1, 64 do
+    local x = rand() * 2 - 1
+    local y = rand() * 2 - 1
+    local z = rand() * 2 - 1
+    if x * x + y * y + z * z <= 1 then
+      local dx, dy, dz
+      if oriented then
+        local fx, fz, rx, rz = B.shipFrame(heading)
+        local a, c = x * sl, z * sw
+        dx, dy, dz = fx * a + rx * c, y * st, fz * a + rz * c
+      else
+        dx, dy, dz = x * sl, y * st, z * sw
+      end
+      if dx * dx + dy * dy + dz * dz >= shape.avoid * shape.avoid then
+        return dx, dy, dz
+      end
+    end
+  end
+  -- Pathological config (avoid swallows the whole shape): aim just
+  -- below the protected bubble rather than looping forever.
+  return 0, -(shape.avoid + 1), 0
+end
+
 -- Solve launch pitch. opts:
 --   v0       muzzle speed, blocks/SECOND
 --   gravity  per-tick gravity (b/t^2), e.g. -0.05

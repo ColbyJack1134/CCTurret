@@ -258,16 +258,25 @@ local DEFAULTS = {
   -- for twice the peripheral traffic; the roster (1s) and idle ship fix
   -- (0.5s) cadences stay the same regardless.
   trackSeconds = 0.1,
-  -- Ship (transponder) targets: the broadcast position IS the peer's
-  -- computer, and destroying it loses the target's coords. So the turret
-  -- aims 1.5*avoidRadius BELOW the transponder (into the hull), and the
-  -- fire gate opens whenever the shot would land within areaRadius of the
-  -- transponder but no closer than avoidRadius: hull hits anywhere in
-  -- that ring count, the transponder block itself is never fired on.
+  -- Ship (transponder) targets: a hull SHAPE centred on the broadcast
+  -- GPS fix, and the turret aims at a RANDOM point inside it so impacts
+  -- spread across the hull instead of boring one hole. Headingless
+  -- beacons get a sphere of areaRadius; ships broadcasting a heading get
+  -- an oriented ellipsoid length x width x height (FULL dimensions in
+  -- blocks: length runs along the heading). Aim points (and the fire
+  -- gate) keep avoidRadius off the transponder block itself -- the
+  -- broadcast position IS the peer's computer, and destroying it loses
+  -- the target's coords. Big cannons re-roll the point every shot and
+  -- wait for a true lock on it; autocannons hop points every
+  -- repointSeconds while the fire line stays high anywhere in the hull.
   shipTargets = {
-    areaRadius = 8,   -- default hull "size" in blocks around the transponder
-    avoidRadius = 2,  -- protected bubble around the transponder
-    -- Per-callsign overrides, e.g. { CBJK = { areaRadius = 12 } }.
+    areaRadius = 4,   -- sphere radius (no heading broadcast)
+    length = 8,       -- ellipsoid, along the heading
+    width = 4,        --   across it
+    height = 3,       --   vertical
+    avoidRadius = 1,  -- protected bubble around the transponder block
+    repointSeconds = 2, -- autocannon: hop to a new aim point this often
+    -- Per-callsign overrides, e.g. { CBJK = { length = 24, width = 9 } }.
     perShip = {},
   },
   -- Hard travel limits per axis, in mount-frame degrees (the block
@@ -484,6 +493,15 @@ local function loadConfig()
     cfg.playerHitbox.up = nil
     cfg.playerHitbox.down = nil
     cfg.playerHitbox.aimOffset = nil
+  end
+
+  -- Migration: ship targets grew a real hull shape (random aim points,
+  -- sphere/ellipsoid) with tighter defaults. The old 8/2 defaults were
+  -- written back into every cannon.cfg by this very function, so values
+  -- still equal to them are the old DEFAULTS, not operator intent.
+  if type(cfg.shipTargets) == "table" then
+    if cfg.shipTargets.areaRadius == 8 then cfg.shipTargets.areaRadius = 4 end
+    if cfg.shipTargets.avoidRadius == 2 then cfg.shipTargets.avoidRadius = 1 end
   end
 
   writeCfg(cfg)
@@ -843,9 +861,12 @@ local state = {
   missV = nil,       --   in blocks (drives the hitbox fire gate)
   lead = nil,        -- player lead debug: { speed, blocks, tof }
   targetRaw = nil,   -- debug: raw detector/transponder point {x,y,z}
+  shipAim = nil,     -- ship targets: random hull aim offset {x,y,z,at,bad},
+                     -- world-frame from the (led) hull centre; nil = re-roll
   aim = nil,         -- debug: final solved aim point after avoid/lead/aimHeight
   roster = {},       -- { {kind, name, x, y, z, dist?}, ... } sorted by distance
-  peerShips = {},    -- transponder ships by callsign: {x,y,z,heading,seenAt}
+  peerShips = {},    -- transponder ships by callsign:
+                     -- {x,y,z,heading,seenAt,vx,vy,vz}
   mount = nil,       -- last block-reader NBT, for the debug tab
   impact = nil,      -- static-mode diagnostic: predicted impact from the
                      -- ACTUAL barrel angle {x,y,z, off, vmiss, tof}
@@ -1109,11 +1130,20 @@ local function anglesFor(tx, ty, tz)
     hasArc, canReach
 end
 
--- areaRadius/avoidRadius for a ship target, per-callsign override first.
-local function shipArea(name)
+-- Hull shape for a ship target (Ballistics.hullNorm/sampleHullAim
+-- convention: sphere radius r, ellipsoid SEMI-axes l/w/t -- the config
+-- carries full length/width/height like a ship's dimensions -- and the
+-- avoid bubble). Per-callsign overrides first.
+local function shipShape(name)
   local o = cfg.shipTargets.perShip[name] or {}
-  return o.areaRadius or cfg.shipTargets.areaRadius,
-    o.avoidRadius or cfg.shipTargets.avoidRadius
+  local st = cfg.shipTargets
+  return {
+    r = o.areaRadius or st.areaRadius,
+    l = (o.length or st.length) / 2,
+    w = (o.width or st.width) / 2,
+    t = (o.height or st.height) / 2,
+    avoid = o.avoidRadius or st.avoidRadius,
+  }
 end
 
 -- Where a shot along the barrel's CURRENT line would pass relative to a
@@ -1123,12 +1153,6 @@ end
 local function missComponents(yawErr, pitchErr, mountPitch, dist)
   return -dist * math.sin(math.rad(yawErr)) * math.cos(math.rad(mountPitch)),
     -dist * math.sin(math.rad(pitchErr))
-end
-
--- Radial miss distance in blocks (ship targets gate on a sphere).
-local function missDistance(yawErr, pitchErr, mountPitch, dist)
-  local h, v = missComponents(yawErr, pitchErr, mountPitch, dist)
-  return math.sqrt(h * h + v * v)
 end
 
 -- ------------------------------------------------------------- prediction --
@@ -1284,8 +1308,10 @@ end
 -- measured to the predicted point, not the current one. Flight time
 -- comes from the arc solver (true ballistic TOF); past max range the
 -- flat-line estimate keeps the readouts alive while hasArc holds fire.
--- Returns the aim position and the lead time used.
-local function leadPoint(pos)
+-- Returns the aim position and the lead time used. Velocity is a
+-- parameter so players (detector-history track) and ships (broadcast-
+-- to-broadcast peer velocity) share the same intercept math.
+local function interceptFor(pos, vx, vy, vz)
   local c = cannonPos()
   if not c then return pos, 0 end
   local function leadTime(p)
@@ -1297,26 +1323,43 @@ local function leadPoint(pos)
     return t + cfg.lead.latencySeconds
   end
   local t1 = leadTime(pos)
-  local t2 = leadTime({ x = pos.x + track.vx * t1, y = pos.y + track.vy * t1,
-    z = pos.z + track.vz * t1 })
+  local t2 = leadTime({ x = pos.x + vx * t1, y = pos.y + vy * t1,
+    z = pos.z + vz * t1 })
   return {
-    x = pos.x + track.vx * t2,
-    y = pos.y + track.vy * t2,
-    z = pos.z + track.vz * t2,
+    x = pos.x + vx * t2,
+    y = pos.y + vy * t2,
+    z = pos.z + vz * t2,
   }, t2
 end
 
--- Ship-target fire gate: would the shot land within `area` blocks of the
--- transponder, but no closer than `avoid`? Returns gate, missBlocks.
-local function hullGate(center, mount, area, avoid)
+local function leadPoint(pos)
+  return interceptFor(pos, track.vx, track.vy, track.vz)
+end
+
+-- Ship-target fire gate: would a shot from the barrel's CURRENT pose
+-- pass through the hull shape around `center` (sphere or, with a
+-- heading, the oriented ellipsoid), no closer than shape.avoid to the
+-- transponder? Returns gate, missBlocks (radial, for readouts/avoid),
+-- and the normalized hull coordinate (<=1 inside; the burst gate widens
+-- it). The miss offsets live in the plane perpendicular to the line of
+-- fire: h along its horizontal perpendicular, v vertical -- lifted into
+-- a world-frame vector so the ellipsoid can judge it in ship axes.
+local function hullGate(center, mount, shape, heading)
   local relYaw, relPitch, dist, _, hasArc =
     anglesFor(center.x, center.y, center.z)
   -- No arc to the hull: the "solution" is line-of-sight posture, and a
   -- miss measured against it would be fiction. Gate closed.
-  if not relYaw or not hasArc then return false, nil end
-  local miss = missDistance(angleDiff(relYaw, mount.CannonYaw),
+  if not relYaw or not hasArc then return false, nil, nil end
+  local h, v = missComponents(angleDiff(relYaw, mount.CannonYaw),
     relPitch - mount.CannonPitch, mount.CannonPitch, dist)
-  return miss <= area and miss >= avoid, miss
+  local miss = math.sqrt(h * h + v * v)
+  local c = cannonPos() -- non-nil: anglesFor just succeeded
+  local ddx, ddz = center.x - c.x, center.z - c.z
+  local dl = math.sqrt(ddx * ddx + ddz * ddz)
+  local px, pz = 0, 0
+  if dl > 1e-6 then px, pz = -ddz / dl, ddx / dl end
+  local norm = Ballistics.hullNorm(h * px, v, h * pz, shape, heading)
+  return norm <= 1 and miss >= shape.avoid, miss, norm
 end
 
 -- Big-cannon auto-fire pacing (cfg.reload.enabled = false, the autoloader
@@ -1573,6 +1616,8 @@ local function fire()
   relay.setOutput(cfg.fireSide, true)
   sleep(cfg.firePulseSeconds)
   relay.setOutput(cfg.fireSide, false)
+  -- A manual shell consumed this hull point too: roll a fresh one.
+  if state.targetKind == "ship" then state.shipAim = nil end
   state.flash = "FIRED"
 end
 
@@ -1606,6 +1651,10 @@ function startShot(now)
   setFiring(true)
   reloadSeq.phase = "firing"
   reloadSeq.at = now + cfg.firePulseSeconds
+  -- Artillery walks its fire across the hull: each shell gets a fresh
+  -- random aim point (rolled on the next track tick; the barrel re-lays
+  -- during the reload it would otherwise spend idle).
+  if state.targetKind == "ship" then state.shipAim = nil end
 end
 
 -- Advance the physical reload cycle. One edge per call (one relay change
@@ -2116,10 +2165,33 @@ local function handlePeerState(msg)
   local pos = msg.lastPos
   if type(pos) ~= "table" or type(pos.x) ~= "number"
     or type(pos.y) ~= "number" or type(pos.z) ~= "number" then return end
+  -- Ship velocity, measured broadcast-to-broadcast (the ~0.5s cadence
+  -- gives an exact dt -- the track-history estimator the players use
+  -- would see the stair-stepped fixes as alternating zero/spike).
+  -- Lightly smoothed against GPS rounding; a gap over 3s (transponder
+  -- quiet, chunk unload) makes the old velocity fiction, so reset.
+  local prev = state.peerShips[name]
+  local now = os.clock()
+  local vx, vy, vz = 0, 0, 0
+  if prev then
+    local dt = now - prev.seenAt
+    if dt > 0.05 and dt <= 3 then
+      local nvx = (pos.x - prev.x) / dt
+      local nvy = (pos.y - prev.y) / dt
+      local nvz = (pos.z - prev.z) / dt
+      vx = (prev.vx or nvx) + 0.5 * (nvx - (prev.vx or nvx))
+      vy = (prev.vy or nvy) + 0.5 * (nvy - (prev.vy or nvy))
+      vz = (prev.vz or nvz) + 0.5 * (nvz - (prev.vz or nvz))
+    elseif dt <= 0.05 then
+      -- Duplicate/burst broadcast: dt too small to difference.
+      vx, vy, vz = prev.vx or 0, prev.vy or 0, prev.vz or 0
+    end
+  end
   state.peerShips[name] = {
     x = pos.x, y = pos.y, z = pos.z,
     heading = msg.shipHeading,
-    seenAt = os.clock(),
+    seenAt = now,
+    vx = vx, vy = vy, vz = vz,
   }
 end
 
@@ -2211,6 +2283,7 @@ local function setTarget(kind, name)
   state.tof, state.hasArc = nil, nil
   state.impact = nil
   state.targetRaw, state.aim = nil, nil
+  state.shipAim = nil
   resetLead()
   resetBurst()
   setFiring(false) -- never carry a held fire line across a target change
@@ -2446,6 +2519,33 @@ local CONFIG_ITEMS = {
     show = function() return cfg.lead.enabled end,
     get = function() return cfg.lead.minSpeed end,
     set = function(v) cfg.lead.minSpeed = v end },
+  -- Hull: the ship-target shape random aim points are drawn from
+  -- (cfg.shipTargets; per-callsign overrides stay file-only).
+  { group = "Hull", label = "sphere radius", etype = "num", file = "cfg",
+    min = 1, max = 64, step = 1,
+    get = function() return cfg.shipTargets.areaRadius end,
+    set = function(v) cfg.shipTargets.areaRadius = v end },
+  { group = "Hull", label = "length", etype = "num", file = "cfg",
+    min = 1, max = 128, step = 1,
+    get = function() return cfg.shipTargets.length end,
+    set = function(v) cfg.shipTargets.length = v end },
+  { group = "Hull", label = "width", etype = "num", file = "cfg",
+    min = 1, max = 64, step = 1,
+    get = function() return cfg.shipTargets.width end,
+    set = function(v) cfg.shipTargets.width = v end },
+  { group = "Hull", label = "height", etype = "num", file = "cfg",
+    min = 1, max = 64, step = 1,
+    get = function() return cfg.shipTargets.height end,
+    set = function(v) cfg.shipTargets.height = v end },
+  { group = "Hull", label = "avoid radius", etype = "num", file = "cfg",
+    min = 0, max = 8, step = 0.5,
+    get = function() return cfg.shipTargets.avoidRadius end,
+    set = function(v) cfg.shipTargets.avoidRadius = v end },
+  { group = "Hull", label = "repointSecs", etype = "num", file = "cfg",
+    min = 0.5, max = 10, step = 0.5,
+    show = function() return cfg.profile.kind == "autocannon" end,
+    get = function() return cfg.shipTargets.repointSeconds end,
+    set = function(v) cfg.shipTargets.repointSeconds = v end },
   -- Position. All coords point at the mount BASE block; the launch pivot is
   -- derived (pivotFromBase). gps toggles manual xyz vs a GPS-fix-plus-offset
   -- derivation; static = true re-derives the mount live (refreshStaticCannon)
@@ -3227,8 +3327,8 @@ local function drawDebugScreen(w, h)
   if state.targetName then
     line("target", state.targetName, colors.cyan)
     -- Raw detector point vs the point actually solved for. A gap here is
-    -- hitbox aimHeight + lead (players) or the below-transponder drop
-    -- (ships) -- e.g. aim Y is the feet Y raised by aimHeight (centre mass).
+    -- hitbox aimHeight + lead (players) or lead + the random hull aim
+    -- point (ships) -- e.g. aim Y is the feet Y raised by aimHeight.
     line("target xyz", fmtPos(state.targetRaw))
     line("aim xyz", fmtPos(state.aim), colors.cyan)
     line("yaw/pitch err",
@@ -3294,10 +3394,29 @@ local function drawDebugScreen(w, h)
         track.yawErrRate, track.pitchErrRate, cfg.yawDrive.kd, cfg.pitchDrive.kd))
     end
     if state.targetKind == "ship" then
-      local area, avoid = shipArea(state.targetName)
+      local shp = shipShape(state.targetName)
+      local peer = state.peerShips[state.targetName]
+      local hull = (peer and peer.heading)
+        and ("%gx%gx%g hdg %d"):format(shp.l * 2, shp.w * 2, shp.t * 2,
+          peer.heading)
+        or ("sphere r%g"):format(shp.r)
       line("hull miss", state.miss
-        and ("%.1f (fire %g..%g)"):format(state.miss, avoid, area) or "?",
+        and ("%.1f (%s)"):format(state.miss, hull) or "?",
         state.locked and colors.lime or colors.yellow)
+      -- The rolled aim offset inside the hull (re-rolls per shell /
+      -- every repointSeconds) and the transponder lead, if moving.
+      if state.shipAim then
+        line("hull point", ("%+.1f %+.1f %+.1f%s"):format(
+          state.shipAim.x, state.shipAim.y, state.shipAim.z,
+          state.shipAim.bad and "  UNREACHABLE" or ""),
+          state.shipAim.bad and colors.orange or nil)
+      end
+      if cfg.lead.enabled then
+        line("lead", state.lead
+          and ("%.1fm @ %.1fm/s (t %.2fs)"):format(
+            state.lead.blocks, state.lead.speed, state.lead.tof)
+          or "none (still)", colors.orange)
+      end
     else
       local hb = cfg.playerHitbox
       line("aim miss h/v", state.missH
@@ -3502,15 +3621,53 @@ local function trackLoop()
       local pos = targetPos()
       if pos then
         state.lost = false
-        -- Ship targets: aim below the transponder, never at it (the
-        -- broadcast position is the block keeping the target on the air).
-        -- Players: the reported point is the FEET, so raise the aim by
-        -- aimHeight (centre of mass) and led to the intercept when on.
-        local area, avoid
+        -- Ship targets: a random aim point inside the hull shape around
+        -- the (led) transponder fix, so impacts spread across the ship
+        -- instead of boring one hole. Players: the reported point is the
+        -- FEET, so raise the aim by aimHeight (centre of mass) and lead
+        -- to the intercept when on.
+        local shape, hullCenter -- ship targets only
         local ax, ay, az = pos.x, pos.y, pos.z
         if state.targetKind == "ship" then
-          area, avoid = shipArea(state.targetName)
-          ay = ay - avoid * 1.5
+          shape = shipShape(state.targetName)
+          -- Lead, on the broadcast-to-broadcast peer velocity through
+          -- the same intercept solver players use -- plus dead-reckoning
+          -- the up-to-0.5s-old fix forward to NOW, which also smooths
+          -- the stair-step a climbing ship used to put in the aim.
+          local speed = pos.vx
+            and math.sqrt(pos.vx * pos.vx + pos.vy * pos.vy
+              + pos.vz * pos.vz) or 0
+          if cfg.lead.enabled and speed >= cfg.lead.minSpeed then
+            local age = os.clock() - pos.seenAt
+            local here = { x = pos.x + pos.vx * age,
+              y = pos.y + pos.vy * age, z = pos.z + pos.vz * age }
+            local p, tof = interceptFor(here, pos.vx, pos.vy, pos.vz)
+            state.lead = { speed = speed, blocks = speed * tof, tof = tof }
+            ax, ay, az = p.x, p.y, p.z
+          else
+            state.lead = nil
+          end
+          hullCenter = { x = ax, y = ay, z = az }
+          -- Random hull point: artillery re-rolls at the trigger (one
+          -- shell per point, walked across the ship); autocannons hop
+          -- every repointSeconds WITHOUT dropping the fire line -- the
+          -- gate below is the whole hull, so the stream keeps cutting
+          -- while the barrel transits to the new point. A point the
+          -- solver can't serve (arc/limits/despawn) re-rolls at most
+          -- twice a second. Offsets are world-frame, so the point rides
+          -- the moving fix without swinging as the ship turns.
+          local sa = state.shipAim
+          local nowR = os.clock()
+          if not sa
+            or (cfg.profile.kind == "autocannon"
+              and nowR - sa.at >= cfg.shipTargets.repointSeconds)
+            or (sa.bad and nowR - sa.at >= 0.5) then
+            local rdx, rdy, rdz =
+              Ballistics.sampleHullAim(shape, pos.heading)
+            sa = { x = rdx, y = rdy, z = rdz, at = nowR }
+            state.shipAim = sa
+          end
+          ax, ay, az = ax + sa.x, ay + sa.y, az + sa.z
         elseif state.targetKind == "player" then
           if cfg.lead.enabled then
             updateLead(pos)
@@ -3610,17 +3767,40 @@ local function trackLoop()
             state.outOfArc = aimYaw ~= tgtYaw or aimPitch ~= relPitch
             state.yawErr = yawFull and angleDiff(aimYaw, cy) or (aimYaw - cy)
             state.pitchErr = aimPitch - data.CannonPitch
+            -- The rolled hull point can't be served from here (clamped
+            -- at a travel limit / no arc / round despawns): re-roll it
+            -- (throttled in the aim block) instead of staring forever
+            -- at a corner of the ship the mount can't reach.
+            if shape and state.shipAim
+              and (state.outOfArc or not hasArc or canReach == false) then
+              state.shipAim.bad = true
+            end
             local withinWide -- widened gate, feeds the burst hysteresis
             local wd = cfg.burst.widen
-            if area then
-              -- Hull gate replaces the per-axis tolerance lock: fire as
-              -- soon as the shot would land on the hull ring, while the
-              -- motors keep converging on the below-transponder aim point.
-              state.locked, state.miss = hullGate(pos, data, area, avoid)
-              -- Widened ring grows outward only: avoidRadius still
+            if shape then
+              local inHull, miss, norm =
+                hullGate(hullCenter, data, shape, pos.heading)
+              state.miss = miss
+              if cfg.profile.kind == "bigcannon" then
+                -- Artillery: one shell per aim point. Wait for a true
+                -- lock on the CHOSEN point (same settle test as coord
+                -- targets) so the shell lands there -- never lob on
+                -- first rim contact, which is how shots used to fall
+                -- short on the near edge of the area -- and the trigger
+                -- re-rolls the point for the next shell.
+                state.locked = inHull and not state.outOfArc
+                  and axisSettled(state.yawErr, cfg.yawDrive, track.loopT)
+                  and axisSettled(state.pitchErr, cfg.pitchDrive, track.loopT)
+              else
+                -- Autocannon: fire anywhere through the hull, so the
+                -- stream keeps cutting while the barrel hops between
+                -- aim points inside it.
+                state.locked = inHull
+              end
+              -- Widened hull grows outward only: avoidRadius still
               -- protects the transponder during a burst hold.
-              withinWide = state.miss ~= nil
-                and state.miss <= area * wd and state.miss >= avoid
+              withinWide = norm ~= nil and norm <= wd
+                and miss ~= nil and miss >= shape.avoid
             elseif state.targetKind == "coord" then
               -- Fixed point: no hitbox, just the per-axis tolerance lock.
               -- missH/missV are kept for the debug tab's aim-miss line.
@@ -3738,6 +3918,8 @@ local function trackLoop()
             pulse.offAt = now + cfg.firePulseSeconds
             pulse.nextAt = now + math.max(cfg.profile.reloadSeconds,
               cfg.firePulseSeconds + 0.1)
+            -- Fresh random hull point for the next shell (walked fire).
+            if state.targetKind == "ship" then state.shipAim = nil end
           end
         end
       else

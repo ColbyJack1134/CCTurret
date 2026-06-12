@@ -118,23 +118,26 @@ and the line holds — the round would vanish mid-air short of the
 target. Manual `F` is not gated. In the other direction, **burst hysteresis** (`burst` in the
 config, on by default) keeps an opened gate from chattering: once
 firing, the line stays high while the miss is still within
-`burst.widen`× the normal gate (hitbox / hull ring / tolerance), and
+`burst.widen`× the normal gate (hitbox / hull / tolerance), and
 only drops after `burst.holdSeconds` straight outside that widened
 gate — ammo for coverage on a juking target. `burst.enabled = false`
-reverts to the strict instant-drop gate. The widened hull ring grows
+reverts to the strict instant-drop gate. The widened hull grows
 outward only; `avoidRadius` still protects the transponder during a
 burst hold.
 
-Player targets are aimed with **predictive lead** (`lead` in the
-config): target velocity is measured across a short position history
-(`windowSeconds`, newest-minus-oldest — adjacent-tick differences are
-detector-jitter noise) and the turret aims where the target will be
-after the shell's flight time — the arc solver's true time-of-flight
-plus `latencySeconds` of fixed lag. The fire gate follows the
-predicted box, so shells are gated on where the target *will* be, not
-where it was. `enabled = false` reverts to aiming at the live
-position. The DEBUG tab shows the live lead distance, target speed,
-and lead time.
+Moving targets are aimed with **predictive lead** (`lead` in the
+config): the turret aims where the target will be after the shell's
+flight time — the arc solver's true time-of-flight plus
+`latencySeconds` of fixed lag. Player velocity is measured across a
+short position history (`windowSeconds`, newest-minus-oldest —
+adjacent-tick differences are detector-jitter noise); ship velocity is
+differenced broadcast-to-broadcast at ingest (the ~0.5 s transponder
+cadence gives an exact dt) and the stale fix is dead-reckoned forward
+every tick, which also smooths the stair-step a moving ship used to
+put in the aim. The fire gate follows the predicted point, so shells
+are gated on where the target *will* be, not where it was.
+`enabled = false` reverts to aiming at the live position. The DEBUG
+tab shows the live lead distance, target speed, and lead time.
 
 ## Cannon profile
 
@@ -304,15 +307,28 @@ that goes quiet shows `LOST` and the turret holds. **Note:** if the
 cannon's own ship runs CCMinimap, its own callsign appears in the
 roster — add it to `whitelist` so it renders dimmed.
 
-The broadcast position is the peer's *computer* — destroying it loses
-the target's coords. So ship targets use an area instead of a point
-(`shipTargets` in the config, per-callsign overrides under `perShip`):
-the turret aims `1.5 * avoidRadius` below the transponder, and the fire
-gate opens whenever the shot would land within `areaRadius` of the
-transponder but no closer than `avoidRadius`. Hull hits anywhere in
-that ring fire immediately while the barrel keeps converging on the
-center; the transponder block itself is never fired on. The status
-line shows the live miss distance while closing in.
+Ship targets are aimed at a **random point inside a hull shape**
+centred on the broadcast GPS fix (`shipTargets` in the config,
+per-callsign overrides under `perShip`), so impacts spread across the
+ship instead of boring one hole and pouring every following shot
+through it. Headingless beacons get a **sphere** of `areaRadius`
+(default 4); a ship that broadcasts its heading gets an **oriented
+ellipsoid** `length × width × height` (defaults 8×4×3, full dimensions
+in blocks, length along the heading). The broadcast position is the
+peer's *computer* — destroying it loses the target's coords — so aim
+points and the fire gate both keep `avoidRadius` (default 1) off the
+transponder block itself.
+
+The two fire modes use the hull differently. **Big cannons** roll a
+fresh point for every shell and wait for a true lock on it (the same
+settle test as coordinate targets) before firing — never lobbing on
+first rim contact, which is how artillery used to land short on the
+near edge of the area — then the barrel re-lays onto the next point
+during the reload. **Autocannons** hop to a new point every
+`repointSeconds` (default 2) while the fire line stays high anywhere
+inside the hull, so the stream keeps cutting across the ship during
+the transit. The status line shows the live hull miss, the rolled
+point, and the ship lead while closing in.
 
 ### Private beacon (`transponder.lua`)
 
