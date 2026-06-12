@@ -2244,8 +2244,8 @@ local function refreshRoster()
   for name, peer in pairs(state.peerShips) do
     if peerFresh(peer) then
       -- heading comes from CCMinimap airship-state broadcasts (compass
-      -- degrees, 0 = north); private beacons include it too when their
-      -- transponder has a nav/compass peripheral to read.
+      -- degrees, 0 = north); the private transponder beacons have none
+      -- (no readable heading source aboard an aeronautics ship).
       add({ kind = "ship", name = name, x = peer.x, y = peer.y, z = peer.z,
         heading = peer.heading })
     else
