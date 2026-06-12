@@ -56,7 +56,14 @@ local headingOffset = tonumber(args[2]) or 0
 -- drop-in): typed finds first, then a full scan probing every attached
 -- peripheral for a needle-reading method.
 local NAV_TYPES = { "navigation_table", "ship_navigation_table", "compass" }
-local NAV_METHODS = { "getRelativeAngle", "getYaw", "getRotationYaw", "getRotation" }
+-- getFacing is the Advanced Peripherals compass turtle upgrade (peripheral
+-- type "compass"): returns the turtle's own facing as a cardinal STRING
+-- ("north"/"east"/...), already world-absolute -- no spawn math, but only
+-- 90-degree resolution (the hull snaps to the nearest cardinal). Listed
+-- last so a real nav table wins when both are attached.
+local NAV_METHODS = { "getRelativeAngle", "getYaw", "getRotationYaw",
+  "getRotation", "getFacing" }
+local DIR_DEG = { north = 0, east = 90, south = 180, west = 270 }
 local nav = nil
 local function probe(name, p)
   if not p then return nil end
@@ -80,14 +87,21 @@ if not nav then
   end
 end
 
--- World heading from the needle: it points at spawn (0,0), whose bearing
--- from HERE follows from our own GPS fix; the peripheral reading is the
--- needle's angle relative to the block's forward.
+-- World heading from the nav reading. Two shapes come back:
+--  * cardinal string (AP compass getFacing): already absolute, map + offset.
+--  * number (nav table getRelativeAngle): the needle points at spawn (0,0),
+--    whose bearing from HERE follows from our own GPS fix; the reading is
+--    the needle's angle relative to the block's forward.
 local function readHeading(x, z)
   if not nav then return nil end
   local ok, rel = pcall(nav.p[nav.method], nav.p)
   if not ok or rel == nil then return nil end
   if type(rel) == "table" then rel = rel.yaw or rel.heading or rel[1] end
+  if type(rel) == "string" then
+    local d = DIR_DEG[rel:lower()]
+    if not d then return nil end -- "up"/"down"/unknown: no usable heading
+    return (d + headingOffset) % 360
+  end
   if type(rel) ~= "number" then return nil end
   local bearingToSpawn = math.deg(math.atan(-x, z))
   return (bearingToSpawn - rel + headingOffset) % 360
