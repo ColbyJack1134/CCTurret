@@ -325,10 +325,13 @@ settle test as coordinate targets) before firing — never lobbing on
 first rim contact, which is how artillery used to land short on the
 near edge of the area — then the barrel re-lays onto the next point
 during the reload. **Autocannons** hop to a new point every
-`repointSeconds` (default 2) while the fire line stays high anywhere
-inside the hull, so the stream keeps cutting across the ship during
-the transit. The status line shows the live hull miss, the rolled
-point, and the ship lead while closing in.
+`repointSeconds` (default 2) while actually firing — the line stays
+high anywhere inside the hull, so the stream keeps cutting across the
+ship during the transit. A locked turret that isn't firing holds dead
+still on its settled point (no idle jitter; the first burst after
+arming lands instantly, then starts walking). The status line shows
+the live hull miss, the rolled point, and the ship lead while closing
+in.
 
 ### Private beacon (`transponder.lua`)
 

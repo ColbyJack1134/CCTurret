@@ -268,7 +268,8 @@ local DEFAULTS = {
   -- broadcast position IS the peer's computer, and destroying it loses
   -- the target's coords. Big cannons re-roll the point every shot and
   -- wait for a true lock on it; autocannons hop points every
-  -- repointSeconds while the fire line stays high anywhere in the hull.
+  -- repointSeconds while ACTUALLY FIRING (the line stays high through
+  -- the hop), and hold dead still on their point while locked but quiet.
   shipTargets = {
     areaRadius = 4,   -- sphere radius (no heading broadcast)
     length = 8,       -- ellipsoid, along the heading
@@ -3650,16 +3651,21 @@ local function trackLoop()
           hullCenter = { x = ax, y = ay, z = az }
           -- Random hull point: artillery re-rolls at the trigger (one
           -- shell per point, walked across the ship); autocannons hop
-          -- every repointSeconds WITHOUT dropping the fire line -- the
-          -- gate below is the whole hull, so the stream keeps cutting
-          -- while the barrel transits to the new point. A point the
-          -- solver can't serve (arc/limits/despawn) re-rolls at most
-          -- twice a second. Offsets are world-frame, so the point rides
-          -- the moving fix without swinging as the ship turns.
+          -- every repointSeconds WHILE FIRING, without dropping the
+          -- line -- the gate below is the whole hull, so the stream
+          -- keeps cutting while the barrel transits to the new point.
+          -- Hops only buy spread while rounds are leaving the barrel,
+          -- so an armed-but-quiet or disarmed lock holds dead still on
+          -- its settled point (no jitter, instant first shot) instead
+          -- of wandering the hull. A point the solver can't serve
+          -- (arc/limits/despawn) still re-rolls at most twice a second
+          -- even while quiet, so the turret parks on a reachable spot.
+          -- Offsets are world-frame, so the point rides the moving fix
+          -- without swinging as the ship turns.
           local sa = state.shipAim
           local nowR = os.clock()
           if not sa
-            or (cfg.profile.kind == "autocannon"
+            or (cfg.profile.kind == "autocannon" and state.firing
               and nowR - sa.at >= cfg.shipTargets.repointSeconds)
             or (sa.bad and nowR - sa.at >= 0.5) then
             local rdx, rdy, rdz =
