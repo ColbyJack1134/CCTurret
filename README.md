@@ -20,9 +20,9 @@ In-game:
 - **Block Reader** against the cannon mount to read `CannonYaw` / `CannonPitch`
 - **Player Detector**
 - **Redstone Relay** for fire, assemble, and reload signals
-- Wireless modem + [GPS constellation](https://tweaked.cc/guide/gps_setup.html) (optional GPS positioning. Required for ship mode and transponder ship targets)
-- Navigation table with a compass (required for ship mode to get yaw)
-- Gimbal sensor (required for ship mode to get pitch and roll)
+- **Wireless modem** + [GPS constellation](https://tweaked.cc/guide/gps_setup.html) (optional GPS positioning. Required for ship mode and transponder ship targets)
+- **Navigation table** with a compass (required for ship mode to get yaw)
+- **Gimbal sensor** (required for ship mode to get pitch and roll)
 
 ## Building the turret
 
