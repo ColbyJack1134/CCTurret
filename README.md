@@ -156,7 +156,10 @@ batteries, CCTurret plugs into [Spruce](https://github.com/ColbyJack1134/Spruce)
 a C2 server for Create Aeronautics. It's entirely optional; everything above
 runs without it.
 
+Spruce Turret Demo 1:
 [![Spruce Turret Demo 1](https://img.youtube.com/vi/mJGrPOFG8G4/hqdefault.jpg)](https://www.youtube.com/watch?v=mJGrPOFG8G4)
+
+Spruce Turret Demo 2:
 [![Spruce Turret Demo 2](https://img.youtube.com/vi/rH7eVXvDnv0/hqdefault.jpg)](https://www.youtube.com/watch?v=rH7eVXvDnv0)
 
 ## Built on
