@@ -85,6 +85,8 @@ a short calibration wiggle, and comes up **disarmed**.
 
 Almost everything can be configured live on the **CONFIG** tab. There is also the `cannon.cfg` file for additional configs.
 
+![Setting the gun on the CONFIG tab](docs/screenshots/config-build.png)
+
 Configure the turret's build: kind, projectile, cannon material, barrel count, barrel blocks (blocks from the mount pivot to the muzzle tip), and arc type.
 
 You must also configure the Position to set whether the turret is upside down, using GPS, and the xyz location / offset from GPS. Below you can also turn on ship mode and configure those peripherals.
