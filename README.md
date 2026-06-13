@@ -1,449 +1,171 @@
-# CCBigCannon
+# CCTurret
 
-Closed-loop turret control for [Create Big Cannons](https://modrinth.com/mod/create-big-cannons)
-on CC:Tweaked, based on [pastebin tb4aiueb](https://pastebin.com/tb4aiueb)
-(preserved in `original.lua`).
+Auto-aiming turret control for [Create Big Cannons](https://modrinth.com/mod/create-big-cannons) on [CC:Tweaked](https://tweaked.cc/) with [Advanced Peripherals](https://docs.advanced-peripherals.de/). Mount it on the ground or on a [Create Aeronautics](https://github.com/Sciecode/create-aeronautics) airship; it tracks players (and ships running [CCMinimap](https://github.com/ColbyJack1134/CCMinimap) or with a transponder), solves the ballistic arc (gravity and drag), and leads moving targets. One-line install with self-calibrating drives, running fully in ComputerCraft with no server required. Optional [Spruce](https://github.com/ColbyJack1134/Spruce) integration for remote command and control.
 
-## v1 hardware
+![A turret tracking and firing](docs/screenshots/turret-firing.png)
 
-- **2x Rotational Speed Controller** (Create Crafts & Additions), modem-attached,
-  driving the cannon mount's yaw and pitch inputs.
-- **Block Reader** (Advanced Peripherals) against the cannon mount — reads the
-  `CannonYaw` / `CannonPitch` NBT for closed-loop feedback.
-- **Player Detector** (Advanced Peripherals) — target acquisition.
-- **Redstone Relay** (CC:Tweaked) — one line: fire. Aiming needs no assembly
-  or clutch line: the speed controllers hold at 0 RPM and the block reader
-  gives absolute angles. A big cannon with a **physical reload** (`reload`
-  config) adds two more lines — an assembly line held high (drop it to
-  disassemble) and a momentary loader-trigger line — on the same relay's
-  spare sides or a second relay.
+## Requirements
 
-## Usage
+Mods:
 
-Shared libraries come from the CCMinimap submodule (`git submodule update
---init`) so there is exactly one tracked copy of each; `cfgutil.lua` and
-`heading.lua` at the repo root are symlinks into it, so every file a
-turret needs sits flat in the root. Copy to the computer:
+- [CC:Tweaked](https://tweaked.cc/)
+- [Create](https://modrinth.com/mod/create)
+- [Create Big Cannons](https://modrinth.com/mod/create-big-cannons)
+- [Advanced Peripherals](https://docs.advanced-peripherals.de/) — Block Reader and Player Detector
 
-- `cannon.lua`
-- `ballistics.lua`
-- `autotune.lua`
-- `cfgutil.lua` (symlink — copying materialises the real file)
-- `heading.lua` (symlink — ditto)
+In-game:
 
-The symlinks resolve only after the submodule is initialised; a clone
-without `--recursive` leaves them dangling until you run the command
-above. (They're proper git symlinks, so a native-Windows checkout
-without symlink support would write path stubs instead — clone in
-WSL/linux.)
+- Advanced Computer
+- **2x Rotation Speed Controller** to control the mount's yaw and pitch
+- **Block Reader** against the cannon mount to read `CannonYaw` / `CannonPitch`
+- **Player Detector**
+- **Redstone Relay** for fire, assemble, and reload signals
+- Wireless modem + [GPS constellation](https://tweaked.cc/guide/gps_setup.html) (optional GPS positioning. Required for ship mode and transponder ship targets)
+- Navigation table with a compass (required for ship mode to get yaw)
+- Gimbal sensor (required for ship mode to get pitch and roll)
 
-Run `cannon.lua`. First boot writes `cannon.cfg` (hand-authored intent)
-and `cannon.cal` (machine-measured), then calibrates. Setup is mostly
-hands-off now:
+## Building the turret
 
-- The two speed controllers no longer need naming: leave
-  `peripherals.yaw`/`pitch` at `"auto"` and the calibration wiggle nudges
-  each one and reads whether `CannonYaw` or `CannonPitch` moved to tell
-  them apart. The resolved names are saved to `cannon.cal`.
-- Muzzle speed is **computed**, never typed — set the gun's `material`
-  and `barrels` (autocannon) or `charges` (bigcannon) and the b/s is
-  derived from the CBC formula (see **Cannon profile**).
-- `yawOffset` (the home/rest facing) is **measured**, not typed: it
-  defaults to `"auto"`, and calibration reads the assembled rest yaw off
-  the block reader — the first thing it does, before any rotation, since
-  the gun reports its rest angle the moment it's assembled — and saves it
-  to `cannon.cal`. So `cannon` position is the only thing you usually
-  still set by hand (or `cannon.gps = true`), and a `cannon.cfg` copied
-  to a second turret won't drag the first one's home position along.
-- Drive sign, slew rate (`degPerSecPerRpm`), the `minSpeed` floor, and
-  `yawOffset` are all measured by calibration and live in `cannon.cal`.
+The turret requires an Advanced Computer wired to a handful of peripherals.
 
-Everything calibrated lands in `cannon.cal`, which is safe to delete — the
-**CAL** button (or `K`) rebuilds it. Edit any of it live on the **CONFIG**
-tab (below) instead of quitting to a text editor.
+### Static mount
 
-Stationary builds can skip hardcoding the mount coords: set
-`cannon.gps = true` (wireless modem + GPS constellation required) and
-the computer locates itself once at boot, deriving the mount position
-as the fix plus `cannon.offset` — mount minus computer in **world**
-axes (+x east, +y up, +z south). Boot fails loudly if there's no fix;
-rerun the program after moving the build. The DEBUG tab shows the
-derived position.
+![A ground-mounted turret](docs/screenshots/static-build.png)
 
-## Airship mode
+A static ground turret requires at least 5 peripherals:
+1. Two **Rotation Speed Controllers**. The output of one should connect to the bottom of the turret mount to control yaw, and the output of the other should connect to one of the sides of the turret mount to control pitch. You do not need to know which is which as the turret will auto calibrate.
+2. A **Block Reader** pointing directly at the turret mount. The ideal spot is on the side that you did not use for pitch control.
+3. A **Player Detector** to get player targets.
+4. A **Redstone Relay** to send the redstone signals for fire, assemble, and reload.
 
-Set `ship.enabled = true` — either in `cannon.cfg`, or live on the
-**CONFIG** tab's **Ship** group (toggling it there re-resolves the nav
-table and gimbal on the spot, and reverts with a flash if either is
-missing rather than half-applying). The Ship group also edits
-`headingOffset`, `navTable`, `gimbal`, and the gimbal axis map
-(pitch/roll axis, inverts, level rests); the mount lever arm is the
-Position group's offset rows, which relabel to `offset right` / `up` /
-`fwd` in ship mode (hull-local; left/back = negative) versus world
-`offset x` / `y` / `z` in static-GPS mode. `headingOffset` and
-the gimbal map apply immediately — dial them against the DEBUG tab's
-heading / ship pitch / ship roll readouts. Requires a wireless modem
-(GPS) and a navigation table (heading, CCMinimap needle math with
-`ship.headingOffset` correction). The cannon's world position is derived
-each half-second from the computer's GPS fix plus `ship.offset` — the
-ship-local computer→cannon-mount vector in blocks (`forward`/`up`/`right`,
-left = negative right) — rotated by the live heading. `yawOffset` then
-means "cannon rest direction relative to ship-forward". Ship pitch/roll
-are assumed level for now. If GPS or the nav table stop answering, the
-turret holds and shows NO FIX rather than aiming on stale data.
+The back of the cannon mount also requires a redstone signal to assemble. For autocannons, you can use a lever, but for big cannons you will want a redstone link.
 
-Three tabs along the top: **TARGETS** (the roster), **DEBUG** (live aim
-numbers), and **CONFIG** (live settings editor — see below).
+The front of the cannon mount requires a redstone link to control when to fire. By default this signal comes from the top of the Redstone Relay.
 
-Keys: `F` fire (manual pulse), `A` arm/disarm, `C` enter an XYZ
-target, `K` calibrate + auto-tune the drive, `L` toggle a diagnostic
-trace, `Q` quit. On the CONFIG tab the arrow keys navigate (↑/↓ select a
-row, ←/→ adjust it) and Enter opens a text edit; the single-key actions
-(`F`/`A`/`C`/`K`/`L`/`Q`) work on every tab. The turret
-continuously tracks the selected player; `LOCKED` means both axes are
-within `tolerance`. With no target (or once a target is LOST) the barrel
-returns to its neutral rest pose — yaw to its rest facing, pitch level —
-rather than freezing where it last aimed; clear a target with **STOP**.
-While **armed** (ARM button or `A`; disarmed by
-default) the fire line is held high whenever the turret is locked on and
-dropped the moment lock is lost — autocannon behavior; a pulse/reload
-mode for regular cannons is planned.
+A **wireless modem** connected to a [GPS constellation](https://tweaked.cc/guide/gps_setup.html) is optional but worth adding. With it, the computer can locate its own mount
+(`cannon.gps = true`) instead of you hand-typing coordinates. But you still need to set the offset from the computer to the mount. Without it, the turret cannot pick up transponder signals either.
 
-Auto-fire is range-gated: beyond `maxDistance` blocks (default 50) the
-line holds and the status shows OUT OF RANGE, while tracking continues
-so fire resumes the moment the target closes back in. Autocannons are
-also **despawn-gated**: when the solved flight time outruns the round's
-material lifetime (see `material` below) the status shows WON'T REACH
-and the line holds — the round would vanish mid-air short of the
-target. Manual `F` is not gated. In the other direction, **burst hysteresis** (`burst` in the
-config, on by default) keeps an opened gate from chattering: once
-firing, the line stays high while the miss is still within
-`burst.widen`× the normal gate (hitbox / hull / tolerance), and
-only drops after `burst.holdSeconds` straight outside that widened
-gate — ammo for coverage on a juking target. `burst.enabled = false`
-reverts to the strict instant-drop gate. The widened hull grows
-outward only; `avoidRadius` still protects the transponder during a
-burst hold.
+### On an airship
 
-Moving targets are aimed with **predictive lead** (`lead` in the
-config): the turret aims where the target will be after the shell's
-flight time — the arc solver's true time-of-flight plus
-`latencySeconds` of fixed lag. Player velocity is measured across a
-short position history (`windowSeconds`, newest-minus-oldest —
-adjacent-tick differences are detector-jitter noise); ship velocity is
-differenced broadcast-to-broadcast at ingest (the ~0.5 s transponder
-cadence gives an exact dt) and the stale fix is dead-reckoned forward
-every tick, which also smooths the stair-step a moving ship used to
-put in the aim. The fire gate follows the predicted point, so shells
-are gated on where the target *will* be, not where it was.
-`enabled = false` reverts to aiming at the live position. The DEBUG
-tab shows the live lead distance, target speed, and lead time.
+![A turret mounted on an airship](docs/screenshots/ship-build.png)
 
-## Cannon profile
+Mounted on a [Create Aeronautics](https://github.com/Sciecode/create-aeronautics)
+ship, the turret has to know where it is and how the deck is tilted on every
+tick. That takes three more peripherals on top of the static set.
 
-`profile` in the config describes the gun; it drives both the fire
-mode and the ballistics:
+The wireless modem with a GPS constellation is required for ship turrets.
 
-- `kind`: `autocannon` holds the fire line while the gate is open;
-  `bigcannon` pulses `firePulseSeconds` per shot and waits
-  `profile.reloadSeconds` before the next (reload countdown on the
-  DEBUG tab). By default that wait assumes an autoloader — the line
-  just sits low. Set `reload.enabled` for a gun that must be torn down
-  to reload (see **Reload cycle**).
-- `projectile`: keys the constants table in `ballistics.lua` —
-  big-cannon shells fall at −0.05 b/t², autocannon rounds and the
-  mortar stone at −0.025, drag 0.99/tick for all (verified from CBC
-  source; datapacks can override, so re-verify on a tuned server).
-- `charges` (bigcannon): powder charges loaded — muzzle speed is
-  2 b/t per charge. 5 charges = 200 b/s ≈ 686 blocks max range.
-- `material` + `barrels` (autocannon): muzzle speed is a closed form of
-  the build, **computed for you** — `20 × (base + perBarrel ×
-  min(barrels, cap))` with `base/perBarrel/cap` from the material: cast
-  iron `20×(5 + 2×min(b,2))`, bronze `20×(3 + 1.5×min(b,3))`, steel
-  `20×(3 + 1.5×min(b,4))`. A full-length steel or cast-iron gun is 180
-  b/s. So set `material` (`cast_iron`/`bronze`/`steel`) and the barrel
-  count, not a velocity. Autocannon rounds (machine-gun included) also
-  carry a **despawn clock from the material** — cast iron 11 ticks,
-  bronze 25, steel 60 — and vanish mid-air when it runs out: ~94 / ~166
-  / ~405 blocks flat at full barrels (drag-accurate; high arcs cover
-  less). The turret solves flight time against this clock and holds
-  auto-fire with **WON'T REACH** when the round would expire short of
-  the target. Big-cannon shells have no in-flight cap.
-- `muzzleVelocityOverride` (autocannon): `> 0` forces the muzzle speed
-  in b/s instead of computing it — only for a **datapack-tuned server**
-  whose numbers differ from the published ones; `0` = compute. (Old
-  configs: a hand-tuned `muzzleVelocity` / `lead.muzzleVelocity`
-  migrates into this override automatically.)
-- `lifetimeOverride` (autocannon): `> 0` forces the despawn clock in
-  ticks (same datapack escape hatch as the speed); `0` = material.
-- `barrelBlocks`: mount pivot → muzzle tip, in blocks. CBC spawns the
-  shell ~`barrelBlocks − 1.5` out along the barrel; on a long gun
-  ignoring that shifts arcing shots by 15–25 blocks at range.
-- `arc`: `shallow` (flat, fast) or `steep` (lobbed) when both
-  solutions exist.
+A **navigation table** with a compass gives ship heading. The raw needle is
+usually rotated from true, so set `ship.headingOffset` to correct it by a multiple of 90°. You can use the `heading` readout on the DEBUG tab to figure out the offset.
 
-Pitch is solved ballistically every tick (gravity + drag, closed-form
-horizontal time-of-flight + bisected pitch — `ballistics.lua`,
-unit-tested against a per-tick simulation in `tests/`), launching from
-the muzzle rather than the mount, and the solver's time-of-flight
-feeds the lead solve. A target no arc reaches shows **NO ARC**: the
-barrel tracks line-of-sight as a ready posture and auto-fire stays
-gated until the target closes in. `pitchOffset` remains a plain aim
-bias on top of the solution.
+A **gimbal sensor** gives deck pitch and roll. `ship.gimbalMap` says which
+sensor axis is pitch and which is roll (`x` / `z` by default); `pitchRest` /
+`rollRest` are whatever the sensor reads when the ship is dead level. `invertPitch` / `invertRoll` are also options if those values are backwards. The DEBUG tab shows live `ship pitch` and `ship roll` for figuring out these values. By convention pitch is +nose-up
+and roll is +right-side-down.
 
-Player targets lock onto the centre of mass (`getPlayerPos` reports the
-FEET — the entity position — so the turret aims `playerHitbox.aimHeight`
-blocks above it; default 0.9, the middle of a standing player). Fire
-opens early: as soon as the shot would pass through the body box rising
-from the reported feet — `playerHitbox.width` wide and `playerHitbox.height`
-tall (default 0.6 × 1.8) — the line goes high while the turret keeps
-converging on centre mass. Raise `aimHeight` toward the head, or pad
-`width`/`height`, if the gate feels too strict. The status line shows the
-live horizontal / vertical miss until lock. `trackSeconds` (default 0.1, minimum 0.05 —
-one game tick) sets the tracking loop period if you want faster aim
-updates for more peripheral traffic.
+Turn it all on with `ship.enabled = true` (in `cannon.cfg`, or the CONFIG tab's
+Ship group). If GPS or the nav table ever go quiet the turret holds and shows
+`NO FIX` rather than firing on a stale position.
 
-## CONFIG tab and the cfg / cal split
+*Note in the screenshot I am also using analog transmissions in order to slow down the rpm after the speed controller's output. The speed controller can only set rpm as an int value, while rpm can actually go down to 0.01. By doing a gear reduction / adjustable chain gearshift / analog transmission, the turret can achieve greater precision at the cost of max rotational speed.*
 
-Config lives in two files. `cannon.cfg` is **hand-authored intent** — the
-gun profile, aim offsets, tolerances, travel limits, ship/reload wiring.
-`cannon.cal` is **machine-measured** — the resolved yaw/pitch controller
-names, the drive sign (`invertYaw`/`invertPitch`), the slew rate
-(`degPerSecPerRpm`), the `minSpeed` floor, and `yawOffset` (the home/rest
-facing, read from the assembled rest yaw). Calibration writes only
-`cannon.cal`; it's safe to delete (the **CAL** button rebuilds it) and
-keeps the hand-edited config clean. Because `yawOffset` lives here and is
-ignored if found in `cannon.cfg`, copying a `cannon.cfg` to a new turret
-never carries the old one's home position — it's re-measured per mount.
+## Install
 
-The **CONFIG** tab edits all of it live, no quitting to a text editor.
-Rows are grouped (Build / Aim / Position / Ship / Arc limits / Drive /
-Calibrated; calibrated rows are orange). The Ship group (ship mode +
-heading/nav/gimbal) only shows its detail rows once ship mode is on. Tap a row to select it, then use
-its `[-]`/`[+]` steppers (numbers) or `<`/`>` (enums like `material`,
-`arc`, `kind`), or `[=]` to type a value; arrow keys work too. Some
-fields are **type-only** (just `[=]`, no steppers): the mount position /
-GPS `offset` floats and the arc travel limits, where you want to enter an
-exact value. Edits apply **immediately** — change `material` and the
-muzzle speed recomputes; toggle **Position → gps** and edit the `offset`
-and the mount position re-derives from the GPS fix, no reboot. **SAVE** writes
-the changes to disk (each field to its own file), **CANCEL** reverts to
-the values from when you opened the tab. Because measured values win over
-the hand-edited file, pin a calibrated value by editing it here (or in
-`cannon.cal`), not in `cannon.cfg`.
+With the hardware wired up, drop the software on the computer:
 
-Setting up a new turret is then: drop the files on the computer, set the
-gun's `material` + `barrels` (or `charges`) and the `cannon` position,
-and press **CAL** — the drives auto-detect and calibrate themselves.
+```lua
+wget run https://raw.githubusercontent.com/ColbyJack1134/CCTurret/main/install.lua
+```
 
-## Reload cycle
+It pulls the file set, offers the optional ship beacon and turtle loader, and
+launches `cannon.lua`. The first run writes `cannon.cfg` and `cannon.cal`, does
+a short calibration wiggle, and comes up **disarmed**. 
 
-A real big cannon can't be reloaded while assembled — it has to be torn
-back into blocks, loaded, and rebuilt. Set `reload.enabled = true` (a
-`bigcannon` profile) and the controller drives that sequence on two
-extra redstone lines instead of the autoloader's silent timer:
+## First setup
 
-1. **Fire** — pulse `fireSide` for `firePulseSeconds`.
-2. **Disassemble** — drop `assemblySide` (held high the rest of the
-   time = assembled). Wait `reload.settleSeconds`.
-3. **Load** — pulse `reloadSide` for `reload.reloadPulseSeconds` to kick
-   off whatever loads the breech, then wait `profile.reloadSeconds` for
-   it to finish.
-4. **Reassemble** — raise `assemblySide`. Wait `reload.settleSeconds`,
-   then the gun is ready for the next shot.
+Almost everything can be configured live on the **CONFIG** tab. There is also the `cannon.cfg` file for additional configs.
 
-The cannon is **assembled by default**: the assembly line is high at
-boot (the gun is built for the calibration nudge) and on quit, and only
-drops during a reload. The whole cycle is non-blocking — aiming, the UI,
-and transponder tracking keep running — but the barrel **holds** while
-the contraption is torn down (it can't move what isn't there) and the
-fire gate stays shut until reassembly. A manual `F` shot runs the same
-cycle. The status line and the DEBUG `reload` line show the live phase
-(`DISASSEMBLING` / `LOADING` / `ASSEMBLING`) and countdown.
+Configure the turret's build: kind, projectile, cannon material, barrel count, barrel blocks (blocks from the mount pivot to the muzzle tip), and arc type.
 
-Wiring: by default all three lines (`fireSide`, `assemblySide`,
-`reloadSide`) are sides of the one fire relay — pick three that aren't
-wired together. To drive the assembly/reload lines from a **second**
-relay, set `reload.relay` to that relay's peripheral name. Don't care
-about a settle pause? Set `reload.settleSeconds = 0`.
+You must also configure the Position to set whether the turret is upside down, using GPS, and the xyz location / offset from GPS. Below you can also turn on ship mode and configure those peripherals.
 
-## Coordinate targets
+The Arc Limits section allows you to set limits for the turret, or set `-180..180` for a full 360° range of motion. **SAVE** when you're done.
 
-Press `C` (or click **+ set XYZ coord** at the top of the TARGETS tab)
-and type a world point as `x y z` (spaces or commas, decimals and
-negatives fine) — Enter locks it, Escape cancels, a bad entry reprompts
-with a hint. The point is shown on the status line as `*x, y, z` in
-light blue and cleared with **STOP** like any other target.
+With everything set up, do a final calibration. Make sure the turret is stopped so the speed controllers are set to 0. Disassemble and reassemble the cannon so it is in its home position. Then press **CAL** (`K`). It sorts out which speed controller is which axis, measures each drive's direction, slew rate, and minimum speed, and auto-tunes the step response. It will take a minute or two as the barrel steps back and forth. The measured results are saved to `cannon.cal`, separate from your hand-edited `cannon.cfg` — it's safe to delete and **CAL** rebuilds it.
 
-It's a fixed aim point: no lead and no hitbox box — the turret arc-solves
-straight at the coordinate and locks when both axes are within
-`tolerance`, so it's the cleanest way to test ballistics. Stand off at a
-known spot, read its F3 coords, target them, and watch where the shell
-lands versus the DEBUG tab's predicted distance and time-of-flight.
-Auto-fire still respects `maxDistance` (raise it for long shots) and the
-arc gate (**NO ARC** past max range); manual `F` is ungated, so you can
-lob a ranging shot at anything.
+## The three tabs
 
-While a land target is set, the DEBUG tab forward-flies a shot from the
-barrel's **actual current angle** (not the solver's answer) and shows
-`impact xyz` (a world coordinate to go watch), `impact off` (how far that
-landing is from the target), and `v.miss@range` (how high/low the shell
-crosses the target's distance — `+` high, `−` low). It shares the flight
-model with the solver, so a large `v.miss@range` means the barrel fired
-before it settled onto the solution (loosen the slew or tighten
-`tolerance`) or the angle convention is off; it does **not** validate
-muzzle speed — for that, compare the predicted `impact xyz` to where the
-shell is actually seen to land. Note `tolerance` is angular: 1° is ~3.5
-blocks of miss at 200, ~10 at 600, so artillery wants it tight (≈0.2°),
-which in turn needs the drive tuned enough to settle that close.
+**TARGETS** shows the target roster. Players appear as `@name` (cyan),
+transponder ships as `#callsign` (orange). Click to lock. `+ set XYZ coord` aims at a fixed
+point; **STOP** clears the target and returns the barrel to rest.
 
-## Transponder targets
+![TARGETS tab](docs/screenshots/targets-tab.png)
 
-With any wireless modem attached, the TARGETS tab also lists every ship
-broadcasting CCMinimap's transponder (`airship-state` rednet protocol,
-0.5 s cadence) — `#callsign` rows in orange next to `@player` rows in
-cyan. Ships that go quiet for 5 s drop from the roster; a tracked ship
-that goes quiet shows `LOST` and the turret holds. **Note:** if the
-cannon's own ship runs CCMinimap, its own callsign appears in the
-roster — add it to `whitelist` so it renders dimmed.
+**DEBUG** shows live turret data: commanded vs actual angles, miss, distance,
+time-of-flight, lead, reload phase, and the derived mount position.
 
-Ship targets are aimed at a **random point inside a hull shape**
-centred on the broadcast GPS fix (`shipTargets` in the config,
-per-callsign overrides under `perShip`), so impacts spread across the
-ship instead of boring one hole and pouring every following shot
-through it. Headingless beacons get a **sphere** of `areaRadius`
-(default 4); a ship that broadcasts its heading gets an **oriented
-ellipsoid** `length × width × height` (defaults 8×4×3, full dimensions
-in blocks, length along the heading). The broadcast position is the
-peer's *computer* — destroying it loses the target's coords — so aim
-points and the fire gate both keep `avoidRadius` (default 1) off the
-transponder block itself.
+![DEBUG tab](docs/screenshots/debug-tab.png)
 
-The two fire modes use the hull differently. **Big cannons** roll a
-fresh point for every shell and wait for a true lock on it (the same
-settle test as coordinate targets) before firing — never lobbing on
-first rim contact, which is how artillery used to land short on the
-near edge of the area — then the barrel re-lays onto the next point
-during the reload. **Autocannons** hop to a new point every
-`repointSeconds` (default 2) while actually firing — the line stays
-high anywhere inside the hull, so the stream keeps cutting across the
-ship during the transit. A locked turret that isn't firing holds dead
-still on its settled point (no idle jitter; the first burst after
-arming lands instantly, then starts walking). The status line shows
-the live hull miss, the rolled point, and the ship lead while closing
-in.
+**CONFIG** shows most settings, edited live. Rows are grouped (Build, Aim,
+Position, Ship, Arc limits, Drive, Calibrated). Navigate with the mouse or arrow
+keys; `<` / `>` change enums, `[=]` types a value. Edits apply immediately.
+**SAVE** writes to disk, **CANCEL** reverts.
 
-### Private beacon (`transponder.lua`)
+## Hotkeys
 
-To put a ship on the turret's roster *without* it appearing on
-CCMinimap, run `transponder.lua` on a turtle (or computer) with a
-wireless modem and place it aboard. It GPS-locates itself and
-broadcasts its position every 0.5 s on a **private** rednet protocol
-(`cannon-transponder`) instead of CCMinimap's `airship-state` — the
-minimap only listens for the latter, so the beacon never shows up
-there, but the turret tracks it exactly like any other transponder
-ship (and Spruce's sniffer still sees it). Handy for marking a test
-target you want to shoot at without lighting it up on everyone's map.
+| Key | Action |
+| --- | --- |
+| `F` | Fire (manual pulse, ungated) |
+| `A` | Arm / disarm |
+| `C` | Enter an XYZ target |
+| `K` | Calibrate + auto-tune the drive |
+| `O` | Capture the current barrel pose as the rest/home facing |
+| `L` | Toggle the diagnostic trace |
+| `Q` | Quit |
 
-Run `transponder.lua [callsign]` — the optional callsign is the
-`#callsign` shown in the roster (defaults to the computer label, else
-`beacon-<id>`). It needs a GPS constellation in range (the same one
-CCMinimap uses); with none it prints `NO GPS FIX` and holds rather than
-broadcasting stale coords, so the turret honestly shows the target as
-lost. It carries position only (no heading — the ship-target aim
-doesn't need one).
+## Features
 
-## Travel limits
+- Closed-loop aim from Block Reader feedback
+- Ballistic arc solver (gravity and drag); muzzle speed computed from the build
+- Predictive lead on moving players and ships
+- Auto-fire gating: out of range, round despawn, unreachable arc, friendly-fire zones
+- Player aim at centre of mass, with early fire across the hitbox
+- Ship hull targeting. Shots spread across the hull instead of drilling one hole
+- Autocannon hold-the-line and big-cannon pulse-and-reload fire modes
+- Physical reload cycle (disassemble → load → reassemble) for manually-reloaded big cannons
+- One-button calibration and drive auto-tune
+- Static (coords or GPS) and airship (nav-table) mounting
 
-`limits.yaw` (default −90..+90) and `limits.pitch` (default −30..+60)
-bound the mount in rest-relative degrees (0 = the barrel's rest
-orientation, wherever `yawOffset` points it — e.g. off the ship's
-starboard side). A target outside the arc shows `OUT OF ARC`: the
-barrel parks at the nearest limit, ready for re-entry, and fire only
-opens if shots from inside the arc would still hit. Slews never route
-through the zone behind the arc (no shortest-path wrap), so the barrel
-can't sweep across your own ship. For a free-standing 360° cannon set
-yaw to −180..180 (note: it will then unwind the long way around rather
-than crossing the ±180 seam).
+## Add-ons
 
-The drive adds **velocity feedforward** on top of the proportional
-term: the boot calibration wiggle measures each axis's slew rate
-(`degPerSecPerRpm`, ~0.75 for a direct-drive mount), and the
-controller feeds the aim point's own angular rate straight into the
-RPM command. Without it, a pure-P loop trails any crossing target by
-`speed / (rate × gain)` blocks at every distance — enough to keep the
-fire gate closed against anything faster than a walk. Set
-`degPerSecPerRpm` (or an invert flag) back to `"auto"` after
-re-gearing to re-measure — or just press the **CAL** button (or `K`),
-which re-runs the wiggle live and saves the result.
+These are one-off scripts also included in this repo.
 
-On top of P + feedforward there's an optional **derivative term**
-(`yawDrive.kd` / `pitchDrive.kd`, a PD loop). It brakes the command in
-proportion to how fast the aim *error* is closing —
-`kd × d(err)/dt ÷ degPerSecPerRpm` — so the barrel eases onto the
-target instead of overshooting and hunting just before lock. It acts on
-the error, not the mount's velocity, so it stays out of the
-feedforward's way on a moving target (steady tracking has ~0 error
-rate), and it only shapes an already-active drive — it never pushes a
-parked barrel. `kd = 0` (the default) is the pure P+feedforward loop.
-If an axis oscillates around the target right before locking, raise
-`kd` in the **CONFIG** tab (Drive group) a little at a time — try
-0.2–0.5; too high makes convergence sluggish. The DEBUG tab's
-`err rate y/p` line (shown once `kd ≠ 0`) is the thing it's damping:
-watch it settle toward 0 without ringing.
+**`transponder.lua`** is a private ship beacon. Run it on a turtle with a
+wireless modem aboard a ship; it GPS-broadcasts position on a private protocol,
+so the turret lists it as a `#callsign` target without it showing on CCMinimap.
 
-If an axis spins away from the target, flip `invertYaw` / `invertPitch`
-in the config instead of regearing.
+**`autoloader.lua`** is a turtle that reloads a big cannon's breech
+with a Ram Rod, pairing with the redstone reload cycle for a fully automatic and compact heavy gun.
 
-## Calibrate + auto-tune (the CAL button / `K`)
+## Spruce integration
 
-**`K`** (or the **CAL** button) does the whole drive setup in one automatic
-pass — no hand-tuning, no pre-steps:
+For multi-turret fleet command, a web UI, remote targeting, and coordinated
+batteries, CCTurret plugs into [Spruce](https://github.com/ColbyJack1134/Spruce),
+a C2 server for Create Aeronautics. It's entirely optional; everything above
+runs without it.
 
-1. Re-detects which speed controller is yaw vs pitch (if `"auto"`).
-2. Wiggles each axis to measure the drive sign, slew rate
-   (`degPerSecPerRpm`), and the `minSpeed` floor.
-3. Measures the real control-loop period (by timing its own peripheral
-   work — no target needed).
-4. Auto-tunes each axis's `approach` cap: it drives step responses on
-   **internal angle targets** (it just steps the mount in place — you do
-   **not** need to be tracking anything), raises `approach` until a step
-   *just* starts to overshoot, and keeps the largest value that stays
-   clean (re-verified to absorb sensor noise). It writes the tuned
-   `approach` + a matching `speedGain` to `cannon.cfg`, zeroes `kd` (the
-   cap supersedes the D term), and logs every probe to `cannon.tune.log`.
+- [Spruce Turret Demo 1](https://www.youtube.com/watch?v=mJGrPOFG8G4)
+- [Spruce Turret Demo 2](https://www.youtube.com/watch?v=rH7eVXvDnv0)
 
-The whole thing takes ~1–2 minutes and the barrel steps back and forth on
-its own — **disarm first** (`A`) and give it clearance. Boot only does the
-quick wiggle (steps 1–2) so it doesn't lengthen every startup; press `K`
-once after setup for the full auto-tune. The search and its convergence are
-validated offline against a mount model fitted to real in-game traces,
-across a range of gearing, inertia, loop rates, and sensor noise
-(`tests/autotune_sim.lua`).
+## Built on
 
-## Settling and lock
+Initially built off of a community turret script
+([pastebin tb4aiueb](https://pastebin.com/tb4aiueb)) and grew from there. The auto-locking ideas (the
+arc solver, windowed velocity estimate, and overshoot handling) were also inspired by
+[NeuGoga/cc-tweaked-autolocking](https://github.com/NeuGoga/cc-tweaked-autolocking).
+The ballistics constants are verified against the
+[Create Big Cannons source](https://github.com/rbasamoyai/CreateBigCannons) code.
 
-A Create speed controller can't turn slower than ~1 RPM (`minSpeed`).
-The drive never commands *between* 0 and that floor — a sub-floor
-command just stalls the mount in place — so it drives at ≥ `minSpeed`
-or parks at 0. The barrel therefore settles about `minSpeed / speedGain`
-degrees from the target: **raise `speedGain` to settle tighter** (the
-opposite of the usual pure-P intuition, because there's no deadband to
-overshoot — it parks the instant it can't usefully drive). Only lower
-`speedGain` if an axis visibly oscillates *around* the target; if it
-stops *short*, that's the floor — raise the gain.
+## License
 
-Because 1 RPM is a hard floor, you can't always reach an arbitrarily
-tight `tolerance`. `lockWhenStalled` (on by default) counts an axis as
-locked once it's parked at that floor — as close as the hardware can
-get — so the gun still fires at its best achievable aim even when the
-error can't be driven below `tolerance`. The achievable precision is
-~`minSpeed / speedGain`°, so a tighter lock means a higher `speedGain`
-(and, ultimately, a finer gear reduction to lower `degPerSecPerRpm`).
-Set `lockWhenStalled = false` for a strict tolerance-only lock.
-
-## Later
-
-- Web interface for remote targeting (player or XYZ), Spruce-style.
-- Multi-turret: one computer driving several mounts; rednet commander
-  for ground artillery batteries.
+MIT licensed. See `LICENSE`.

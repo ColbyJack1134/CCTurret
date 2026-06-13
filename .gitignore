@@ -1,3 +1,6 @@
+# Local tooling -- never track
+.claude/
+
 # Private working notes -- never track these
 TURRET_C2_HANDOFF.md
 SPRUCE_PLAN.md
